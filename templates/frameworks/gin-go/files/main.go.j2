@@ -1,0 +1,147 @@
+package main
+
+import (
+	"fmt"
+	"net/http"
+	"os"
+
+	"github.com/gin-gonic/gin"
+	"github.com/gin-contrib/cors"
+	"go.uber.org/zap"
+)
+
+// ========== 全局变量 ==========
+var (
+	logger *zap.Logger
+	port   = "{{{port}}}"
+)
+
+func init() {
+	// 初始化日志
+	var err error
+	logger, err = zap.NewProduction()
+	if err != nil {
+		panic(fmt.Sprintf("初始化日志失败: %v", err))
+	}
+}
+
+// ========== 响应模型 ==========
+type Response struct {
+	Success bool        `json:"success"`
+	Data    interface{} `json:"data,omitempty"`
+	Error   string      `json:"error,omitempty"`
+}
+
+type HealthResponse struct {
+	Status    string  `json:"status"`
+	Timestamp string  `json:"timestamp"`
+	Uptime    float64 `json:"uptime"`
+	Version   string  `json:"version"`
+}
+
+{{#if features.health_check}}
+// ========== 健康检查端点 ==========
+func healthCheck(c *gin.Context) {
+	c.JSON(http.StatusOK, HealthResponse{
+		Status:    "healthy",
+		Timestamp: c.GetHeader("X-Request-Time"),
+		Uptime:    0.0, // TODO: 实现实际运行时间
+		Version:   "1.0.0",
+	})
+}
+{{/if}}
+
+{{#if features.api_endpoints}}
+// ========== API 端点定义 ==========
+{{#each endpoints}}
+// {{{description}}}
+// func {{{method.toLowerCase()}}}{{{path.replace(/\//g, "")}}}(c *gin.Context) {
+// 	// TODO: 实现 {{{description}}}
+// 	c.JSON(http.StatusNotImplemented, gin.H{"error": "TODO: 未实现"})
+// }
+{{/each}}
+{{/if}}
+
+// ========== 404 处理 ==========
+func notFound(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{
+		"error":   "Not Found",
+		"message": fmt.Sprintf("路径 %s %s 不存在", c.Request.Method, c.Request.URL.Path),
+	})
+}
+
+// ========== 错误处理中间件 ==========
+func errorRecovery() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		defer func() {
+			if err := recover(); err != nil {
+				logger.Error("panic recovered",
+					zap.Any("error", err),
+					zap.String("path", c.Request.URL.Path),
+				)
+				c.JSON(http.StatusInternalServerError, gin.H{
+					"error": "Internal Server Error",
+				})
+			}
+		}()
+		c.Next()
+	}
+}
+
+// ========== 主函数 ==========
+func main() {
+	// 从环境变量读取端口
+	if envPort := os.Getenv("PORT"); envPort != "" {
+		port = envPort
+	}
+
+	// Gin 设置
+	if os.Getenv("ENV") == "production" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+
+	// 创建路由
+	r := gin.New()
+
+	// 中间件配置
+	r.Use(errorRecovery())         // 错误恢复
+	r.Use(gin.Logger())              // 日志
+	r.Use(gin.Recovery())            // Gin 内置恢复
+	r.Use(cors.Default())            // CORS
+
+{{#if features.health_check}}
+	// 健康检查
+	r.GET("/health", healthCheck)
+{{/if}}
+
+	// 根路径
+	r.GET("/", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{
+			"message": "欢迎使用 {{{projectName}}} API",
+			"version": "1.0.0",
+			"health":  "/health",
+		})
+	})
+
+	// TODO: 添加业务路由
+	// API 路由组
+	// api := r.Group("/api")
+	// {
+	//     api.GET("/items", getItems)
+	//     api.POST("/items", createItem)
+	// }
+
+	// 404 处理
+	r.NoRoute(notFound)
+
+	// 启动服务器
+	addr := fmt.Sprintf("0.0.0.0:%s", port)
+	logger.Info("服务器启动中",
+		zap.String("address", addr),
+		zap.String("environment", os.Getenv("ENV")),
+	)
+
+	if err := r.Run(addr); err != nil {
+		logger.Fatal("服务器启动失败", zap.Error(err))
+	}
+}

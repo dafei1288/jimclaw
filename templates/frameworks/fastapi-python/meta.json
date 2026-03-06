@@ -1,0 +1,39 @@
+{
+  "id": "fastapi-python",
+  "name": "FastAPI + Python",
+  "language": "Python",
+  "version": "1.0.0",
+  "description": "生产级 FastAPI REST API 模板，包含异步处理、自动文档、CORS、错误处理和完整测试",
+  "tags": ["api", "rest", "backend", "production-ready", "async", "python"],
+  "dependencies": {
+    "fastapi": "^0.104.0",
+    "uvicorn": "^0.24.0",
+    "pydantic": "^2.5.0",
+    "pydantic-settings": "^2.1.0"
+  },
+  "devDependencies": {
+    "pytest": "^7.4.0",
+    "pytest-asyncio": "^0.21.0",
+    "httpx": "^0.25.0",
+    "black": "^23.11.0",
+    "flake8": "^6.1.0",
+    "mypy": "^1.7.0"
+  },
+  "files": {
+    "main": "files/main.py.j2",
+    "test": "files/test_main.py.j2",
+    "config": "files/config.py",
+    "models": "files/models.py",
+    "requirements": "files/requirements.txt",
+    "pyproject": "files/pyproject.toml"
+  },
+  "middleware": ["cors", "gzip", "error-handler", "trusted-host"],
+  "features": {
+    "health_check": true,
+    "cors": true,
+    "async": true,
+    "auto_docs": true,
+    "validation": true
+  },
+  "scaffoldExample": "from fastapi import FastAPI, HTTPException\nfrom fastapi.middleware.cors import CORSMiddleware\nfrom contextlib import asynccontextmanager\n\napp = FastAPI()\n\n# CORS 中间件\napp.add_middleware(\n    CORSMiddleware,\n    allow_origins=['*'],\n    allow_credentials=True,\n    allow_methods=['*'],\n    allow_headers=['*'],\n)\n\n# TODO: 添加路由\n\n@app.get('/health')\nasync def health_check():\n    return {'status': 'healthy', 'timestamp': datetime.utcnow().isoformat()}\n\nif __name__ == '__main__':\n    import uvicorn\n    uvicorn.run(app, host='0.0.0.0', port=int(os.getenv('PORT', 8000)))"
+}

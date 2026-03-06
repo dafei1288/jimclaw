@@ -1,0 +1,1838 @@
+import { Annotation, StateGraph, START, END } from "@langchain/langgraph";
+import { BaseMessage } from "@langchain/core/messages";
+import { BaseAgent } from "./agent";
+import * as fs from "fs/promises";
+import * as path from "path";
+import * as crypto from "crypto";
+import { z } from "zod";
+import { ModelManager } from "../utils/models";
+import { ShellExecuteSkill } from "../skills/shell_exec";
+import { DockerSkill } from "../skills/docker_exec";
+import { HealthCheckSkill } from "../skills/health_check";
+import { PlaywrightSkill } from "../skills/playwright_exec";
+import { LSPDiagnoseSkill } from "../skills/lsp_diagnose";
+import { LintFixSkill } from "../skills/lint_fix";
+
+
+// ========== 改进 1: 模板引擎导入 ==========
+import { getTemplateEngine, type TemplateContext } from "./template_engine";
+import {
+  getScaffoldingCommand,
+  generateMiddlewareConfig,
+  REQUIRED_MIDDLEWARE,
+  type MiddlewareSpec
+} from "./middleware_standards";
+// ========== 改进 2: 分阶段生成导入 ==========
+import {
+  GenerationStage,
+  getScaffoldPrompt,
+  getImplementationPrompt,
+  getTestAlignmentPrompt,
+  validateScaffoldCode,
+  validateImplementationCode,
+  extractCodeBlock,
+  generateStageSummary,
+  type FileGenerationState,
+  type PhasedGenerationConfig,
+  DEFAULT_PHASED_CONFIG
+} from "./phased_generation";
+/**
+ * 任务契约：PM 下发给团队的标准指令
+ */
+export interface TaskContract {
+  title: string;
+  requirements: string[];
+  acceptanceCriteria: string[];
+}
+
+/**
+ * 技术方案：架构师下发给开发的实现指南
+ */
+export interface TechSpec {
+  architecture: string;
+  language: string;
+  testCommand: string;
+  runCommand: string;
+  entryPoint: string;
+  filesToCreate: string[];
+  interfaces: string;
+}
+
+/**
+ * 资源清单：全局系统资源配置（端口、环境变量、服务名）
+ */
+export interface SystemManifest {
+  services: {
+    name: string;
+    port?: number;
+    description?: string;
+  }[];
+  environment: Record<string, string>;
+  sharedConfig: Record<string, any>;
+}
+
+/**
+ * 接口契约：定义服务间的交互协议
+ */
+export interface ApiContract {
+  endpoints: {
+    path: string;
+    method: string;
+    description: string;
+    requestBody?: any;
+    responseBody?: any;
+    parameters?: any;
+  }[];
+}
+
+/**
+ * 子任务：由 Orchestrator 拆解的具体开发任务
+ */
+export interface SubTask {
+  id: string;
+  description: string;
+  fileTarget: string;
+  dependencies: string[];
+  contextRequirement: string;
+  status: "pending" | "completed" | "failed";
+  lastError?: string;
+}
+
+/**
+ * 仲裁指令：架构师介入时下发的跨文件修复指令
+ */
+export interface MediationDirective {
+  file: string;
+  action: string;
+  detail: string;
+}
+
+/**
+ * 文件变更记录：每轮 coder 执行后追加，用于前端展示修改历史
+ */
+export interface FileChangeEntry {
+  round: number;
+  file: string;
+  taskTitle: string;
+  status: "written" | "skipped" | "error";
+  error?: string;
+}
+
+// ── 改进 3：LLM 输出 Zod 校验 Schema ─────────────────────────────────────────
+
+const TaskContractSchema = z.object({
+  title: z.string(),
+  requirements: z.array(z.string()),
+  acceptanceCriteria: z.array(z.string()),
+});
+
+const TechSpecSchema = z.object({
+  architecture: z.string(),
+  language: z.string(),
+  testCommand: z.string(),
+  runCommand: z.string(),
+  entryPoint: z.string(),
+  filesToCreate: z.array(z.string()),
+  interfaces: z.string(),
+});
+
+const SubTaskArraySchema = z.array(z.object({
+  id: z.string(),
+  description: z.string(),
+  fileTarget: z.string(),
+  dependencies: z.array(z.string()),
+  contextRequirement: z.string(),
+  status: z.enum(["pending", "completed", "failed"] as [string, ...string[]]).optional(),
+}));
+
+const QAResultSchema = z.object({
+  passed: z.boolean(),
+  feedback: z.string(),
+  failedFiles: z.array(z.string()).optional(),
+  testErrors: z.array(z.string()).optional(),
+  failedTestNames: z.array(z.string()).optional(),
+});
+
+const MediationDirectiveSchema = z.array(z.object({
+  file: z.string(),
+  action: z.string(),
+  detail: z.string(),
+}));
+
+// ── 改进 6：API 端点静态校验 Schema ──────────────────────────────────────────
+
+const HTTP_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH"] as const;
+
+const ApiEndpointSchema = z.object({
+  path: z.string().refine((s) => s.startsWith("/"), { message: "路径必须以 / 开头" }),
+  method: z.enum(HTTP_METHODS),
+  description: z.string().min(1),
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 核心状态定义
+ */
+export const JimClawState = Annotation.Root({
+  messages: Annotation<BaseMessage[]>({
+    reducer: (x, y) => x.concat(y),
+  }),
+  teamChatLog: Annotation<{ sender: string; content: string }[]>({
+    reducer: (x, y) => x.concat(y),
+  }),
+  subTasks: Annotation<SubTask[]>({
+    reducer: (x, y) => y ?? x,
+  }),
+  contract: Annotation<TaskContract | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  spec: Annotation<TechSpec | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  manifest: Annotation<SystemManifest | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  apiContract: Annotation<ApiContract | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  code: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  testResults: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  userGoal: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  retryCount: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+  }),
+  isDone: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  requiresApproval: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  deploymentStatus: Annotation<{ url?: string; status: "none" | "deploying" | "running" | "failed" } | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  // 改进 5：QA 结构化失败信息
+  qaFailures: Annotation<{
+    failedFiles: string[];
+    testErrors: string[];
+    failedTestNames: string[];
+  } | null>({
+    reducer: (x, y) => y !== undefined ? y : x,
+  }),
+  // 改进 9：package.json 内容 hash，用于跳过无变化时的 npm install
+  packageJsonHash: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  // 架构师仲裁指令：coder 自救失败 2 轮后由架构师介入下发
+  mediationDirectives: Annotation<MediationDirective[] | null>({
+    reducer: (x, y) => y !== undefined ? y : x,
+  }),
+  // 团队共识：各节点累积追加，所有 agent 通过 brief 参数共享，形成项目级公共上下文
+  projectBrief: Annotation<string[]>({
+    reducer: (x, y) => [...(x || []), ...(y || [])],
+  }),
+  // 文件变更记录：每轮 coder 执行后累积追加，前端用于展示"每次改了哪些文件"
+  codeLog: Annotation<FileChangeEntry[]>({
+    reducer: (x, y) => [...(x || []), ...(y || [])],
+  }),
+  // Docker 容器 ID：infra_setup 启动后存储，各节点通过 docker exec 隔离执行生成代码
+  containerId: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  // 改进 1: 模板相关状态
+  templateId: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  templateMetadata: Annotation<any>({
+    reducer: (x, y) => y ?? x,
+  }),
+  // 改进 2: 分阶段生成状态
+  generationStage: Annotation<GenerationStage | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  fileGenerationStates: Annotation<Record<string, FileGenerationState>>({
+    reducer: (x, y) => ({ ...(x || {}), ...(y || {}) }),
+  }),
+  phasedConfig: Annotation<PhasedGenerationConfig>({
+    reducer: (x, y) => y ?? x,
+  }),
+});
+
+export type JimClawState = typeof JimClawState.State;
+
+function extractText(content: any): string {
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((b: any) => typeof b === "string" || b.type === "text")
+      .map((b: any) => typeof b === "string" ? b : b.text)
+      .join("\n");
+  }
+  return String(content);
+}
+
+// 改进 8 + 3：重写 parseJsonFromResponse，支持数组提取，失败时打印警告
+function parseJsonFromResponse(content: string, defaultValue: any): any {
+  const text = content.trim();
+  const cleaned = text.replace(/```json\s*/g, "").replace(/```\s*/g, "").trim();
+
+  // 1. 先尝试整体直接解析
+  try {
+    return JSON.parse(cleaned);
+  } catch {}
+
+  // 2. 提取最外层数组 [...]
+  const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
+  if (arrayMatch) {
+    try {
+      return JSON.parse(arrayMatch[0]);
+    } catch {}
+  }
+
+  // 3. 提取最外层对象 {...}
+  const objMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (objMatch) {
+    try {
+      return JSON.parse(objMatch[0]);
+    } catch {}
+  }
+
+  // 全部失败：警告并回退
+  console.warn("[parseJson] 解析失败，回退到默认值:", text.slice(0, 300));
+  return defaultValue;
+}
+
+/**
+ * 在 Docker 容器内执行 shell 命令，将工作目录定为 /app
+ * background=true 时使用 docker exec -d（立即返回），用于启动后台进程
+ */
+async function execInContainer(containerId: string, command: string, opts: { timeout?: number; background?: boolean } = {}): Promise<string> {
+  if (opts.background) {
+    // docker exec -d 启动后即返回，无需 isBackground
+    return ShellExecuteSkill.config.run({
+      command: `docker exec -d ${containerId} sh -c ${JSON.stringify(command)}`,
+      timeout: 10000,
+    });
+  }
+  return ShellExecuteSkill.config.run({
+    command: `docker exec ${containerId} sh -c ${JSON.stringify(command)}`,
+    timeout: opts.timeout ?? 90000,
+  });
+}
+
+export async function createJimClowGraph(agents: {
+  pm: BaseAgent;
+  architect: BaseAgent;
+  coder: BaseAgent;
+  qa: BaseAgent;
+}, onEvent?: (event: { type: string; sender: string; content: string; metadata?: any }) => void) {
+  const maxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+  const WORKSPACE = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
+  // 通知 FileWriteSkill 当前 workspace 路径，防止 Coder agent 向 workspace 外写入文件
+  process.env.JIMCLAW_WORKSPACE = WORKSPACE;
+
+  // 打印生效配置，方便确认
+  const globalCfg = ModelManager.getGlobalConfig();
+
+  // ========== 改进: 初始化模板引擎 ==========
+  const templateEngine = getTemplateEngine();
+  await templateEngine.loadTemplates();
+  console.log(`[Graph] 模板引擎已就绪，加载了 ${templateEngine.getTemplateCount()} 个模板`);
+  console.log(`[Config] maxRetries=${maxRetries} | workspace=${globalCfg?.workspaceDir ?? "./workspace"} | enableEvolution=${globalCfg?.enableEvolution ?? false}`);
+
+  const emit = (type: string, sender: string, content: string, metadata?: any) => {
+    if (onEvent) {
+      onEvent({ type, sender, content, metadata });
+    }
+  };
+
+  // 立即暴露 workspace 路径，供调用方归档或展示
+  emit("workspace-ready", "System", WORKSPACE, { workspacePath: WORKSPACE });
+
+  const workflow = new StateGraph(JimClawState)
+    .addNode("pm", async (state: JimClawState) => {
+      console.log(`--- [产品经理 ${agents.pm.getPersona().name}] 正在定义任务契约 ---`);
+      emit("phase-change", "System", "requirement");
+      emit("thinking", agents.pm.getPersona().name, "正在根据用户目标起草任务契约...");
+
+      const goal = state.userGoal || "一个简单的计数器应用";
+      const response = await agents.pm.chat([
+        { role: "user", content: `请为以下目标定义任务契约：${goal}。要求必须包含一个可测试的验证脚本。请仅输出 JSON 格式：title, requirements, acceptanceCriteria。请确保内容使用中文描述。` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在分析处理" : "分析完成", ev), { brief: state.projectBrief });
+
+      const contract = parseJsonFromResponse(extractText(response.content), { title: "待办任务", requirements: [], acceptanceCriteria: [] });
+
+      // 改进 3：safeParse 校验
+      const validation = TaskContractSchema.safeParse(contract);
+      if (!validation.success) {
+        console.warn("[PM] TaskContract 校验失败:", validation.error.message);
+      }
+
+      await fs.mkdir(WORKSPACE, { recursive: true });
+      await fs.writeFile(path.join(WORKSPACE, "contract.json"), JSON.stringify(contract, null, 2));
+
+      emit("artifact", agents.pm.getPersona().name, "任务契约已就绪。", { contract });
+      return {
+        contract,
+        teamChatLog: [{ sender: agents.pm.getPersona().name, content: `我已经定义好了任务契约。` }]
+      };
+    })
+    .addNode("architect", async (state: JimClawState) => {
+      console.log(`--- [架构师 ${agents.architect.getPersona().name}] 正在进行技术设计 ---`);
+      emit("phase-change", "System", "design");
+      emit("thinking", agents.architect.getPersona().name, "正在制定技术规范...");
+
+      const response = await agents.architect.chat([
+        { role: "user", content: `基于此契约：${JSON.stringify(state.contract)}，设计极简可运行的技术规范。
+
+第一步（必须先执行）：
+• 调用 get_server_ip 工具获取服务器真实 IP
+• 调用 find_free_port 工具获取空闲端口（从 4000 起）
+• 将真实 IP 和端口填入 spec.entryPoint（格式：http://<真实IP>:<空闲端口>）
+
+强制要求：
+1. 优先使用单文件架构或极简目录结构。
+2. 数据持久化优先使用内存或 SQLite，严禁在没有明确要求时引入 MongoDB/Redis 等外部依赖。
+3. 必须包含完整的 package.json 定义。
+4. filesToCreate 必须包含一个单元测试文件，文件名和 testCommand 按实际语言选择：
+   | 语言       | 单元测试文件名       | testCommand                        |
+   |-----------|--------------------|------------------------------------|
+   | JavaScript | unit_test.js       | node unit_test.js                  |
+   | TypeScript | unit_test.ts       | npx ts-node unit_test.ts           |
+   | Python     | test_unit.py       | python test_unit.py                |
+   | Java       | 符合 Maven 目录结构  | mvn test                           |
+   | Go         | *_test.go          | go test ./...                      |
+   | 其他        | 遵循语言惯例         | 对应测试命令                          |
+   - 单元测试只测导出的纯函数（不依赖 HTTP/DB/网络）
+   - 集成测试（HTTP 端点验证）由 QA 节点负责，无需写入 filesToCreate
+   - 严禁在单元测试文件中引入 HTTP 客户端或启动任何 server
+   - runCommand 按语言选择（见下方规则 10/11），不要用错
+5. 前端文件规则（重要）：
+   - 若契约中包含"前端"/"界面"/"前后端"/"UI"/"web"等关键词，filesToCreate 必须包含 public/index.html
+   - public/index.html 是完整的单文件 HTML，内嵌 CSS 样式和 JavaScript，通过 fetch() 调用后端 API
+   - 严禁引入 Vue/React/Svelte 等现代前端框架或 npm 前端构建依赖（现代框架支持为未来规划）
+   - 后端（Express/Koa 等）必须将 public/ 目录挂载为静态资源：app.use(express.static('public'))
+6. language 字段必须与 filesToCreate 中的文件扩展名一致。
+7. apiContract.endpoints 必须根据契约需求枚举所有 HTTP 端点，严禁输出空数组。
+8. entryPoint 必须使用工具返回的真实 IP 和端口，严禁使用 localhost 或硬编码 3000。
+9. 生成的应用必须通过环境变量读取端口（如 process.env.PORT / os.environ.get('PORT') / System.getenv("PORT")），runCommand 无需指定端口（由部署层注入）。
+10. JavaScript 项目规则：
+    - runCommand 必须是：node server.js（直接运行，无需编译）
+    - filesToCreate 中绝对不能包含 tsconfig.json（JavaScript 不需要 TypeScript 配置）
+    - 严禁对 JavaScript 项目使用 npx tsc 或 npx ts-node 命令
+11. package.json 依赖分类规则（严格执行）：
+    - express / fastify / koa / sqlite3 / axios 等运行时需要的库 → 必须放 "dependencies"
+    - typescript / ts-node / @types/* / jest / eslint 等仅开发需要的工具 → 放 "devDependencies"
+    - 严禁将 express 等服务器运行时依赖放进 devDependencies，否则生产环境无法启动
+12. TypeScript 项目规则：
+    - filesToCreate 必须包含 tsconfig.json（内容见下方规范）
+    - runCommand 必须是先编译再运行：npx tsc && node dist/server.js
+    - 严禁用 npx ts-node server.ts 作为 runCommand（ts-node 冷启动耗时 8-10 秒，会导致部署超时）
+    - testCommand 仍可使用 ts-node（单元测试一次性执行可接受）
+    - tsconfig.json 内容规范：
+      {
+        "compilerOptions": { "target": "ES2020", "module": "commonjs", "outDir": "dist",
+          "esModuleInterop": true, "skipLibCheck": true, "strict": false },
+        "include": ["./*.ts"],
+        "exclude": ["node_modules", "dist"]
+      }
+13. Docker 部署规则（应用将运行在 Docker 容器中，前端资源路由必须兼容容器环境）：
+    - 前端 HTML 的所有 API 调用必须使用相对路径（'/api/items'）或 window.location.origin，严禁硬编码 'http://localhost:PORT' 或 'http://IP:PORT'
+    - 后端 app.listen() 必须绑定 '0.0.0.0'（不限任何接口），示例：app.listen(PORT, '0.0.0.0', ...）
+    - entryPoint 中的 IP（如 10.x.x.x）是宿主机对外地址，绝对不能作为 app.listen() 的 host 参数
+    - 容器端口映射已由系统自动处理，runCommand 无需指定 IP，只需读取 process.env.PORT
+
+完成工具调用后，仅输出格式完全扁平的 JSON，严格匹配以下结构（testCommand/filesToCreate 按实际语言填写）：
+{
+  "spec": { "architecture": "单体应用", "language": "<实际语言>", "testCommand": "<按语言选择>", "runCommand": "<按语言选择>", "entryPoint": "http://<工具返回的真实IP>:<工具返回的空闲端口>", "filesToCreate": ["<按语言选择，含单元测试文件，若有前端需求则加 public/index.html>"], "interfaces": "描述模块间接口" },
+  "manifest": { "services": [{ "name": "api", "port": <工具返回的空闲端口> }], "environment": { "PORT": "<工具返回的空闲端口>" } },
+  "apiContract": {
+    "endpoints": [
+      { "path": "/api/items", "method": "GET", "description": "获取所有条目", "responseBody": { "type": "array" } }
+    ]
+  }
+}
+
+注意：endpoints 示例仅供格式参考，必须根据契约实际需求定义真实端点。
+注意：filesToCreate 示例仅供格式参考，若契约含前端需求，必须将 public/index.html 加入列表。` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在制定技术规范" : ev.type === 'tool_use' ? ev.content : "技术规范已完成", ev), { brief: state.projectBrief });
+
+      const output = parseJsonFromResponse(extractText(response.content), {});
+      const spec = output.spec || { architecture: "未知", language: "TypeScript", testCommand: "npm test", runCommand: "npm start", entryPoint: "http://localhost:3000", filesToCreate: [] };
+      const manifest = output.manifest || { services: [], environment: {} };
+      const apiContract = output.apiContract || { endpoints: [] };
+
+      // 改进 3：safeParse 校验
+      const specValidation = TechSpecSchema.safeParse(spec);
+      if (!specValidation.success) {
+        console.warn("[Architect] TechSpec 校验失败:", specValidation.error.message);
+      }
+
+      const readmeResponse = await agents.architect.chat([
+        { role: "user", content: `为该项目生成一份中文的 README.md。` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在分析处理" : "分析完成", ev), { brief: state.projectBrief });
+
+      await fs.writeFile(path.join(WORKSPACE, "spec.json"), JSON.stringify(spec, null, 2));
+      await fs.writeFile(path.join(WORKSPACE, "manifest.json"), JSON.stringify(manifest, null, 2));
+      await fs.writeFile(path.join(WORKSPACE, "api_contract.json"), JSON.stringify(apiContract, null, 2));
+      await fs.writeFile(path.join(WORKSPACE, "README.md"), extractText(readmeResponse.content));
+
+      // 架构师决策写入团队共识
+      const endpointSummary = apiContract.endpoints.map((e: any) => `${e.method} ${e.path}`).join(", ");
+      const archBrief = [
+        `[Architect] 语言: ${spec.language} | 测试命令: ${spec.testCommand} | 运行命令: ${spec.runCommand}`,
+        `[Architect] 测试约束: 单元测试文件只能测导出的纯函数，严禁使用 supertest/axios/fetch 等 HTTP 客户端`,
+        `[Architect] API 端点: ${endpointSummary || "无"}`,
+        `[Architect] 入口: ${spec.entryPoint}`,
+      ];
+
+
+      // ========== 改进 1: 模板推荐 ==========
+      const language = spec.language || "TypeScript";
+      const features = Object.entries(state.contract?.requirements || {})
+        .filter(([_, v]) => typeof v === "string" && (v.includes("前端") || v.includes("界面") || v.includes("web")))
+        .map(([k, _]) => k);
+      const hasFrontend = spec.filesToCreate.some((f: string) => f.endsWith(".html"));
+      if (hasFrontend) features.push("static_files");
+
+      const template = templateEngine.recommendTemplate(language, features);
+      if (template) {
+        console.log(`[Architect] 推荐模板: ${template.name} (${template.id})`);
+        archBrief.push(`[Architect] 推荐模板: ${template.name}`);
+
+        // 获取脚手架命令和中间件配置
+        const scaffoldingCmd = getScaffoldingCommand(language, spec.framework);
+        if (scaffoldingCmd) {
+          console.log(`[Architect] 脚手架命令: ${scaffoldingCmd.command} ${scaffoldingCmd.args.join(" ")}`);
+        }
+
+        const middlewares = REQUIRED_MIDDLEWARE[language.toLowerCase()] || [];
+        const requiredMiddlewareNames = middlewares.filter((m: MiddlewareSpec) => m.required).map((m: MiddlewareSpec) => m.name);
+        console.log(`[Architect] 必备中间件: ${requiredMiddlewareNames.join(", ")}`);
+        archBrief.push(`[Architect] 必备中间件: ${requiredMiddlewareNames.join(", ")}`);
+      }
+      emit("artifact", agents.architect.getPersona().name, "技术方案已完成。", { spec, manifest, apiContract });
+      return {
+        templateId: template?.id,
+        spec, manifest, apiContract,
+        projectBrief: archBrief,
+        teamChatLog: [{ sender: agents.architect.getPersona().name, content: "我已完成系统设计。" }]
+      };
+    })
+    .addNode("contract_sync", async (state: JimClawState) => {
+      console.log(`--- [测试工程师 ${agents.qa.getPersona().name}] 正在进行契约校对 ---`);
+      emit("phase-change", "System", "sync");
+      const apiContract = state.apiContract;
+      if (!apiContract || !apiContract.endpoints?.length) {
+        console.warn("[ContractSync] apiContract.endpoints 为空，跳过契约校验。架构师未生成 API 端点定义，这可能导致 coder 和 test 文件之间的路由不一致。");
+        return { teamChatLog: [] };
+      }
+
+      // 改进 6：本地静态校验
+      const validationErrors: string[] = [];
+      const seen = new Set<string>();
+      for (const ep of apiContract.endpoints) {
+        const result = ApiEndpointSchema.safeParse(ep);
+        if (!result.success) {
+          validationErrors.push(`端点 [${ep.method} ${ep.path}]: ${result.error.message}`);
+        }
+        const key = `${ep.method}:${ep.path}`;
+        if (seen.has(key)) {
+          validationErrors.push(`重复端点: ${key}`);
+        } else {
+          seen.add(key);
+        }
+      }
+      if (validationErrors.length > 0) {
+        console.warn("[ContractSync] API 契约静态校验发现问题:\n" + validationErrors.join("\n"));
+      }
+
+      const validationNote = validationErrors.length > 0
+        ? `\n\n注意：静态校验发现以下问题，请一并修正：\n${validationErrors.join("\n")}`
+        : "";
+
+      const response = await agents.qa.chat([
+        { role: "user", content: `审查 API 契约：${JSON.stringify(apiContract)}${validationNote}` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在审查 API 契约" : "契约审查完成", ev), { brief: state.projectBrief, workspaceDir: WORKSPACE });
+      const validatedContract = parseJsonFromResponse(extractText(response.content), apiContract);
+      await fs.writeFile(path.join(WORKSPACE, "api_contract_validated.json"), JSON.stringify(validatedContract, null, 2));
+      return { apiContract: validatedContract };
+    })
+    .addNode("approval", async (state: JimClawState) => {
+      console.log(`--- [系统] 等待人工审批 ---`);
+      emit("phase-change", "System", "approval");
+      emit("approval_required", "系统", "方案设计已就绪，请审阅。", { spec: state.spec, manifest: state.manifest });
+      return { requiresApproval: true };
+    })
+    .addNode("orchestrator", async (state: JimClawState) => {
+      console.log(`--- [产品经理 ${agents.pm.getPersona().name}] 正在拆解开发任务 ---`);
+      emit("phase-change", "System", "planning");
+      const response = await agents.pm.chat([
+        { role: "user", content: `基于规范：${JSON.stringify(state.spec)}，拆解为具体子任务。
+          强制执行顺序：
+          1. 数组的第一个任务必须是生成 'package.json'，以确保依赖可被安装。
+          2. 数组的第二个任务必须是核心入口文件（如 server.js）。
+          3. 必须包含一个简单的验证测试文件（如 test.js）。
+
+          仅输出 JSON 数组，格式为：
+          [{ "id": "task_1", "description": "...", "fileTarget": "package.json", "dependencies": [], "contextRequirement": "..." }]` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在分析处理" : "分析完成", ev), { brief: state.projectBrief });
+
+      const rawSubTasks = parseJsonFromResponse(extractText(response.content), []);
+
+      // 改进 3：safeParse 校验
+      const validation = SubTaskArraySchema.safeParse(rawSubTasks);
+      if (!validation.success) {
+        console.warn("[Orchestrator] SubTask 数组校验失败:", validation.error.message);
+      }
+
+      const subTasks = rawSubTasks.map((t: any) => ({ ...t, status: "pending" }));
+      return { subTasks };
+    })
+    .addNode("coder", async (state: JimClawState) => {
+      const currentRetry = state.retryCount || 0;
+      console.log(`--- [开发 ${agents.coder.getPersona().name}] 正在开发 (重试 ${currentRetry})... ---`);
+      emit("phase-change", "System", "coding");
+
+      const subTasks = state.subTasks || [];
+      const language = state.spec?.language || "TypeScript";
+      const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
+
+      // --- 全景视图增强：扫描现有文件列表 ---
+      const listFiles = async (dir: string): Promise<string[]> => {
+        try {
+          const files = await fs.readdir(dir, { recursive: true });
+          return (files as string[]).filter((f: string) => !f.includes("node_modules") && !f.includes(".git"));
+        } catch { return []; }
+      };
+      const existingFiles = await listFiles(WORKSPACE);
+      const projectTree = existingFiles.length > 0 ? `当前项目结构：\n${existingFiles.join("\n")}` : "当前项目为空白，请从基础文件开始。";
+
+      // 改进 9：跟踪 package.json hash，避免无变化时重复 npm install
+      let newPackageJsonHash = state.packageJsonHash || "";
+      const codeLogEntries: FileChangeEntry[] = [];
+
+      for (const task of subTasks) {
+          if (task.status === "completed" && currentRetry === 0) continue;
+
+          // QA retry：有明确失败文件列表时，只重跑失败的文件，跳过已通过的
+          // 例外：如果仲裁指令中包含该文件，则必须处理（不能跳过）
+          if (currentRetry > 0 && task.status === "completed") {
+            const failures = state.qaFailures;
+            const hasMediationForFile = state.mediationDirectives?.some(d => d.file === task.fileTarget);
+            if (failures && failures.failedFiles.length > 0 && !failures.failedFiles.includes(task.fileTarget) && !hasMediationForFile) {
+              emit("thinking", agents.coder.getPersona().name, `跳过未失败文件: ${task.fileTarget}`, { task });
+              codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "skipped" });
+              continue;
+            }
+          }
+
+          let filePassed = false;
+          let fileRetryCount = 0;
+          while (!filePassed && fileRetryCount < 3) {
+            emit("thinking", agents.coder.getPersona().name, `实现并自纠错: ${task.fileTarget} (尝试 ${fileRetryCount + 1})`, { task });
+
+            const relevantContext = task.dependencies
+              .map(f => filesContent[f] ? `文件: ${f}\n\`\`\`${language.toLowerCase()}\n${filesContent[f]}\n\`\`\`` : "")
+              .filter(c => c !== "").join("\n\n");
+
+            // 跨文件对齐上下文：test 文件自动注入实现文件；实现文件自动注入 test 文件
+            const isTestFile = /test|spec/i.test(task.fileTarget);
+            const crossFileContext: string[] = [];
+            if (isTestFile) {
+              // 找到实现文件（非 test/spec 且已生成）
+              const implFiles = Object.entries(filesContent)
+                .filter(([f]) => !/test|spec/i.test(f) && !f.endsWith("package.json") && f !== task.fileTarget);
+              for (const [f, c] of implFiles) {
+                crossFileContext.push(`文件: ${f}（此测试文件必须仅测试该文件中实际存在的路由和函数）\n\`\`\`\n${c}\n\`\`\``);
+              }
+            } else {
+              // 实现文件：注入当前 test 文件，让 coder 知道测试期望什么
+              const testFiles = Object.entries(filesContent)
+                .filter(([f]) => /test|spec/i.test(f));
+              for (const [f, c] of testFiles) {
+                crossFileContext.push(`文件: ${f}（你实现的代码必须满足该测试文件的所有测试用例）\n\`\`\`\n${c}\n\`\`\``);
+              }
+            }
+
+            // API契约约束
+            const apiContractBlock = state.apiContract?.endpoints?.length
+              ? `\n=== API 契约（必须严格遵守）===\n${JSON.stringify(state.apiContract.endpoints, null, 2)}`
+              : "";
+
+            // ── 精准修复 vs 全文件重写 ─────────────────────────────────────────
+            // QA 重试且文件已存在时，先尝试精准 patch（只改出问题的方法），失败再全文件重写
+            let code = "";
+            let raw = "";
+            const canPatch = currentRetry > 0 && fileRetryCount === 0 && !!filesContent[task.fileTarget];
+            if (canPatch) {
+              emit("thinking", agents.coder.getPersona().name, `精准修复: ${task.fileTarget}`, { task });
+              const patchFailures = state.qaFailures;
+              const patchErrDetail = [...(patchFailures?.testErrors || []), state.testResults || ""]
+                .filter(Boolean).join("\n").slice(0, 1000);
+              const patchPrompt = `[精准修复模式] 仅修改 ${task.fileTarget} 中导致测试失败的代码片段，保留其他逻辑不变。\n\n当前文件内容：\n\`\`\`\n${filesContent[task.fileTarget]}\n\`\`\`\n\n失败信息：\n${patchErrDetail}\n\n请输出 JSON 数组（禁止输出任何其他文字）：\n[\n  {"find": "原始代码片段（必须与文件完全一致，至少含完整的一行）", "replace": "修正后的代码片段", "reason": "修改原因"}\n]\n若需要全文件重写（如接口或结构不兼容）：[{"find":"__FULL_REWRITE__","replace":"完整代码","reason":"原因"}]`;
+              const patchResp = await agents.coder.chat(
+                [{ role: "user", content: patchPrompt }],
+                (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? `正在精准修复: ${task.fileTarget}` : "精准修复完成", ev),
+                { mode: "coding", brief: state.projectBrief }
+              );
+              const patchRaw = extractText(patchResp.content);
+              const patches = parseJsonFromResponse(patchRaw, null) as Array<{find: string; replace: string; reason?: string}> | null;
+              if (Array.isArray(patches) && patches.length > 0) {
+                const fullRewritePatch = patches.find((p: any) => p.find === "__FULL_REWRITE__");
+                if (fullRewritePatch) {
+                  code = fullRewritePatch.replace;
+                  console.log(`[Coder] 精准修复→全文件重写: ${task.fileTarget}`);
+                } else {
+                  let patched = filesContent[task.fileTarget];
+                  let patchFailed = false;
+                  for (const p of patches) {
+                    if (patched.includes(p.find)) {
+                      patched = patched.replace(p.find, p.replace);
+                      console.log(`[Coder] patch ${task.fileTarget}: ${(p.reason || p.find).slice(0, 80)}`);
+                    } else {
+                      console.warn(`[Coder] patch 定位失败 → 回退全文件重写: "${p.find.slice(0, 60)}"`);
+                      patchFailed = true;
+                      break;
+                    }
+                  }
+                  if (!patchFailed) {
+                    code = patched;
+                    emit("thinking", agents.coder.getPersona().name, `精准修复完成 (${patches.length} 处改动)`, { task });
+                  }
+                }
+              }
+            }
+
+            // 全文件重写（首次写入 / fileRetryCount > 0 / 精准修复失败时）
+            if (!code) {
+              let prompt = `
+[严格规则]
+• 禁止调用任何工具（read_file / write_file / lsp_diagnose 等）
+• 禁止输出任何解释、分析或中文说明文字
+• 只能输出目标文件的完整代码，必须用 markdown 代码块包裹：\`\`\`语言\n代码\n\`\`\`
+
+=== 全景视图 ===
+${projectTree}
+${apiContractBlock}
+
+=== 任务上下文 ===
+你正在处理文件: ${task.fileTarget}
+依赖信息: ${task.contextRequirement}
+相关文件内容:
+${relevantContext}
+${crossFileContext.length > 0 ? `\n=== 跨文件对齐（关键约束）===\n${crossFileContext.join("\n\n")}` : ""}
+`.trim();
+
+              if (fileRetryCount > 0) {
+                prompt += `\n\n[ERROR] 文件 ${task.fileTarget} 存在语法或类型错误：\n${task.lastError}\n\n请直接输出修复后的完整代码，并用 markdown 包装。`;
+              } else if (currentRetry > 0) {
+                // 优先使用结构化失败信息定向修复
+                const failures = state.qaFailures;
+                if (failures && failures.failedFiles.length > 0 && failures.failedFiles.includes(task.fileTarget)) {
+                  prompt += `\n\n[ERROR] 文件 ${task.fileTarget} 在 QA 测试中失败：`;
+                  if (failures.testErrors.length > 0) {
+                    prompt += `\n错误信息：\n${failures.testErrors.join("\n")}`;
+                  }
+                  if (failures.failedTestNames.length > 0) {
+                    prompt += `\n失败测试：${failures.failedTestNames.join(", ")}`;
+                  }
+                  prompt += `\n\n请根据以上具体错误修复此文件，直接输出修复后的完整代码，并用 markdown 包装。`;
+                } else {
+                  prompt += `\n\n[ERROR] 测试验证未通过，总体反馈为：\n${state.testResults}\n\n请根据反馈修改代码，直接输出修复后的完整代码，并用 markdown 包装。`;
+                }
+              } else {
+                const isServerFile = /server|app|index/i.test(task.fileTarget) && !isTestFile && !task.fileTarget.endsWith(".html");
+                const isHtmlFile = task.fileTarget.endsWith(".html");
+                const isUnitTestFile = isTestFile;
+                const hasFrontend = (state.spec?.filesToCreate || []).some(f => f.endsWith(".html"));
+                // 从 manifest 或 entryPoint 提取端口，用于 portConstraint 提示
+                const manifestPort = state.manifest?.services?.[0]?.port
+                  ?? (() => { try { return parseInt(new URL(state.spec?.entryPoint ?? "").port || "3000"); } catch { return 3000; } })();
+                const portConstraint = isServerFile
+                  ? `\n• 【端口三层模型 - 必须理解】应用运行在 Docker 容器内：` +
+                    `\n  - 服务端口（应用监听）= 容器端口（Docker 内部）= 宿主端口（外部访问）= ${manifestPort}` +
+                    `\n  - 三者数值相同，由 process.env.PORT 传入，严禁在代码里写死任何数字端口` +
+                    `\n• 监听端口必须且只能读取 process.env.PORT，不得有数字 fallback，示例：` +
+                    `\n  const PORT = parseInt(process.env.PORT!, 10);  // process.env.PORT 由系统保证已设置` +
+                    `\n• 必须包含 app.listen() 调用，明确绑定 '0.0.0.0'，并带 NODE_ENV 保护，完整模板：` +
+                    `\n  if (process.env.NODE_ENV !== 'test') {` +
+                    `\n    app.listen(PORT, '0.0.0.0', () => console.log(\`[服务] 已启动，端口 \${PORT}\`));` +
+                    `\n  }` +
+                    `\n• 【严禁】app.listen() 的 host 参数写任何具体 IP（如 '127.0.0.1' 或 '10.x.x.x'）` +
+                    `\n  spec.entryPoint 中的 IP 是宿主机对外地址，不是容器内绑定地址，不能用于 listen()` +
+                    `\n• 严禁只写 export default app 而不调用 listen，否则部署时进程立即退出` +
+                    (hasFrontend
+                      ? `\n• 【前端静态资源 - 必须】项目含 public/index.html，必须在路由定义之前挂载静态资源：` +
+                        `\n  app.use(express.static(path.join(__dirname, 'public')));` +
+                        `\n  访问根路径 / 才能打开前端页面，部署健康检查依赖此返回 200`
+                      : "")
+                  : "";
+
+                // 单元测试约束：按文件扩展名给出语言专属指引
+                let unitTestConstraint = "";
+                if (isUnitTestFile) {
+                  const ext = task.fileTarget.split(".").pop()?.toLowerCase() || "";
+                  const frameworkHint =
+                    ext === "js"  ? `使用 node:test + node:assert（内置，零依赖）。示例：\n  const { test } = require('node:test'); const assert = require('node:assert');` :
+                    ext === "ts"  ? `使用 node:test + node:assert（内置，零依赖）或 ts-node 兼容的测试框架。` :
+                    ext === "py"  ? `使用 Python 内置 unittest 模块（零依赖）。示例：\n  import unittest\n  class TestFunctions(unittest.TestCase): ...` :
+                    (ext === "java" || ext === "kt") ? `使用 JUnit（项目已有依赖）。只测 static 方法或无状态 service 类。` :
+                    ext === "go"  ? `使用 Go 内置 testing 包。` :
+                    `使用该语言内置的单元测试框架，避免引入额外依赖。`;
+
+                  unitTestConstraint =
+                    `\n\n[单元测试约束 - 必须遵守]\n` +
+                    `• ${frameworkHint}\n` +
+                    `• 只测导出的纯函数（validate/format/calculate/transform 等逻辑函数）\n` +
+                    `• 严禁引入任何 HTTP 客户端（supertest/axios/requests/OkHttp 等）\n` +
+                    `• 严禁启动 HTTP server 或发起任何网络请求\n` +
+                    `• 若实现文件没有可测的纯函数，只需验证主模块能被正常导入/实例化即可`;
+                }
+
+                // HTML 前端文件约束
+                let htmlConstraint = "";
+                if (isHtmlFile) {
+                  const apiEndpoints = (state.apiContract?.endpoints || [])
+                    .map(e => `${e.method} ${e.path}`)
+                    .join(", ");
+                  htmlConstraint =
+                    `\n\n[HTML 前端约束 - 必须遵守]\n` +
+                    `• 单文件完整 HTML，内嵌 <style> CSS 和 <script> JavaScript，无外部构建工具\n` +
+                    `• 严禁引入 Vue/React/Svelte/Angular 等框架，严禁使用 npm 前端依赖\n` +
+                    `• 所有后端 API 通过原生 fetch() 调用，API 端点列表：${apiEndpoints || "见 apiContract"}\n` +
+                    `• 后端地址使用 window.location.origin（不硬编码 IP/端口），示例：\n` +
+                    `  const API = window.location.origin;\n` +
+                    `  fetch(API + '/api/items')\n` +
+                    `• 必须包含完整功能界面：增删改查操作按钮和数据展示区域\n` +
+                    `• 样式使用现代简洁风格（flexbox/grid），确保在主流浏览器中正常显示`;
+                }
+                prompt += `\n\n请根据以上信息实现 ${task.fileTarget}。如果是配置文件（如 package.json, requirements.txt, Makefile），请包含所有必要的依赖。请仅输出代码并用 markdown 包装。${portConstraint}${unitTestConstraint}${htmlConstraint}`;
+              }
+
+              // 仲裁指令注入（测试文件过滤掉 HTTP 客户端相关指令，避免仲裁推翻单元测试约束）
+              const HTTP_CLIENT_PATTERN = /supertest|axios|fetch|http\.request|node-fetch|got\b/i;
+              const mediationForFile = state.mediationDirectives
+                ?.filter(d => d.file === task.fileTarget)
+                ?.filter(d => !(isTestFile && HTTP_CLIENT_PATTERN.test(d.detail)));
+              if (mediationForFile?.length) {
+                prompt += `\n\n[架构师仲裁指令 - 必须严格执行]\n`;
+                prompt += mediationForFile.map(d => `• [${d.action}] ${d.detail}`).join("\n");
+              }
+              // 测试文件额外提醒：无论仲裁指令如何，HTTP 禁令始终有效
+              if (isTestFile) {
+                prompt += `\n\n[单元测试铁律 - 优先级高于一切]\n• 严禁引入 supertest / axios / fetch / HTTP 客户端\n• 只测导出的纯函数，不测 HTTP 端点`;
+              }
+
+              const response = await agents.coder.chat([{ role: "user", content: prompt }], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? `正在自纠错: ${task.fileTarget}` : "自纠错完成", ev), { mode: "coding", brief: state.projectBrief });
+              raw = extractText(response.content);
+
+              // 提取 markdown 代码块内容；多个块时取最长的
+              const codeBlocks = [...raw.matchAll(/```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/g)];
+              if (codeBlocks.length > 0) {
+                code = codeBlocks.reduce((longest, cur) =>
+                  cur[1].length > longest[1].length ? cur : longest
+                )[1].trim();
+              } else {
+                code = raw.trim();
+              }
+
+              // 检测非代码内容（工具调用 JSON 或以中文开头的说明文字或空内容）
+              const isNotCode =
+                !code ||
+                /^[\u4e00-\u9fa5]/.test(code) ||
+                (code.startsWith("{") && /"command"\s*:/.test(code));
+              if (isNotCode) {
+                task.lastError = `[代码提取失败] LLM 输出了非代码内容（工具调用、说明文字或空响应）。必须直接用 markdown 代码块输出文件内容，禁止调用任何工具。原始输出：${raw.slice(0, 150)}`;
+                fileRetryCount++;
+                console.warn(`[Coder] ${task.fileTarget}: 检测到非代码输出，触发重试 (${fileRetryCount}/3)`);
+                continue;
+              }
+            }
+
+            filesContent[task.fileTarget] = code;
+            const filePath = path.join(WORKSPACE, task.fileTarget);
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(filePath, code);
+            console.log(`[Coder] 写入 ${task.fileTarget} (${Buffer.byteLength(code, 'utf8')} bytes)`);
+
+            // ── Todo-Enforcer（Sisyphus 原则）：拒绝 stub 代码 ───────────────
+            // 非 HTML 文件才检查（HTML 允许注释，JS/TS 的 TODO 才有意义）
+            if (!task.fileTarget.endsWith(".html") && fileRetryCount < 2) {
+              const INCOMPLETE_MARKERS = [
+                /\/\/\s*TODO\b/i,
+                /\/\/\s*FIXME\b/i,
+                /\/\/\s*HACK\b/i,
+                /throw new Error\(['"`]not implemented/i,
+                /throw new Error\(['"`]TODO/i,
+                /\/\*\s*placeholder/i,
+              ];
+              const incompleteLine = code.split("\n").find(l =>
+                INCOMPLETE_MARKERS.some(r => r.test(l)) && !l.trim().startsWith("//  ")
+              );
+              if (incompleteLine) {
+                task.lastError = `文件包含未完成标记，必须补全再提交：${incompleteLine.trim()}`;
+                console.warn(`[Coder] ⚠ Todo-Enforcer 触发：${task.fileTarget} 含未完成标记，强制重写 (${fileRetryCount + 1}/3)`);
+                fileRetryCount++;
+                continue;
+              }
+            }
+
+            // ── 依赖完整性验证 A：扫描外部 require/import，缺什么补什么 ──────────
+            if (task.fileTarget.match(/\.(js|ts)$/)) {
+              const NODE_BUILTINS = new Set([
+                "fs","path","http","https","os","crypto","net","url","util","stream",
+                "events","assert","buffer","child_process","cluster","dgram","dns",
+                "domain","module","process","punycode","querystring","readline",
+                "repl","string_decoder","timers","tls","vm","zlib",
+                "node:fs","node:path","node:http","node:https","node:os","node:crypto",
+                "node:net","node:url","node:util","node:stream","node:events",
+                "node:assert","node:buffer","node:child_process","node:test","node:readline",
+              ]);
+              // 提取所有外部包名（过滤内置模块和相对路径）
+              const requireMatches = [...code.matchAll(/require\(['"]([^'"./][^'"]*)['"]\)/g)].map(m => m[1].split("/")[0]);
+              const importMatches = [...code.matchAll(/(?:import|from)\s+['"]([^'"./][^'"]*)['"]/g)].map(m => m[1].split("/")[0]);
+              const usedPackages = [...new Set([...requireMatches, ...importMatches])].filter(p => !NODE_BUILTINS.has(p));
+
+              if (usedPackages.length > 0) {
+                const pkgJsonPath = path.join(WORKSPACE, "package.json");
+                try {
+                  const pkgRaw = await fs.readFile(pkgJsonPath, "utf-8");
+                  const pkg = JSON.parse(pkgRaw);
+                  const declared = new Set([
+                    ...Object.keys(pkg.dependencies || {}),
+                    ...Object.keys(pkg.devDependencies || {}),
+                  ]);
+                  const missing = usedPackages.filter(p => !declared.has(p));
+                  if (missing.length > 0) {
+                    console.log(`[Coder] 检测到未声明依赖: ${missing.join(", ")}，正在追加到 devDependencies...`);
+                    pkg.devDependencies = pkg.devDependencies || {};
+                    missing.forEach(p => { pkg.devDependencies[p] = "latest"; });
+                    const newPkgContent = JSON.stringify(pkg, null, 2);
+                    await fs.writeFile(pkgJsonPath, newPkgContent);
+                    filesContent["package.json"] = newPkgContent;
+                    await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && npm install --silent`, timeout: 300000 });
+                    if (state.containerId) {
+                      await execInContainer(state.containerId, "npm install --silent", { timeout: 300000 }).catch(() => {});
+                    }
+                    newPackageJsonHash = crypto.createHash("md5").update(newPkgContent).digest("hex");
+                    console.log(`[Coder] 已补充安装: ${missing.join(", ")}`);
+                  }
+                } catch {}
+              }
+
+              // ── 依赖完整性验证 B：扫描本地 require/import，目标文件不存在则报错 ──
+              const localRefs = [...code.matchAll(/require\(['"](\.\.?\/[^'"]+)['"]\)/g)].map(m => m[1])
+                .concat([...code.matchAll(/from\s+['"](\.\.?\/[^'"]+)['"]/g)].map(m => m[1]));
+              const missingLocal: string[] = [];
+              for (const ref of localRefs) {
+                // 补全扩展名尝试
+                const candidates = [ref, `${ref}.js`, `${ref}.ts`, `${ref}/index.js`, `${ref}/index.ts`];
+                const exists = await Promise.any(
+                  candidates.map(c => fs.access(path.join(WORKSPACE, c)).then(() => true))
+                ).catch(() => false);
+                if (!exists) missingLocal.push(ref);
+              }
+              if (missingLocal.length > 0) {
+                task.lastError = `[本地引用缺失] 以下本地文件不存在: ${missingLocal.join(", ")}。\n严禁引用不在 filesToCreate 列表中的本地文件，请将相关逻辑内联到当前文件，不要用 require/import 引用不存在的文件。`;
+                fileRetryCount++;
+                console.warn(`[Coder] ${task.fileTarget}: 本地引用缺失 ${missingLocal.join(", ")}，触发重试`);
+                continue;
+              }
+            }
+
+            // 改进 9：package.json hash 检查，未变化时跳过 npm install
+            if (task.fileTarget === "package.json") {
+              const newHash = crypto.createHash("md5").update(code).digest("hex");
+              if (newHash !== (state.packageJsonHash || "")) {
+                emit("thinking", "System", "检测到 package.json 变更，正在实时安装依赖以支持后续诊断...", { task });
+                await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && npm install --silent`, timeout: 300000 });
+                if (state.containerId) {
+                  await execInContainer(state.containerId, "npm install --silent", { timeout: 300000 }).catch(() => {});
+                }
+                newPackageJsonHash = newHash;
+              } else {
+                emit("thinking", "System", "[Coder] package.json 未变更，跳过 npm install", { task });
+                console.log("[Coder] package.json 未变更，跳过 npm install");
+              }
+            } else if (task.fileTarget === "requirements.txt") {
+              emit("thinking", "System", "检测到 requirements.txt，正在实时安装 Python 依赖...", { task });
+              await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && pip install -r requirements.txt --quiet`, timeout: 300000 });
+              if (state.containerId) {
+                await execInContainer(state.containerId, "pip install -r requirements.txt --quiet", { timeout: 300000 }).catch(() => {});
+              }
+            }
+
+            // --- 实时诊断与小步快跑 ---
+            if (task.fileTarget.match(/\.(ts|js|py)$/)) {
+               const diag = await LSPDiagnoseSkill.config.run({ file_path: filePath });
+               console.log(`[Coder] 诊断 ${task.fileTarget}: ${diag.slice(0, 500)}`);
+               if (diag.includes("[ERROR]")) {
+                  task.lastError = diag;
+                  fileRetryCount++;
+               } else {
+                  await LintFixSkill.config.run({ file_path: filePath });
+
+                  // 如果是测试文件，立即跑一下
+                  // 使用与 isTestFile 一致的大小写不敏感匹配
+                  if (/test|spec/i.test(task.fileTarget)) {
+                    // 检查代码是否违规使用 HTTP 客户端（supertest/axios/fetch 等）
+                    if (/require\s*\(\s*['"]supertest['"]|require\s*\(\s*['"]axios['"]/.test(code)) {
+                      task.lastError = `[单元测试违规] ${task.fileTarget} 使用了 HTTP 客户端（supertest/axios）。\n` +
+                        `单元测试只能测试导出的纯函数，严禁发起 HTTP 请求。\n` +
+                        `请改用 node:test + node:assert，只 require 纯函数并断言其返回值。\n` +
+                        `示例：const { validateTitle } = require('./server'); assert.strictEqual(validateTitle(''), false);`;
+                      fileRetryCount++;
+                      continue;
+                    }
+
+                    emit("thinking", "System", `检测到测试文件 ${task.fileTarget}，正在执行增量验证...`, { task });
+                    // 使用 spec.testCommand 而非硬编码运行器，确保 Jest/pytest/mvn 等框架正确运行
+                    // NODE_ENV=test 防止 server.js 的 app.listen() 在 require 时触发端口占用
+                    const specTestCmd = state.spec?.testCommand;
+                    const testCmd = specTestCmd
+                      ? `cd ${WORKSPACE} && NODE_ENV=test ${specTestCmd}`
+                      : language.toLowerCase() === "python"
+                        ? `cd ${WORKSPACE} && python3 ${task.fileTarget}`
+                        : `cd ${WORKSPACE} && NODE_ENV=test node ${task.fileTarget}`;
+                    const testRun = state.containerId
+                      ? await execInContainer(state.containerId, `NODE_ENV=test ${specTestCmd || `node ${task.fileTarget}`}`, { timeout: 60000 })
+                      : await ShellExecuteSkill.config.run({ command: testCmd, timeout: 60000 });
+                    console.log(`[Coder] 增量测试结果 (${specTestCmd || 'node'}):\n${testRun.slice(0, 2000)}`);
+                    // 检测各类测试框架的失败标志
+                    // 注意：node:test 输出 "ℹ fail 0" 表示0个失败（正常通过），不能误判为失败
+                    const zeroFails = /ℹ\s+fail\s+0\b/.test(testRun);
+                    const testFailed = !zeroFails && (
+                      testRun.includes("Error") || testRun.includes("Fail") ||
+                      testRun.includes(" fail") || testRun.includes("✖") || testRun.includes("not ok") ||
+                      testRun.includes("is not defined") || testRun.includes("Cannot find")
+                    );
+                    if (testFailed) {
+                      // EADDRINUSE：unit_test.js 触发了 server 监听，说明缺少 NODE_ENV 保护
+                      if (testRun.includes("EADDRINUSE")) {
+                        task.lastError = `[端口占用] ${task.fileTarget} 在运行时触发了 HTTP server 监听（EADDRINUSE）。\n` +
+                          `单元测试文件不能启动任何 HTTP server。修复方案二选一：\n` +
+                          `1. 完全不 require('./server')，只导入纯函数：const { myFn } = require('./utils');\n` +
+                          `2. 确保 server.js 的 app.listen() 被 NODE_ENV 保护（已设置 NODE_ENV=test 运行）。\n` +
+                          `当前 server.js 缺少保护。请在 server.js 中将 app.listen() 改为：\n` +
+                          `  if (process.env.NODE_ENV !== 'test') { app.listen(PORT, '0.0.0.0', ...); }`;
+                      // 识别 JS 框架不匹配：describe/it/expect 等全局变量未定义
+                      } else if (/ReferenceError:\s*(describe|it|expect|test|beforeAll|afterAll)\s+is not defined/.test(testRun)) {
+                        task.lastError = `[框架不匹配] testCommand="${specTestCmd}" 但 ${task.fileTarget} 使用了该命令不支持的测试全局变量。\n` +
+                          `请将 ${task.fileTarget} 改写为与 testCommand 匹配的框架：\n` +
+                          `• 若 testCommand="node <file>"，必须用 Node.js 内置 node:test（import { test, describe } from 'node:test'）\n` +
+                          `• 若 testCommand="npx jest --forceExit"，使用 Jest（describe/it/expect）\n` +
+                          `当前错误：${testRun.slice(0, 300)}`;
+                      } else {
+                        task.lastError = `增量测试失败（命令：${specTestCmd || 'node'}）：\n${testRun.slice(0, 1500)}`;
+                      }
+                      fileRetryCount++;
+                      continue;
+                    }
+                  }
+                  filePassed = true;
+               }
+            } else { filePassed = true; }
+          }
+          task.status = filePassed ? "completed" : "failed";
+          codeLogEntries.push({
+            round: currentRetry,
+            file: task.fileTarget,
+            taskTitle: task.description.slice(0, 80),
+            status: filePassed ? "written" : "error",
+            ...(filePassed ? {} : { error: task.lastError?.slice(0, 150) }),
+          });
+      }
+
+      // 如果 coder 自检已确认有文件失败（增量测试 3 次全败），
+      // 直接构造 qaFailures 传给下游，跳过 terminal+QA 的 LLM 调用，避免无谓循环
+      const selfDetectedFailures = subTasks.filter(t => t.status === "failed");
+      if (selfDetectedFailures.length > 0) {
+        const failedFiles = selfDetectedFailures.map(t => t.fileTarget);
+        const testErrors = selfDetectedFailures.map(t => t.lastError || "增量测试失败").filter(Boolean);
+        console.log(`[Coder] 自检发现 ${selfDetectedFailures.length} 个文件失败，直接构造 qaFailures 跳过 QA LLM: ${failedFiles.join(", ")}`);
+        return {
+          retryCount: currentRetry + 1,
+          code: JSON.stringify(filesContent, null, 2),
+          subTasks: [...subTasks],
+          packageJsonHash: newPackageJsonHash,
+          // 注入预构造的失败结果，terminal 和 QA 会读到这些
+          testResults: `[Coder 自检失败]\n${testErrors.join("\n")}`,
+          qaFailures: { failedFiles, testErrors, failedTestNames: failedFiles },
+          isDone: false,
+          codeLog: codeLogEntries,
+          teamChatLog: [{ sender: agents.coder.getPersona().name, content: `自检发现 ${failedFiles.join(", ")} 失败，已构造失败报告。` }]
+        };
+      }
+
+      return {
+        retryCount: currentRetry + 1,
+        code: JSON.stringify(filesContent, null, 2),
+        subTasks: [...subTasks],
+        packageJsonHash: newPackageJsonHash,
+        codeLog: codeLogEntries,
+        teamChatLog: [{ sender: agents.coder.getPersona().name, content: `开发与自检完成。` }]
+      };
+    })
+    .addNode("infra_setup", async (state: JimClawState) => {
+      // ── Docker 容器化执行：所有生成代码在隔离容器内运行 ──────────────────
+      const lang = state.spec?.language?.toLowerCase() ?? "javascript";
+      const image = lang.includes("python") ? "python:3.11-slim" : "node:20-alpine";
+
+      // 收集所有需要映射的端口（来自 SystemManifest.services + entryPoint 兜底）
+      const manifestPorts = (state.manifest?.services ?? [])
+        .map(s => s.port)
+        .filter((p): p is number => typeof p === "number" && p > 0);
+      if (manifestPorts.length === 0) {
+        try { manifestPorts.push(parseInt(new URL(state.spec?.entryPoint ?? "http://localhost:3000").port || "3000")); }
+        catch {}
+      }
+      const portFlags = [...new Set(manifestPorts)].map(p => `-p ${p}:${p}`).join(" ");
+
+      const runId = path.basename(WORKSPACE);
+      const containerName = `jimclaw_${runId}`;
+
+      // 检查是否已有运行中的容器（重试场景复用，避免重复冷启动）
+      let containerId = state.containerId || "";
+      if (containerId) {
+        const check = await ShellExecuteSkill.config.run({
+          command: `docker inspect --format='{{.State.Running}}' ${containerId} 2>/dev/null || echo false`,
+          timeout: 5000,
+        });
+        if (!check.includes("true")) {
+          containerId = ""; // 容器已死，重新启动
+        }
+      }
+
+      if (!containerId) {
+        // 清理同名旧容器（上次运行残留）
+        await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true`, timeout: 10000 });
+        emit("thinking", "System", `[容器] 启动隔离容器 ${containerName}（${image}），端口映射: ${portFlags || "无"}`);
+        console.log(`[InfraSetup] 启动容器 ${containerName}, 端口: ${portFlags}`);
+        const envFlags = Object.entries(state.manifest?.environment ?? {})
+          .map(([k, v]) => `-e ${k}=${v}`).join(" ");
+        const startOut = await ShellExecuteSkill.config.run({
+          command: `docker run -d --name ${containerName} ${portFlags} ${envFlags} -v "${WORKSPACE}:/app" -w /app --memory=1g --cpus=2 ${image} tail -f /dev/null`,
+          timeout: 60000,
+        });
+        // docker run -d 输出完整 64 位容器 ID
+        const idLine = startOut.split("\n").map(l => l.trim()).find(l => /^[a-f0-9]{12,}$/.test(l));
+        containerId = idLine || containerName;
+        console.log(`[InfraSetup] 容器已启动: ${containerId.slice(0, 12)}`);
+      } else {
+        emit("thinking", "System", `[容器] 复用已有容器 ${containerId.slice(0, 12)}`);
+        console.log(`[InfraSetup] 复用容器: ${containerId.slice(0, 12)}`);
+      }
+
+      // 在容器内安装依赖（node_modules 不存在时触发）
+      const nodeModulesPath = path.join(WORKSPACE, "node_modules");
+      const hasPkg = state.code.includes('"package.json"') || state.code.includes("package.json");
+      let needsInstall = false;
+      try { await fs.access(nodeModulesPath); } catch { needsInstall = true; }
+
+      if (needsInstall && hasPkg) {
+        emit("thinking", "System", "[容器] 执行 npm install...");
+        console.log("[InfraSetup] 在容器内执行 npm install...");
+        await execInContainer(containerId, "npm install --silent", { timeout: 300000 });
+      }
+
+      // docker-compose 项目额外处理（如有）
+      const dockerComposePath = path.join(WORKSPACE, "docker-compose.yml");
+      try {
+        await fs.access(dockerComposePath);
+        await DockerSkill.config.run({ command: "docker-compose up -d", workDir: WORKSPACE });
+      } catch {}
+
+      return { containerId, teamChatLog: [{ sender: agents.qa.getPersona().name, content: `基础设施已就绪，容器 ${containerName} 运行中。` }] };
+    })
+    .addNode("terminal", async (state: JimClawState) => {
+      emit("phase-change", "System", "verification");
+      const testCmd = state.spec?.testCommand || "node index.js";
+      console.log(`[Terminal] 在容器内执行测试: NODE_ENV=test ${testCmd}`);
+      const result = state.containerId
+        ? await execInContainer(state.containerId, `NODE_ENV=test ${testCmd}`, { timeout: 90000 })
+        : await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && NODE_ENV=test ${testCmd}`, timeout: 90000 });
+      console.log(`[Terminal] 测试输出:\n${result.slice(0, 1000)}`);
+      return { testResults: result };
+    })
+    .addNode("verifier", async (state: JimClawState) => {
+      // ── Atlas 原则：永不信任 Coder 的声称，独立读文件验证 ──────────────────
+      console.log(`--- [Verifier] 预检：独立验证文件完整性 ---`);
+      emit("thinking", "System", "正在进行 Pre-QA 独立验证...");
+
+      const issues: string[] = [];
+      const filesToCreate = state.spec?.filesToCreate || [];
+
+      // 检查 1：所有 spec 要求的文件是否真实存在
+      for (const f of filesToCreate) {
+        const fp = path.join(WORKSPACE, f);
+        try { await fs.access(fp); } catch {
+          issues.push(`文件缺失：${f}（spec 要求但 Coder 未创建）`);
+        }
+      }
+
+      // 检查 2：server 文件的 require/import 包是否都在 package.json dependencies
+      const serverFile = filesToCreate.find(f => /server|app/i.test(f) && !/test|spec/i.test(f) && !f.endsWith(".html"));
+      if (serverFile) {
+        try {
+          const serverContent = await fs.readFile(path.join(WORKSPACE, serverFile), "utf-8");
+          const pkgRaw = await fs.readFile(path.join(WORKSPACE, "package.json"), "utf-8");
+          const pkg = JSON.parse(pkgRaw);
+          const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
+          const runtimeDeps = pkg.dependencies || {};
+          const NODE_BUILTINS = new Set([
+            "fs","path","http","https","os","crypto","net","url","util","stream",
+            "events","assert","buffer","child_process","node:fs","node:path",
+            "node:http","node:assert","node:test","node:events","node:crypto",
+          ]);
+          const requires = [
+            ...[...serverContent.matchAll(/require\(['"]([^'"./][^'"]*)['"]\)/g)].map(m => m[1].split("/")[0]),
+            ...[...serverContent.matchAll(/from ['"]([^'"./][^'"]*)['"]/g)].map(m => m[1].split("/")[0]),
+          ];
+          for (const pkg of [...new Set(requires)]) {
+            if (!NODE_BUILTINS.has(pkg) && !runtimeDeps[pkg] && allDeps[pkg]) {
+              issues.push(`依赖分类错误：${pkg} 在 devDependencies，运行时会 Cannot find module`);
+            } else if (!NODE_BUILTINS.has(pkg) && !allDeps[pkg]) {
+              issues.push(`依赖缺失：${pkg} 未在 package.json 中声明`);
+            }
+          }
+
+          // 检查 3：server 是否有 app.listen()，且绑定了 0.0.0.0
+          if (!/app\.listen\(|server\.listen\(/.test(serverContent)) {
+            issues.push(`${serverFile} 缺少 app.listen()，部署后进程会立即退出`);
+          } else if (!/listen\([^,)]*,\s*['"]0\.0\.0\.0['"]/.test(serverContent)) {
+            issues.push(`${serverFile} 的 app.listen() 未绑定 '0.0.0.0'，容器内服务无法被宿主访问。` +
+              `正确写法：app.listen(PORT, '0.0.0.0', callback)`);
+          }
+          // 检查 3b：process.env.PORT 使用（禁止硬编码端口作为 listen 参数）
+          if (/app\.listen\(\s*\d{4,5}\s*[,)]/.test(serverContent)) {
+            issues.push(`${serverFile} 的 app.listen() 直接使用了硬编码端口数字，必须改用 process.env.PORT`);
+          }
+        } catch (e: any) {
+          console.warn(`[Verifier] 读取文件失败: ${e.message}`);
+        }
+      }
+
+      // 检查 4：测试文件是否有实际断言（非空壳）
+      const testFile = filesToCreate.find(f => /test|spec/i.test(f) && !f.endsWith(".html"));
+      if (testFile) {
+        try {
+          const testContent = await fs.readFile(path.join(WORKSPACE, testFile), "utf-8");
+          if (!/assert\.|expect\(|\.equal\(|\.ok\(|\.strictEqual\(/.test(testContent)) {
+            issues.push(`${testFile} 没有实际断言（assert./expect()），测试是空壳，永远通过`);
+          }
+        } catch {}
+      }
+
+      // 检测是否为跨文件问题（涉及 2+ 文件的问题，需要架构师层面协调）
+      const isCrossFileIssue = issues.some(i =>
+        i.includes("接口") || i.includes("契约") || i.includes("跨文件") ||
+        (serverFile && testFile && issues.length >= 2)
+      );
+
+      if (issues.length === 0) {
+        console.log(`[Verifier] ✓ 预检通过，进入 QA`);
+        return {};
+      }
+
+      // 发现问题，根据问题类型决定路由策略
+      console.log(`[Verifier] ❌ 预检发现 ${issues.length} 个问题：\n${issues.map(i => `  • ${i}`).join("\n")}`);
+
+      // 跨文件问题 + 尚未仲裁 → 直连架构师，跳过 QA 和 Coder 自救
+      if (isCrossFileIssue && !state.mediationDirectives && state.retryCount < 2) {
+        console.log(`[Verifier] 检测到跨文件问题，提前触发架构师仲裁...`);
+        return {
+          isDone: false,
+          retryCount: 2,  // 直接设置为 2，触发仲裁流程
+          qaFailures: {
+            failedFiles: [serverFile || "", testFile || ""].filter(Boolean),
+            testErrors: issues,
+            failedTestNames: [],
+          },
+          testResults: `[Verifier 预检失败 - 跨文件问题]\n${issues.join("\n")}`,
+          projectBrief: [`[Verifier 预检] 发现跨文件问题，需要架构师协调`],
+          teamChatLog: [{ sender: "System", content: `预检发现跨文件问题，请求架构师仲裁` }],
+        };
+      }
+
+      // 单文件问题 → 直接路由回 Coder
+      const allFiles = (state.subTasks || []).map(t => t.fileTarget);
+      const failedFiles = [...new Set([
+        serverFile,
+        testFile,
+        ...issues.map(i => allFiles.find(f => i.includes(f))).filter(Boolean),
+      ].filter(Boolean) as string[])];
+
+      return {
+        isDone: false,
+        retryCount: (state.retryCount || 0) + 1,
+        qaFailures: {
+          failedFiles,
+          testErrors: issues,
+          failedTestNames: [],
+        },
+        testResults: `[Verifier 预检失败]\n${issues.join("\n")}`,
+        projectBrief: [`[Verifier 预检] ${issues[0].slice(0, 200)}`],
+        teamChatLog: [{ sender: "System", content: `预检失败：${issues[0]}` }],
+      };
+    })
+    .addNode("qa", async (state: JimClawState) => {
+      console.log(`--- [测试工程师 ${agents.qa.getPersona().name}] 正在评估 ---`);
+
+      // 从测试输出提取有意义的错误行，过滤掉 shell 包装层（如 "Command failed with exit code 1"）
+      // 并将其格式化为可指导下一轮修复的洞察字符串；无有效内容时返回 null
+      // 提取测试失败的核心洞察（增强版：保留完整错误上下文）
+      function extractInsight(output: string, label: string, round: number): string | null {
+        const SHELL_NOISE = /command failed with exit code|npm warn|npm notice|npm err!/i;
+        const ERROR_PATTERN = /error|assert|fail|timeout|cannot|undefined|unexpected|refused|econnrefused|typeerror|syntaxerror|referenceerror|module not found/i;
+        const lines = output.split("\n");
+
+        // 找到第一个错误行的位置
+        let firstErrorIdx = -1;
+        for (let i = 0; i < lines.length; i++) {
+          const line = lines[i].trim();
+          if (line.length > 5 && ERROR_PATTERN.test(line) && !SHELL_NOISE.test(line)) {
+            firstErrorIdx = i;
+            break;
+          }
+        }
+
+        if (firstErrorIdx === -1) return null;
+
+        // 收集错误上下文：错误行前后 3 行 + 错误堆栈（通常是连续的行）
+        const contextStart = Math.max(0, firstErrorIdx - 3);
+        const contextLines: string[] = [];
+
+        for (let i = contextStart; i < lines.length && contextLines.length < 15; i++) {
+          const line = lines[i].trim();
+          // 停止条件：遇到另一个无关测试的结果
+          if (contextLines.length > 0 && line.match(/^(passing|failing|tests)/i)) break;
+          if (line.length > 0) {
+            contextLines.push(line);
+          }
+        }
+
+        const insight = contextLines.join("\n").slice(0, 800);
+        return `[QA 第${round}轮 ${label}]\n${insight}`;
+      }
+
+      // coder 自检失败时直接使用已有的 qaFailures，跳过 LLM 评审，避免无效调用
+      if (state.testResults?.startsWith("[Coder 自检失败]") && state.qaFailures) {
+        console.log(`[QA] coder 自检已确认失败，跳过 LLM 直接路由重试。失败文件: ${state.qaFailures.failedFiles.join(", ")}`);
+        emit("thinking", agents.qa.getPersona().name, `coder 自检失败，直接下发重试指令`, {});
+        return {
+          isDone: false,
+          teamChatLog: [{ sender: agents.qa.getPersona().name, content: "coder 自检失败，直接重试。" }]
+        };
+      }
+
+      // ── 阶段 1：单元测试结果评估 ─────────────────────────────────────
+      const rawUnitOutput = state.testResults || "";
+      const unitTestFail =
+        rawUnitOutput.includes("Command failed") ||
+        rawUnitOutput.includes("Error:") ||
+        rawUnitOutput.includes("error:") ||
+        rawUnitOutput.includes("is not defined") ||
+        rawUnitOutput.includes("Cannot find") ||
+        rawUnitOutput.includes("✖") ||
+        rawUnitOutput.includes("not ok") ||
+        /failed?\s*\d+/i.test(rawUnitOutput);
+
+      if (unitTestFail) {
+        console.log(`[QA] ❌ 单元测试失败，跳过集成测试`);
+        const errLines = rawUnitOutput.split("\n").filter(l => /error|fail|assert/i.test(l)).slice(0, 5);
+        // 从 subTasks 提取实际文件名，避免硬编码 .js 扩展名
+        const allFiles = (state.subTasks || []).map(t => t.fileTarget);
+        const testFile = allFiles.find(f => /test|spec/i.test(f)) || "unit_test.js";
+        const implFile = allFiles.find(f => !/test|spec/i.test(f) && !f.endsWith("package.json")) || "server.js";
+        // 若错误信息提到某个文件，优先使用该文件
+        const mentionedFiles = allFiles.filter(f => rawUnitOutput.includes(f));
+        const failedFiles = mentionedFiles.length > 0
+          ? [...new Set([...mentionedFiles, implFile])]
+          : [testFile, implFile];
+        const qaFailures = {
+          failedFiles,
+          testErrors: errLines.length ? errLines : [rawUnitOutput.slice(0, 400)],
+          failedTestNames: [],
+        };
+        const errSummary = errLines[0] || rawUnitOutput.slice(0, 500);
+        const insight = extractInsight(rawUnitOutput, "单元测试", state.retryCount);
+        return {
+          isDone: false,
+          testResults: rawUnitOutput,
+          qaFailures,
+          projectBrief: insight ? [insight] : [],
+          teamChatLog: [{ sender: agents.qa.getPersona().name, content: `单元测试失败（第${state.retryCount}轮）。错误：${errSummary}` }]
+        };
+      }
+
+      console.log(`[QA] ✓ 单元测试通过，开始集成测试...`);
+      emit("thinking", agents.qa.getPersona().name, "单元测试通过，正在执行集成测试...");
+
+      // ── 阶段 2：启动 server ───────────────────────────────────────────
+      const entryPoint = state.spec?.entryPoint || "http://localhost:3000";
+      let port = "3000";
+      try { port = new URL(entryPoint).port || "3000"; } catch {}
+      const runCmd = state.spec?.runCommand || "node server.js";
+
+      console.log(`[QA] 启动 server：PORT=${port} ${runCmd}`);
+      if (state.containerId) {
+        // 在容器内启动服务，记录 PID 供后续清理
+        await ShellExecuteSkill.config.run({
+          command: `docker exec -d ${state.containerId} sh -c 'export PORT=${port} && ${runCmd} & echo $! > /tmp/server.pid'`,
+          timeout: 10000,
+        });
+      } else {
+        await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && PORT=${port} ${runCmd}`, isBackground: true });
+      }
+
+      // 轮询等待 server 就绪（最多 30s），避免 ts-node 等慢启动工具未完成就开始测试
+      const serverReadyUrl = `http://127.0.0.1:${port}`;
+      let serverReady = false;
+      for (let i = 0; i < 30; i++) {
+        await new Promise(r => setTimeout(r, 1000));
+        try {
+          const res = await fetch(serverReadyUrl, { signal: AbortSignal.timeout(800) });
+          if (res.status < 500) { serverReady = true; break; }
+        } catch {}
+      }
+      if (!serverReady) {
+        console.log(`[QA] ⚠ server 30s 内未响应，继续尝试测试...`);
+      } else {
+        console.log(`[QA] ✓ server 就绪`);
+      }
+
+      const hasFrontend = (state.spec?.filesToCreate || []).some(f => f.endsWith(".html"));
+
+      let integResult = "";
+      let integFail = false;
+      let failedFilesForRetry: string[] = [];
+
+      if (hasFrontend) {
+        // ── 阶段 3a：生成 Playwright E2E 测试（测试前端页面交互）─────────
+        console.log(`[QA] 检测到前端文件，切换为 Playwright E2E 测试`);
+        emit("thinking", agents.qa.getPersona().name, "检测到前端，生成 Playwright 页面测试...");
+
+        const jimclawRoot = process.cwd();
+        const apiEndpoints = JSON.stringify(state.apiContract?.endpoints || [], null, 2);
+
+        const e2eResponse = await agents.qa.chat([{
+          role: "user",
+          content: `编写 e2e_test.js，使用 Playwright 对运行在 ${entryPoint} 的前端页面进行端到端测试。
+
+API 端点（需通过 UI 操作覆盖这些功能，而非直接调 API）：
+${apiEndpoints}
+
+要求：
+1. 使用 require('${jimclawRoot}/node_modules/playwright') 引入 Playwright（不要用相对路径或 npx）
+2. 启动 headless Chromium，导航到 ${entryPoint}（waitUntil: 'domcontentloaded'，禁止用 'networkidle'，后者在服务器持续轮询时永远不触发）
+3. 验证页面正常加载（标题或主要元素可见）
+4. 通过 UI 操作（填写表单、点击按钮）完成 CRUD 操作：
+   - 创建：找到输入框填写内容，点击提交/添加按钮，验证新条目出现在列表中
+   - 读取：验证列表中显示已有数据或空状态提示
+   - 更新（如果页面有编辑功能）：点击编辑，修改内容，保存，验证更新后内容
+   - 删除（如果页面有删除功能）：点击删除按钮，验证条目从列表消失
+5. 每个操作使用 page.waitForSelector 等待元素出现，超时 5000ms
+6. 全部测试通过时在最后一行打印：All E2E tests passed!
+7. 任何断言失败时 console.error 输出具体错误并 process.exit(1)
+8. 使用顶层 async IIFE，测试结束后关闭浏览器
+
+只输出代码，用 markdown 代码块包裹：\`\`\`javascript\n代码\n\`\`\``
+        }], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在生成 E2E 测试代码" : "E2E 测试代码已生成", ev), { mode: "coding", brief: state.projectBrief, workspaceDir: WORKSPACE });
+
+        const e2eRaw = extractText(e2eResponse.content);
+        const e2eBlocks = [...e2eRaw.matchAll(/```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/g)];
+        const e2eCode = e2eBlocks.length > 0
+          ? e2eBlocks.reduce((l, c) => c[1].length > l[1].length ? c : l)[1].trim()
+          : e2eRaw.trim();
+
+        await fs.writeFile(path.join(WORKSPACE, "e2e_test.js"), e2eCode);
+        console.log(`[QA] 写入 e2e_test.js (${Buffer.byteLength(e2eCode, 'utf8')} bytes)`);
+
+        // ── 阶段 4a：执行 E2E 测试 ───────────────────────────────────────
+        integResult = await ShellExecuteSkill.config.run({
+          command: `cd ${WORKSPACE} && node e2e_test.js`
+        });
+        console.log(`[QA] E2E 测试输出:\n${integResult.slice(0, 2000)}`);
+
+        integFail = integResult.includes("Error") ||
+          integResult.includes("error") ||
+          integResult.includes("failed") ||
+          !integResult.includes("All E2E tests passed!");
+
+        if (integFail) {
+          const allFiles = (state.subTasks || []).map(t => t.fileTarget);
+          const serverFile = allFiles.find(f => /server|app/i.test(f) && !/test|spec/i.test(f) && !f.endsWith(".html")) || "server.js";
+          const htmlFile = allFiles.find(f => f.endsWith(".html")) || "public/index.html";
+          failedFilesForRetry = [serverFile, htmlFile];
+        }
+
+      } else {
+        // ── 阶段 3b：生成 integration_test.js（纯 API 测试）───────────────
+        const apiEndpoints = JSON.stringify(state.apiContract?.endpoints || [], null, 2);
+        const integTestResponse = await agents.qa.chat([{
+          role: "user",
+          content: `编写 integration_test.js，测试运行在 ${entryPoint} 的 HTTP 服务。
+
+API 端点（必须测试每个端点，包括正常和错误场景）：
+${apiEndpoints}
+
+要求：
+1. 使用 Node.js 18+ 内置 fetch（无需 require，零外部依赖）
+2. 使用 node:assert 做断言
+3. 全部测试通过时在最后一行打印：All integration tests passed!
+4. 任何断言失败时 console.error 输出具体错误并 process.exit(1)
+5. BASE_URL = "${entryPoint}"（固定值）
+6. 使用顶层 async IIFE 包裹所有测试，确保顺序执行
+
+只输出代码，用 markdown 代码块包裹：\`\`\`javascript\n代码\n\`\`\``
+        }], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在生成集成测试代码" : "集成测试代码已生成", ev), { mode: "coding", brief: state.projectBrief, workspaceDir: WORKSPACE });
+
+        const integRaw = extractText(integTestResponse.content);
+        const integBlocks = [...integRaw.matchAll(/```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/g)];
+        const integCode = integBlocks.length > 0
+          ? integBlocks.reduce((l, c) => c[1].length > l[1].length ? c : l)[1].trim()
+          : integRaw.trim();
+
+        await fs.writeFile(path.join(WORKSPACE, "integration_test.js"), integCode);
+        console.log(`[QA] 写入 integration_test.js (${Buffer.byteLength(integCode, 'utf8')} bytes)`);
+
+        // ── 阶段 4b：执行 API 集成测试 ───────────────────────────────────
+        integResult = await ShellExecuteSkill.config.run({
+          command: `cd ${WORKSPACE} && node integration_test.js`
+        });
+        console.log(`[QA] 集成测试输出:\n${integResult.slice(0, 2000)}`);
+
+        integFail = integResult.includes("AssertionError") ||
+          integResult.includes("Error:") ||
+          integResult.includes("error:") ||
+          !integResult.includes("All integration tests passed!");
+
+        if (integFail) {
+          const allFiles = (state.subTasks || []).map(t => t.fileTarget);
+          const implFile = allFiles.find(f => /server|app|index/i.test(f) && !/test|spec/i.test(f)) || "server.js";
+          failedFilesForRetry = [implFile];
+        }
+      }
+
+      // ── 阶段 5：关闭 server ───────────────────────────────────────────
+      if (state.containerId) {
+        await ShellExecuteSkill.config.run({
+          command: `docker exec ${state.containerId} sh -c 'kill $(cat /tmp/server.pid 2>/dev/null) 2>/dev/null; rm -f /tmp/server.pid' 2>/dev/null || true`,
+          timeout: 5000,
+        });
+      } else {
+        await ShellExecuteSkill.config.run({ command: `fuser -k ${port}/tcp 2>/dev/null || true` });
+      }
+
+      // ── 阶段 6：评估结果 ─────────────────────────────────────────────
+      const testLabel = hasFrontend ? "E2E 页面测试" : "集成测试";
+      if (integFail) {
+        const errLines = integResult.split("\n").filter(l => /error|assert|fail|timeout/i.test(l)).slice(0, 5);
+        const qaFailures = {
+          failedFiles: failedFilesForRetry,
+          testErrors: errLines.length ? errLines : [integResult.slice(0, 400)],
+          failedTestNames: [],
+        };
+        const errSummary = errLines[0] || integResult.slice(0, 500);
+        const insight = extractInsight(integResult, testLabel, state.retryCount);
+        console.log(`[QA] ❌ ${testLabel}失败`);
+        return {
+          isDone: false,
+          testResults: integResult,
+          qaFailures,
+          projectBrief: insight ? [insight] : [],
+          teamChatLog: [{ sender: agents.qa.getPersona().name, content: `${testLabel}失败（第${state.retryCount}轮）。错误：${errSummary}` }]
+        };
+      }
+
+      console.log(`[QA] ✅ 单元测试 + ${testLabel}均通过`);
+      // 记录成功模式到项目记忆（供后续任务参考）
+      const successPattern = `第${state.retryCount}轮通过: 单元测试使用 ${state.spec?.testCommand}，${testLabel} 覆盖 API 端点`;
+      return {
+        isDone: true,
+        testResults: integResult,
+        qaFailures: null,
+        projectBrief: [
+          `✅ 测试验证通过 - ${successPattern}`,
+          `部署命令: ${state.spec?.runCommand}`,
+          `服务入口: ${state.spec?.entryPoint}`,
+        ],
+        teamChatLog: [{ sender: agents.qa.getPersona().name, content: `单元测试和${testLabel}均通过，质量达标。` }]
+      };
+    })
+    .addNode("deploy", async (state: JimClawState) => {
+      emit("phase-change", "System", "deployment");
+      const entry = state.spec?.entryPoint || "http://localhost:3000";
+
+      // 从 entryPoint 提取端口，注入 PORT 环境变量，避免与 JimClaw 自身端口冲突
+      let port = "3000";
+      try {
+        port = new URL(entry).port || "3000";
+      } catch {}
+
+      const runCmd = state.spec?.runCommand || "npm start";
+      if (state.containerId) {
+        // 服务已在容器内，直接启动（容器端口已映射至宿主机）
+        await ShellExecuteSkill.config.run({
+          command: `docker exec -d ${state.containerId} sh -c 'export PORT=${port} && ${runCmd}'`,
+          timeout: 10000,
+        });
+      } else {
+        await ShellExecuteSkill.config.run({
+          command: `cd ${WORKSPACE} && PORT=${port} ${runCmd}`,
+          isBackground: true,
+        });
+      }
+
+      // 等待一秒让进程启动
+      await new Promise(r => setTimeout(r, 1000));
+
+      const health = await HealthCheckSkill.config.run({ url: entry, timeoutMs: 60000, intervalMs: 5000 });
+      const isRunning = health.includes("Success");
+      console.log(`[Deploy] ${isRunning ? "✓" : "✗"} ${entry} — ${health}`);
+      return { deploymentStatus: { url: entry, status: isRunning ? "running" as const : "failed" as const } };
+    })
+    .addNode("post_mortem", async (state: JimClawState) => {
+      console.log(`--- [产品经理 ${agents.pm.getPersona().name}] 正在进行复盘总结 ---`);
+      emit("phase-change", "System", "review");
+
+      // 构建结构化的复盘提示词，包含关键统计和错误模式
+      const retrySummary = state.retryCount
+        ? `经过 ${state.retryCount} 轮迭代${state.mediationDirectives ? `（含 1 次架构师仲裁）` : ""}`
+        : "首次尝试即成功";
+
+      const errorPatterns = state.qaFailures
+        ? `\n失败模式分析：
+  - 涉及文件: ${state.qaFailures.failedFiles.join(", ")}
+  - 错误类型: ${state.qaFailures.testErrors.slice(0, 3).join("; ")}`
+        : "";
+
+      const mediationSummary = state.mediationDirectives
+        ? `\n架构师仲裁结果：
+  - 诊断: ${state.projectBrief?.find(b => b.includes("[架构师仲裁]")) || "无"}
+  - 指令数: ${state.mediationDirectives.length} 条`
+        : "";
+
+      const prompt = `请对本次开发任务进行复盘总结。
+
+【任务概况】
+${state.userGoal}
+${retrySummary}
+
+【最终结果】
+${state.isDone ? "✅ 成功部署" : "❌ 未能完成"}
+
+${errorPatterns}
+${mediationSummary}
+
+请输出 JSON 格式：
+{
+  "what_worked": "本次成功的关键因素（1-2 句话）",
+  "what_failed": "遇到的主要障碍和错误模式（1-2 句话）",
+  "lessons_learned": "对未来任务的建议（2-3 条具体、可操作的规则）"
+}`;
+
+      const response = await agents.pm.chat(
+        [{ role: "user", content: prompt }],
+        (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在进行复盘总结" : "复盘总结完成", ev),
+        { brief: state.projectBrief }
+      );
+
+      const raw = extractText(response.content);
+      const learning = parseJsonFromResponse(raw, {
+        what_worked: "无",
+        what_failed: "无",
+        lessons_learned: "无"
+      });
+
+      console.log(`\n[Post-Mortem] 复盘总结：
+  ✓ 成功因素: ${learning.what_worked}
+  ✗ 失败因素: ${learning.what_failed}
+  💡 经验教训: ${learning.lessons_learned}
+`);
+
+      return {
+        teamChatLog: [
+          { sender: agents.pm.getPersona().name, content: `复盘完成。${state.isDone ? "项目成功交付！" : "未能完成目标。"}` },
+          { sender: "System", content: `经验教训: ${learning.lessons_learned}` }
+        ]
+      };
+    })
+    .addNode("persistence", async (state: JimClawState) => {
+      const session = { timestamp: new Date().toISOString(), finalState: state };
+      await fs.writeFile(path.join(WORKSPACE, "session.json"), JSON.stringify(session, null, 2));
+
+      // 改进 7：自动清理旧 run 目录，保留最新 10 个
+      const workspaceParent = path.dirname(WORKSPACE);
+      try {
+        const allEntries = await fs.readdir(workspaceParent);
+        const runDirs = allEntries.filter(d => d.startsWith("run_")).sort();
+        const toDelete = runDirs.slice(0, Math.max(0, runDirs.length - 10));
+        for (const dir of toDelete) {
+          await fs.rm(path.join(workspaceParent, dir), { recursive: true, force: true });
+          console.log(`[Persistence] 已清理旧 run 目录: ${dir}`);
+        }
+        if (toDelete.length > 0) {
+          console.log(`[Persistence] 共清理 ${toDelete.length} 个旧 run，保留最新 ${Math.min(10, runDirs.length)} 个。`);
+        }
+      } catch (e) {
+        console.warn("[Persistence] 清理旧 run 目录失败:", e);
+      }
+
+      // 成果分享：容器运行信息 + 访问地址
+      const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
+      const isDeployed = state.deploymentStatus?.status === "running";
+      if (state.containerId) {
+        const accessUrl = state.spec?.entryPoint ?? "（未知）";
+        const portList = (state.manifest?.services ?? [])
+          .map(s => `${s.name}: ${s.port}`)
+          .join(", ") || `见 ${accessUrl}`;
+        const sep = "=".repeat(56);
+        if (isDeployed) {
+          console.log(`\n${sep}`);
+          console.log(`[成果] 🚀 应用已部署至 Docker 容器`);
+          console.log(`[成果] 访问地址 : ${accessUrl}`);
+          console.log(`[成果] 服务端口 : ${portList}`);
+          console.log(`[成果] 容器名称 : ${containerName}`);
+          console.log(`[成果] 停止服务 : docker stop ${containerName}`);
+          console.log(`[成果] 删除容器 : docker rm -f ${containerName}`);
+          console.log(`${sep}\n`);
+          emit("artifact", "System", "应用已部署", { containerName, accessUrl, portList });
+        } else {
+          // 部署失败：清理容器，释放资源
+          console.log(`[Persistence] 部署未成功，清理容器 ${containerName}...`);
+          await ShellExecuteSkill.config.run({ command: `docker rm -f ${state.containerId} 2>/dev/null || true`, timeout: 10000 });
+        }
+      }
+
+      return { isDone: true };
+    })
+    .addNode("architect_mediation", async (state: JimClawState) => {
+      console.log(`--- [架构师 ${agents.architect.getPersona().name}] 正在进行冲突仲裁 (retryCount=${state.retryCount}) ---`);
+      emit("phase-change", "System", "design");
+      emit("thinking", agents.architect.getPersona().name, "coder 自救失败，正在从架构层面分析跨文件契约冲突...");
+
+      const filesContent = JSON.parse(state.code || "{}");
+      const filesBlock = Object.entries(filesContent)
+        .map(([f, c]) => `=== ${f} ===\n${c}`)
+        .join("\n\n");
+
+      const prompt = `你是技术仲裁者。coder 和 QA 经过 ${state.retryCount} 轮迭代仍未解决问题，请从架构层面分析跨文件的契约冲突。
+
+重要提示：
+- 请仅关注当前仍存在的错误（qaFailures 中的内容）
+- 不要针对可能已修复的历史问题（如依赖安装、模块系统）给出指令
+- 请对比"当前文件内容"与"测试期望"，找出具体的不匹配点
+
+【单元测试文件的硬性限制 - 针对 unit_test.* / test_unit.* / *_test.* 等文件】
+- 单元测试只能测试导出的纯函数，严禁使用 supertest、axios、fetch 等 HTTP 客户端
+- 严禁在仲裁指令中建议单元测试使用 HTTP 客户端或发起任何网络请求
+- 如果测试文件存在 HTTP 相关错误，根因一定在实现文件（缺少导出函数、未暴露纯函数），而不是让测试文件调用 HTTP
+
+当前仍在报错（这是你唯一需要解决的问题）：
+失败测试：${JSON.stringify(state.qaFailures?.failedTestNames)}
+错误信息：${JSON.stringify(state.qaFailures?.testErrors)}
+失败文件：${JSON.stringify(state.qaFailures?.failedFiles)}
+
+当前所有文件内容（以此为准，不要假设历史状态）：
+${filesBlock}
+
+原始规范（供参考）：
+${JSON.stringify(state.spec, null, 2)}
+
+API 契约（供参考）：
+${JSON.stringify(state.apiContract, null, 2)}
+
+请输出 JSON（针对每个冲突文件给出精确修复指令，每条指令必须对应一个具体的代码变更）：
+{
+  "diagnosis": "根因摘要（必须引用具体文件、行号或函数名）",
+  "directives": [
+    { "file": "具体文件名", "action": "动作类型（ADD_ROUTE/FIX_RESPONSE/ADD_DEPENDENCY/REMOVE_TEST/FIX_IMPORT）", "detail": "精确到字段/函数/返回值的具体修改指令" }
+  ]
+}`;
+
+      const response = await agents.architect.chat([
+        { role: "user", content: prompt }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在分析跨文件契约冲突" : "冲突分析完成", ev), { mode: "reasoning", brief: state.projectBrief });
+
+      const raw = parseJsonFromResponse(extractText(response.content), { diagnosis: "解析失败", directives: [] });
+      const diagnosis: string = raw.diagnosis || "无诊断信息";
+      const rawDirectives = raw.directives || [];
+
+      const validation = MediationDirectiveSchema.safeParse(rawDirectives);
+      if (!validation.success) {
+        console.warn("[Mediation] 仲裁指令校验失败:", validation.error.message);
+      }
+      const parsedDirectives: MediationDirective[] = validation.success ? validation.data : rawDirectives;
+
+      console.log(`[Mediation] 仲裁诊断: ${diagnosis}`);
+      console.log(`[Mediation] 修复指令 (${parsedDirectives.length} 条):`);
+      parsedDirectives.forEach(d => {
+        console.log(`  [${d.file}] ${d.action}: ${d.detail}`);
+      });
+
+      // 按 action 分类指令，便于 Coder 快速定位修复点
+      const directivesByAction = parsedDirectives.reduce((acc, d) => {
+        acc[d.action] = acc[d.action] || [];
+        acc[d.action].push(d);
+        return acc;
+      }, {} as Record<string, MediationDirective[]>);
+
+      const actionSummary = Object.entries(directivesByAction)
+        .map(([action, dirs]) => `${action}(${dirs.length})`)
+        .join(", ");
+
+      return {
+        mediationDirectives: parsedDirectives,
+        projectBrief: [
+          `[架构师仲裁] ${diagnosis}`,
+          `[修复重点] ${actionSummary}`,
+          `[根本原因] ${parsedDirectives.map(d => `${d.file}: ${d.action}`).join("; ")}`,
+        ],
+        teamChatLog: [
+          { sender: agents.architect.getPersona().name, content: `仲裁完成，发现 ${parsedDirectives.length} 个冲突点，已下发修复指令。` },
+          { sender: "System", content: `诊断: ${diagnosis}` }
+        ]
+      };
+    });
+
+  workflow.addEdge(START, "pm");
+  workflow.addEdge("pm", "architect");
+  workflow.addEdge("architect", "contract_sync");
+  workflow.addConditionalEdges("contract_sync", () => onEvent ? "approval" : "orchestrator", { approval: "approval", orchestrator: "orchestrator" });
+  workflow.addEdge("approval", "orchestrator");
+  workflow.addEdge("orchestrator", "coder");
+  // coder 自检失败时直接回 qa（跳过 infra_setup + terminal），避免无效 LLM 调用
+  workflow.addConditionalEdges("coder",
+    (state) => state.testResults?.startsWith("[Coder 自检失败]") ? "qa" : "infra_setup",
+    { infra_setup: "infra_setup", qa: "qa" }
+  );
+  workflow.addEdge("infra_setup", "terminal");
+  workflow.addEdge("terminal", "verifier");
+  workflow.addConditionalEdges("verifier",
+    (state) => state.testResults?.startsWith("[Verifier 预检失败]") ? "coder" : "qa",
+    { coder: "coder", qa: "qa" }
+  );
+  workflow.addConditionalEdges("qa",
+    (state) => {
+      if (state.isDone) return "deploy";
+      if (state.retryCount >= maxRetries) return "post_mortem";
+      if (state.retryCount >= 2 && !state.mediationDirectives) return "architect_mediation";
+      return "coder";
+    },
+    { deploy: "deploy", post_mortem: "post_mortem", coder: "coder", architect_mediation: "architect_mediation" }
+  );
+  workflow.addEdge("architect_mediation", "coder");
+  workflow.addEdge("deploy", "post_mortem");
+  workflow.addEdge("post_mortem", "persistence");
+  workflow.addEdge("persistence", END);
+
+  return workflow.compile();
+}

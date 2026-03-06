@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JimClaw 控制台</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+  <style>
+    :root {
+      --bg:     #0f1117;
+      --bg2:    #1a1d27;
+      --bg3:    #22263a;
+      --border: #2e3248;
+      --accent: #5b7cfa;
+      --accent2:#7c5bfa;
+      --green:  #34d399;
+      --red:    #f87171;
+      --orange: #fb923c;
+      --yellow: #fbbf24;
+      --text:   #e2e8f0;
+      --muted:  #64748b;
+      --r:      8px;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* ── 顶栏 ── */
+    header { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
+    .logo { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: .5px; }
+    .logo span { color: var(--accent2); }
+    .status-badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; background: var(--bg3); color: var(--muted); }
+    .status-badge.running  { background: #1a2e4a; color: #60a5fa; }
+    .status-badge.finished { background: #0f2a1e; color: var(--green); }
+    .status-badge.error    { background: #2a1010; color: var(--red); }
+    .node-pill { padding: 3px 10px; border-radius: 4px; font-size: 11px; background: var(--bg3); border: 1px solid var(--border); color: var(--muted); }
+    .header-input { flex: 1; display: flex; gap: 8px; max-width: 640px; margin-left: auto; }
+    .header-input input { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--r); padding: 7px 14px; color: var(--text); font-size: 13px; outline: none; }
+    .header-input input:focus { border-color: var(--accent); }
+    .btn { background: var(--accent); color: #fff; border: none; border-radius: var(--r); padding: 7px 18px; font-weight: 600; cursor: pointer; font-size: 13px; white-space: nowrap; }
+    .btn:hover { background: var(--accent2); }
+    .btn:disabled { opacity: .4; cursor: default; }
+
+    /* ── 布局 ── */
+    .layout { display: flex; flex: 1; overflow: hidden; }
+
+    /* ── 左栏 ── */
+    .sidebar { width: 240px; flex-shrink: 0; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; padding: 14px; gap: 18px; }
+    .sidebar h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 8px; }
+
+    /* 阶段 */
+    .phase-list { display: flex; flex-direction: column; gap: 3px; }
+    .phase-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: 12px; color: var(--muted); }
+    .phase-item.active { background: #1a2e4a; color: #60a5fa; }
+    .phase-item.done   { color: var(--green); }
+    .phase-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
+    .phase-item.active .phase-dot { background: #60a5fa; box-shadow: 0 0 6px #60a5fa88; }
+    .phase-item.done   .phase-dot { background: var(--green); }
+    .phase-dur { margin-left: auto; font-size: 10px; color: var(--muted); }
+
+    /* 重试 */
+    .retry-dots { display: flex; gap: 3px; flex-wrap: wrap; }
+    .retry-dot  { width: 9px; height: 9px; border-radius: 2px; background: var(--border); }
+    .retry-dot.used { background: var(--orange); }
+
+    /* 团队 */
+    .team-card { background: var(--bg3); border-radius: 6px; padding: 8px 10px; border: 1px solid var(--border); margin-bottom: 6px; }
+    .team-card .t-name  { font-weight: 600; font-size: 12px; }
+    .team-card .t-role  { font-size: 11px; color: var(--muted); margin-top: 1px; }
+    .team-card .t-model { font-size: 10px; color: var(--accent); margin-top: 4px; }
+
+    /* ── 主区域 ── */
+    .main-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+    /* 审批横幅 */
+    .approval-banner { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #1e1a3a; border-bottom: 1px solid #4a3a7a; flex-shrink: 0; }
+    .approval-banner span { flex: 1; font-size: 13px; color: #c4b5fd; }
+    .btn-approve { background: var(--green); color: #000; border: none; border-radius: 6px; padding: 6px 16px; font-weight: 700; cursor: pointer; font-size: 13px; }
+
+    /* 标签页 */
+    .tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--bg2); }
+    .tab  { padding: 10px 18px; font-size: 13px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+    .tab:hover { color: var(--text); }
+    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+    .tab-badge { display: inline-block; background: var(--red); color: #fff; border-radius: 10px; font-size: 10px; padding: 0 5px; margin-left: 4px; vertical-align: middle; }
+
+    /* 内容区 */
+    .tab-content { display: none; flex: 1; min-height: 0; overflow-y: auto; padding: 14px; gap: 8px; }
+    .tab-content.active { display: flex; flex-direction: column; }
+
+    /* ── 日志条目 ── */
+    .log-entry { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; flex-shrink: 0; }
+    .log-header { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; user-select: none; }
+    .log-header:hover { background: var(--bg3); }
+    .log-type { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
+    .t-thinking  { background: #1a2e4a; color: #93c5fd; }
+    .t-artifact  { background: #0f2a1e; color: var(--green); }
+    .t-phase     { background: #1e1a3a; color: #a78bfa; }
+    .t-llm_start { background: #2a2010; color: var(--yellow); }
+    .t-llm_end   { background: #2a2010; color: var(--yellow); }
+    .t-tool      { background: #1a2a2a; color: #5eead4; }
+    .t-chat      { background: #1a2a1a; color: #86efac; }
+    .t-error     { background: #2a1010; color: var(--red); }
+    .log-sender  { font-weight: 600; font-size: 12px; flex-shrink: 0; }
+    .log-preview { flex: 1; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .log-time    { font-size: 11px; color: var(--muted); flex-shrink: 0; }
+    .log-body    { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 420px; overflow-y: auto; line-height: 1.6; }
+    .log-entry.collapsed .log-body { display: none; }
+
+    /* ── 子任务 ── */
+    .tasks-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; flex-shrink: 0; }
+    .task-card  { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 12px; }
+    .task-card.completed { border-color: #1a4a30; }
+    .task-card.failed    { border-color: #4a1a1a; }
+    .ts-pending   { color: var(--muted); }
+    .ts-completed { color: var(--green); }
+    .ts-failed    { color: var(--red); }
+    .task-status { font-size: 11px; font-weight: 700; margin-bottom: 5px; }
+    .task-file   { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
+    .task-desc   { font-size: 11px; color: var(--muted); line-height: 1.4; }
+    .task-err    { font-size: 11px; color: var(--red); margin-top: 6px; padding: 6px; background: #2a1010; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
+
+    /* ── 文件浏览 ── */
+    .files-layout { display: flex; gap: 10px; height: 100%; min-height: 0; overflow: hidden; }
+    .file-tree { width: 210px; flex-shrink: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow-y: auto; min-height: 0; padding: 6px; }
+    .file-tree-item { padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .file-tree-item:hover    { background: var(--bg3); color: var(--text); }
+    .file-tree-item.selected { background: #1a2e4a; color: #93c5fd; }
+    .file-viewer { flex: 1; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
+    .file-viewer-hdr { padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--muted); flex-shrink: 0; }
+    .file-viewer-body { flex: 1; overflow: auto; }
+    .file-viewer-body pre { margin: 0; }
+    .file-viewer-body code { font-family: 'Cascadia Code','Fira Code',monospace !important; font-size: 12px !important; }
+    .file-placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); font-size: 13px; }
+
+    /* ── 详情面板 ── */
+    .detail-block { margin-bottom: 14px; flex-shrink: 0; }
+    .detail-block h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 8px; }
+    .qa-panel  { background: #2a1010; border: 1px solid #4a2020; border-radius: var(--r); padding: 14px; }
+    .qa-panel h4 { color: var(--red); }
+    .qa-tag    { display: inline-block; background: #4a2020; color: var(--red); border-radius: 4px; padding: 2px 8px; font-size: 11px; margin: 2px; }
+    .qa-err    { font-size: 12px; color: #fca5a5; padding: 5px 0; border-bottom: 1px solid #3a1a1a; white-space: pre-wrap; }
+    .qa-err:last-child { border-bottom: none; }
+    .med-panel { background: #2a1800; border: 1px solid #4a2c00; border-radius: var(--r); padding: 14px; }
+    .med-panel h4 { color: var(--orange); }
+    .med-item  { background: #1a1000; border-radius: 6px; padding: 10px; margin-top: 8px; border: 1px solid #3a2000; }
+    .med-file  { font-size: 12px; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
+    .med-action{ font-size: 11px; background: #3a2000; color: #fed7aa; display: inline-block; padding: 1px 6px; border-radius: 3px; margin-bottom: 4px; }
+    .med-detail{ font-size: 12px; color: #fde68a; line-height: 1.5; }
+    .deploy-panel { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 14px; }
+    .deploy-panel.success { border-color: #1a4a30; background: #0a1e14; }
+    .deploy-panel.failed  { border-color: #4a1a1a; background: #1a0a0a; }
+    .deploy-url a { font-size: 16px; font-weight: 700; color: var(--green); text-decoration: none; }
+    .deploy-url a:hover { text-decoration: underline; }
+    .brief-item { font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--border); line-height: 1.5; }
+    .brief-item:last-child { border-bottom: none; }
+
+    /* ── 空状态 ── */
+    .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 200px; gap: 8px; color: var(--muted); }
+    .empty .ico { font-size: 32px; }
+
+    /* ── 回到底部按钮 ── */
+    .scroll-btn { position: absolute; bottom: 20px; right: 20px; background: var(--accent); color: #fff; border: none; border-radius: 20px; padding: 6px 16px; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 12px rgba(0,0,0,.5); z-index: 20; transition: opacity .15s; }
+    .scroll-btn:hover { background: var(--accent2); }
+
+    /* ── 工具 ── */
+    .hidden { display: none !important; }
+    ::-webkit-scrollbar { width: 5px; height: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  </style>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header>
+  <div class="logo">Jim<span>Claw</span> 🦾</div>
+  <div class="status-badge" id="statusBadge">空闲</div>
+  <div class="node-pill" id="nodePill">-</div>
+  <div class="header-input">
+    <input id="goalInput" type="text" placeholder="描述需求，例如：实现一个带前端的 Todo List..." />
+    <button class="btn" id="runBtn" onclick="startTask()">▶ 启动</button>
+  </div>
+</header>
+
+<!-- 主布局 -->
+<div class="layout">
+
+  <!-- 左侧栏 -->
+  <aside class="sidebar">
+    <div>
+      <h3>执行阶段</h3>
+      <div class="phase-list" id="phaseList"></div>
+    </div>
+    <div>
+      <h3>重试轮次</h3>
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div class="retry-dots" id="retryDots"></div>
+        <span id="retryLabel" style="font-size:12px;color:var(--muted)">0 轮</span>
+      </div>
+    </div>
+    <div>
+      <h3>团队成员</h3>
+      <div id="teamList"></div>
+    </div>
+  </aside>
+
+  <!-- 主面板 -->
+  <div class="main-panel" style="position:relative;">
+
+    <!-- 审批横幅 -->
+    <div class="approval-banner hidden" id="approvalBanner">
+      <span>⏸ 方案设计完成，等待人工审批后开始编码</span>
+      <button class="btn-approve" onclick="approve()">批准 ✓</button>
+    </div>
+
+    <!-- 标签页头 -->
+    <div class="tabs">
+      <div class="tab active" data-tab="logs"    onclick="switchTab(this)">实时日志</div>
+      <div class="tab"        data-tab="tasks"   onclick="switchTab(this)">子任务 <span class="tab-badge hidden" id="taskBadge">0</span></div>
+      <div class="tab"        data-tab="files"   onclick="switchTab(this)">工程文件</div>
+      <div class="tab"        data-tab="details" onclick="switchTab(this)">详情 <span class="tab-badge hidden" id="detailBadge">!</span></div>
+    </div>
+
+    <!-- 日志 -->
+    <div class="tab-content active" id="tab-logs">
+      <div class="empty" id="logsEmpty"><div class="ico">📋</div><div>等待任务启动…</div></div>
+    </div>
+
+    <!-- 回到底部按钮 -->
+    <button class="scroll-btn hidden" id="scrollBtn" onclick="scrollLogToBottom()">↓ 最新</button>
+
+    <!-- 子任务 -->
+    <div class="tab-content" id="tab-tasks">
+      <div class="empty" id="tasksEmpty"><div class="ico">🗂</div><div>尚无子任务</div></div>
+      <div class="tasks-grid" id="tasksGrid"></div>
+    </div>
+
+    <!-- 工程文件 -->
+    <div class="tab-content" id="tab-files">
+      <div class="files-layout">
+        <div class="file-tree" id="fileTree">
+          <div style="color:var(--muted);font-size:12px;padding:8px;">工作空间尚未就绪</div>
+        </div>
+        <div class="file-viewer" id="fileViewer">
+          <div class="file-placeholder">← 从左侧选择文件查看</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 详情 -->
+    <div class="tab-content" id="tab-details">
+      <div class="empty" id="detailsEmpty"><div class="ico">🔍</div><div>运行后此处显示详细信息</div></div>
+
+      <div class="detail-block hidden" id="deployBlock">
+        <h4>部署结果</h4>
+        <div class="deploy-panel" id="deployPanel"></div>
+      </div>
+
+      <div class="detail-block hidden" id="qaBlock">
+        <div class="qa-panel">
+          <h4>❌ QA 失败详情</h4>
+          <div id="qaContent" style="margin-top:10px;"></div>
+        </div>
+      </div>
+
+      <div class="detail-block hidden" id="medBlock">
+        <div class="med-panel">
+          <h4>🔧 架构师仲裁指令</h4>
+          <div id="medContent"></div>
+        </div>
+      </div>
+
+      <div class="detail-block hidden" id="briefBlock">
+        <h4>团队共识（Project Brief）</h4>
+        <div id="briefContent"></div>
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// ── 阶段配置 ──────────────────────────────────────────────────────────────────
+const PHASES = [
+  { key: 'requirement',  label: '需求分析' },
+  { key: 'design',       label: '系统设计' },
+  { key: 'sync',         label: '契约校验' },
+  { key: 'approval',     label: '人工审批' },
+  { key: 'planning',     label: '任务编排' },
+  { key: 'coding',       label: '代码实现' },
+  { key: 'verification', label: '测试验证' },
+  { key: 'deployment',   label: '部署上线' },
+];
+
+const TYPE_LABEL = {
+  thinking: '思考', artifact: '产出', 'phase-change': '阶段',
+  llm_call_start: 'LLM↑', llm_response: 'LLM↓', tool_use: '工具',
+  error: '错误',
+};
+const TYPE_CLASS = {
+  thinking: 't-thinking', artifact: 't-artifact', 'phase-change': 't-phase',
+  llm_call_start: 't-llm_start', llm_response: 't-llm_end', tool_use: 't-tool',
+  error: 't-error',
+};
+
+// 每个 agent 专属颜色（日志 sender 与团队卡片共用）
+const SENDER_COLOR = {
+  '阿历克斯': '#93c5fd',   // PM       — 蓝
+  '索菲亚':   '#a78bfa',   // Architect — 紫
+  '阿雷':     '#34d399',   // Coder    — 绿
+  '艾瑞丝':   '#fb923c',   // QA       — 橙
+  'System':   '#64748b',   // 系统     — 灰
+};
+
+// ── 全局状态 ──────────────────────────────────────────────────────────────────
+let session = null;
+let currentTab = 'logs';
+let workspacePath = null;
+let selectedFile = null;
+let autoScroll = true;   // 日志是否跟随滚动到底部
+
+// ── Socket.io ─────────────────────────────────────────────────────────────────
+const socket = io();
+
+socket.on('session-sync', (s) => {
+  session = s;
+  rebuildAll(s);
+});
+
+socket.on('workspace-ready', ({ path }) => {
+  workspacePath = path;
+  if (currentTab === 'files') refreshFileTree();
+});
+
+socket.on('agent-event', (ev) => {
+  appendLog(ev);
+  if (ev.type === 'phase-change') updatePhases(ev.content);
+  if (ev.type === 'approval_required') showApproval(true);
+});
+
+socket.on('state-update', (u) => {
+  if (!session) session = {};
+  if (u.node) { session.currentNode = u.node; document.getElementById('nodePill').textContent = u.node; }
+  if (u.retryCount !== undefined) { session.retryCount = u.retryCount; renderRetry(u.retryCount); }
+  if (u.subTasks)              { session.subTasks = u.subTasks; renderTasks(u.subTasks); }
+  if (u.qaFailures !== undefined) { session.qaFailures = u.qaFailures; renderQA(u.qaFailures); }
+  if (u.mediationDirectives !== undefined) { session.mediationDirectives = u.mediationDirectives; renderMediation(u.mediationDirectives); }
+  if (u.projectBrief?.length)  { session.projectBrief = [...(session.projectBrief||[]), ...u.projectBrief]; renderBrief(session.projectBrief); }
+  if (u.deploymentStatus)      { session.deployment = u.deploymentStatus; renderDeploy(u.deploymentStatus); }
+  if (u.codeLog?.length && currentTab === 'files') refreshFileTree();
+});
+
+socket.on('task-finished', ({ success }) => {
+  setStatus(success ? 'finished' : 'error', success ? '已完成' : '失败');
+  document.getElementById('runBtn').disabled = false;
+  showApproval(false);
+  if (workspacePath) refreshFileTree();
+});
+
+socket.on('task-error', ({ message }) => {
+  setStatus('error', '出错');
+  document.getElementById('runBtn').disabled = false;
+  appendLog({ type: 'error', sender: 'System', content: message, timestamp: nowStr() });
+});
+
+// ── 操作 ──────────────────────────────────────────────────────────────────────
+function startTask() {
+  const goal = document.getElementById('goalInput').value.trim();
+  if (!goal) return;
+  resetUI();
+  setStatus('running', '运行中');
+  document.getElementById('runBtn').disabled = true;
+  socket.emit('run-task', { userGoal: goal });
+}
+
+function approve() {
+  socket.emit('approve-task', { approved: true });
+  showApproval(false);
+}
+
+document.getElementById('goalInput').addEventListener('keydown', e => {
+  if (e.key === 'Enter') startTask();
+});
+
+// ── UI 工具 ───────────────────────────────────────────────────────────────────
+function setStatus(type, label) {
+  const el = document.getElementById('statusBadge');
+  el.className = 'status-badge' + (type ? ' ' + type : '');
+  el.textContent = label;
+}
+
+function showApproval(show) {
+  document.getElementById('approvalBanner').classList.toggle('hidden', !show);
+}
+
+function switchTab(el) {
+  const name = el.dataset.tab;
+  currentTab = name;
+  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + name));
+  // 切换到日志页时，若不在底部则显示回底部按钮
+  const btn = document.getElementById('scrollBtn');
+  if (name === 'logs') {
+    btn.classList.toggle('hidden', autoScroll);
+  } else {
+    btn.classList.add('hidden');
+  }
+  if (name === 'files') refreshFileTree();
+}
+
+function nowStr() {
+  return new Date().toLocaleTimeString('zh-CN', { hour12: false });
+}
+
+function escHtml(s) {
+  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function resetUI() {
+  document.getElementById('tab-logs').innerHTML = '<div class="empty" id="logsEmpty"><div class="ico">📋</div><div>等待任务启动…</div></div>';
+  document.getElementById('tasksGrid').innerHTML = '';
+  document.getElementById('tasksEmpty').classList.remove('hidden');
+  document.getElementById('taskBadge').classList.add('hidden');
+  document.getElementById('detailBadge').classList.add('hidden');
+  document.getElementById('detailsEmpty').classList.remove('hidden');
+  ['deployBlock','qaBlock','medBlock','briefBlock'].forEach(id => document.getElementById(id).classList.add('hidden'));
+  document.getElementById('nodePill').textContent = '-';
+  renderRetry(0);
+  PHASES.forEach(p => {
+    const el = document.getElementById('ph-' + p.key);
+    if (el) { el.className = 'phase-item'; el.querySelector('.phase-dot').className = 'phase-dot'; el.querySelector('.phase-dur').textContent = ''; }
+  });
+  workspacePath = null; selectedFile = null;
+  document.getElementById('fileTree').innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px;">工作空间尚未就绪</div>';
+  document.getElementById('fileViewer').innerHTML = '<div class="file-placeholder">← 从左侧选择文件查看</div>';
+}
+
+// ── 阶段 ──────────────────────────────────────────────────────────────────────
+function buildPhaseList() {
+  document.getElementById('phaseList').innerHTML = PHASES.map(p =>
+    `<div class="phase-item" id="ph-${p.key}">
+      <div class="phase-dot"></div>
+      <span>${p.label}</span>
+      <span class="phase-dur"></span>
+    </div>`
+  ).join('');
+}
+
+function updatePhases(activeKey, phaseData) {
+  let passed = true;
+  PHASES.forEach(p => {
+    const el = document.getElementById('ph-' + p.key);
+    if (!el) return;
+    const dur = phaseData?.[p.key];
+    if (p.key === activeKey) {
+      el.className = 'phase-item active'; passed = false;
+      el.querySelector('.phase-dur').textContent = '';
+    } else if (passed) {
+      el.className = 'phase-item done';
+      const sec = dur?.totalDuration ? Math.round(dur.totalDuration / 1000) + 's' : '';
+      el.querySelector('.phase-dur').textContent = sec;
+    } else {
+      el.className = 'phase-item';
+    }
+  });
+}
+
+// ── 重试 ──────────────────────────────────────────────────────────────────────
+function renderRetry(n) {
+  document.getElementById('retryDots').innerHTML = Array.from({length:10},(_,i) =>
+    `<div class="retry-dot${i<n?' used':''}"></div>`
+  ).join('');
+  document.getElementById('retryLabel').textContent = n + ' 轮';
+}
+
+// ── 团队 ──────────────────────────────────────────────────────────────────────
+function renderTeam(team) {
+  document.getElementById('teamList').innerHTML = (team||[]).map(m => {
+    const color = SENDER_COLOR[m.name] || 'var(--muted)';
+    return `<div class="team-card" style="border-left:3px solid ${color};">
+      <div class="t-name" style="color:${color};">${m.name}</div>
+      <div class="t-role">${m.role}</div>
+      <div class="t-model">⚙ ${m.model || '—'}</div>
+    </div>`;
+  }).join('');
+}
+
+// ── 日志 ──────────────────────────────────────────────────────────────────────
+function appendLog(ev) {
+  const container = document.getElementById('tab-logs');
+  const empty = document.getElementById('logsEmpty');
+  if (empty) empty.remove();
+
+  const tc = TYPE_CLASS[ev.type] || 't-chat';
+  const tl = TYPE_LABEL[ev.type] || '消息';
+  const body = ev.metadata ? JSON.stringify(ev.metadata, null, 2) : (ev.content || '');
+  const preview = (ev.content || '').slice(0, 100).replace(/\n/g,' ');
+  const uid = 'lg' + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const senderColor = SENDER_COLOR[ev.sender] || 'var(--text)';
+
+  const div = document.createElement('div');
+  div.className = 'log-entry collapsed';
+  div.innerHTML =
+    `<div class="log-header" onclick="document.getElementById('${uid}').closest('.log-entry').classList.toggle('collapsed')">
+      <span class="log-type ${tc}">${tl}</span>
+      <span class="log-sender" style="color:${senderColor};">${escHtml(ev.sender||'')}</span>
+      <span class="log-preview">${escHtml(preview)}</span>
+      <span class="log-time">${ev.timestamp||nowStr()}</span>
+    </div>
+    <div class="log-body" id="${uid}">${escHtml(body)}</div>`;
+  container.appendChild(div);
+
+  if (autoScroll) {
+    container.scrollTop = container.scrollHeight;
+  } else if (currentTab === 'logs') {
+    document.getElementById('scrollBtn').classList.remove('hidden');
+  }
+}
+
+function scrollLogToBottom() {
+  const container = document.getElementById('tab-logs');
+  container.scrollTop = container.scrollHeight;
+  autoScroll = true;
+  document.getElementById('scrollBtn').classList.add('hidden');
+}
+
+// ── 子任务 ────────────────────────────────────────────────────────────────────
+function renderTasks(tasks) {
+  if (!tasks?.length) return;
+  document.getElementById('tasksEmpty').classList.add('hidden');
+  const badge = document.getElementById('taskBadge');
+  badge.classList.remove('hidden');
+  badge.textContent = tasks.length;
+  document.getElementById('tasksGrid').innerHTML = tasks.map(t =>
+    `<div class="task-card ${t.status}">
+      <div class="task-status ts-${t.status}">
+        ${{pending:'○ 等待', completed:'✓ 完成', failed:'✗ 失败'}[t.status]||t.status}
+      </div>
+      <div class="task-file">📄 ${escHtml(t.fileTarget)}</div>
+      <div class="task-desc">${escHtml(t.description||'')}</div>
+      ${t.lastError ? `<div class="task-err">${escHtml(t.lastError.slice(0,200))}</div>` : ''}
+    </div>`
+  ).join('');
+}
+
+// ── QA 失败 ───────────────────────────────────────────────────────────────────
+function renderQA(qa) {
+  const block = document.getElementById('qaBlock');
+  if (!qa) { block.classList.add('hidden'); return; }
+  block.classList.remove('hidden');
+  document.getElementById('detailBadge').classList.remove('hidden');
+  document.getElementById('detailsEmpty').classList.add('hidden');
+  const files  = (qa.failedFiles||[]).map(f => `<span class="qa-tag">${escHtml(f)}</span>`).join('');
+  const errors = (qa.testErrors||[]).map(e => `<div class="qa-err">${escHtml(e)}</div>`).join('');
+  document.getElementById('qaContent').innerHTML =
+    `<div style="margin-bottom:8px;">${files||'<span style="color:var(--muted)">（无失败文件记录）</span>'}</div>${errors}`;
+}
+
+// ── 仲裁指令 ──────────────────────────────────────────────────────────────────
+function renderMediation(dirs) {
+  const block = document.getElementById('medBlock');
+  if (!dirs?.length) { block.classList.add('hidden'); return; }
+  block.classList.remove('hidden');
+  document.getElementById('detailBadge').classList.remove('hidden');
+  document.getElementById('detailsEmpty').classList.add('hidden');
+  document.getElementById('medContent').innerHTML = dirs.map(d =>
+    `<div class="med-item">
+      <div class="med-file">📁 ${escHtml(d.file)}</div>
+      <div class="med-action">${escHtml(d.action)}</div>
+      <div class="med-detail">${escHtml(d.detail)}</div>
+    </div>`
+  ).join('');
+}
+
+// ── 部署结果 ──────────────────────────────────────────────────────────────────
+function renderDeploy(dep) {
+  if (!dep || dep.status === 'none') return;
+  const block = document.getElementById('deployBlock');
+  block.classList.remove('hidden');
+  document.getElementById('detailsEmpty').classList.add('hidden');
+  const running = dep.status === 'running';
+  const panel = document.getElementById('deployPanel');
+  panel.className = 'deploy-panel ' + (running ? 'success' : 'failed');
+  panel.innerHTML = running
+    ? `<div style="color:var(--green);font-weight:700;font-size:14px;">🚀 部署成功</div>
+       <div class="deploy-url" style="margin-top:8px;"><a href="${escHtml(dep.url||'')}" target="_blank">🔗 ${escHtml(dep.url||'')}</a></div>`
+    : `<div style="color:var(--red);font-weight:700;font-size:14px;">❌ 部署失败</div>
+       <div style="color:var(--muted);font-size:12px;margin-top:6px;">请查看日志了解详情</div>`;
+}
+
+// ── 团队共识 ──────────────────────────────────────────────────────────────────
+function renderBrief(brief) {
+  if (!brief?.length) return;
+  document.getElementById('briefBlock').classList.remove('hidden');
+  document.getElementById('detailsEmpty').classList.add('hidden');
+  document.getElementById('briefContent').innerHTML =
+    brief.map(b => `<div class="brief-item">${escHtml(b)}</div>`).join('');
+}
+
+// ── 文件浏览器 ────────────────────────────────────────────────────────────────
+async function refreshFileTree() {
+  if (!workspacePath) return;
+  try {
+    const res = await fetch('/api/workspace/files');
+    const { files } = await res.json();
+    const tree = document.getElementById('fileTree');
+    if (!files?.length) {
+      tree.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px;">工作空间为空</div>';
+      return;
+    }
+    tree.innerHTML = files.map(f =>
+      `<div class="file-tree-item${f===selectedFile?' selected':''}" title="${f}" onclick="openFile('${escHtml(f).replace(/'/g,"\\'")}')">
+        ${fileIcon(f)} ${escHtml(f)}
+      </div>`
+    ).join('');
+  } catch {}
+}
+
+async function openFile(rel) {
+  selectedFile = rel;
+  document.querySelectorAll('.file-tree-item').forEach(el => el.classList.toggle('selected', el.title === rel));
+  const viewer = document.getElementById('fileViewer');
+  viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-placeholder">加载中…</div>`;
+  try {
+    const res = await fetch('/api/workspace/file?path=' + encodeURIComponent(rel));
+    const { content } = await res.json();
+    const ext = rel.split('.').pop() || '';
+    const langMap = { ts:'typescript', js:'javascript', json:'json', html:'html', py:'python', md:'markdown', css:'css', yml:'yaml', yaml:'yaml' };
+    const lang = langMap[ext] || 'plaintext';
+    const hi = hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
+    viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-viewer-body"><pre><code>${hi}</code></pre></div>`;
+  } catch {
+    viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-placeholder">读取失败</div>`;
+  }
+}
+
+function fileIcon(f) {
+  if (/\.(ts|tsx)$/.test(f)) return '📜';
+  if (/\.(js|jsx)$/.test(f)) return '📜';
+  if (/\.json$/.test(f)) return '📋';
+  if (/\.html?$/.test(f)) return '🌐';
+  if (/\.md$/.test(f)) return '📝';
+  if (/\.py$/.test(f)) return '🐍';
+  if (/\.(css|scss)$/.test(f)) return '🎨';
+  return '📄';
+}
+
+// ── 页面刷新同步重建 ──────────────────────────────────────────────────────────
+function rebuildAll(s) {
+  const statusMap = { Running:'running', Finished:'finished', Error:'error', Idle:'' };
+  const labelMap  = { Running:'运行中', Finished:'已完成', Error:'出错', Idle:'空闲' };
+  setStatus(statusMap[s.status]||'', labelMap[s.status]||s.status);
+  document.getElementById('nodePill').textContent = s.currentNode || '-';
+  document.getElementById('goalInput').value = s.userGoal || '';
+  document.getElementById('runBtn').disabled = s.status === 'Running';
+
+  renderRetry(s.retryCount || 0);
+  renderTeam(s.team);
+  updatePhases(s.currentPhase, s.phaseData);
+
+  // 重放事件日志
+  const logContainer = document.getElementById('tab-logs');
+  logContainer.innerHTML = '';
+  (s.events || []).forEach(appendLog);
+
+  renderTasks(s.subTasks);
+  renderQA(s.qaFailures);
+  renderMediation(s.mediationDirectives);
+  renderDeploy(s.deployment);
+  renderBrief(s.projectBrief);
+
+  if (s.workspacePath) { workspacePath = s.workspacePath; }
+  if (s.requiresApproval && s.status === 'Running') showApproval(true);
+}
+
+// ── 初始化 ────────────────────────────────────────────────────────────────────
+buildPhaseList();
+renderRetry(0);
+
+// 日志容器滚动监听：用户向上滚时停止自动追底，回到底部时恢复
+document.getElementById('tab-logs').addEventListener('scroll', function() {
+  const atBottom = this.scrollHeight - this.scrollTop - this.clientHeight < 80;
+  if (atBottom === autoScroll) return;
+  autoScroll = atBottom;
+  if (currentTab === 'logs') {
+    document.getElementById('scrollBtn').classList.toggle('hidden', autoScroll);
+  }
+});
+</script>
+</body>
+</html>

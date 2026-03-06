@@ -1,0 +1,51 @@
+{
+  "id": "express-typescript",
+  "name": "Express + TypeScript",
+  "language": "TypeScript",
+  "version": "1.0.0",
+  "description": "生产级 Express REST API 模板，包含完整的中间件配置、错误处理、类型定义和测试",
+  "tags": ["api", "rest", "backend", "production-ready", "express"],
+  "dependencies": {
+    "express": "^4.18.0",
+    "cors": "^2.8.5",
+    "helmet": "^7.0.0",
+    "compression": "^1.7.4",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.0",
+    "@types/node": "^20.0.0",
+    "@types/cors": "^2.8.0",
+    "@types/compression": "^1.7.0",
+    "@types/morgan": "^1.9.0",
+    "typescript": "^5.0.0",
+    "jest": "^29.0.0",
+    "@types/jest": "^29.0.0",
+    "ts-jest": "^29.0.0",
+    "eslint": "^8.0.0",
+    "prettier": "^3.0.0"
+  },
+  "files": {
+    "server": "files/server.ts.j2",
+    "test": "files/server.test.ts.j2",
+    "tsconfig": "files/tsconfig.json",
+    "package": "files/package.json",
+    "middleware": "files/middleware/error-handler.ts",
+    "types": "files/types/index.ts"
+  },
+  "middleware": [
+    "helmet",
+    "cors",
+    "compression",
+    "morgan",
+    "error-handler"
+  ],
+  "features": {
+    "health_check": true,
+    "cors": true,
+    "rate_limiting": false,
+    "websocket": false,
+    "static_files": true
+  },
+  "scaffoldExample": "import express, { Application, Request, Response, NextFunction } from 'express';\nimport cors from 'cors';\nimport helmet from 'helmet';\nimport compression from 'compression';\nimport morgan from 'morgan';\nimport { errorHandler } from './middleware/error-handler';\n\nconst app: Application = express();\nconst PORT = process.env.PORT || 3000;\n\n// 中间件配置\napp.use(helmet());\napp.use(cors());\napp.use(compression());\napp.use(express.json());\nif (process.env.NODE_ENV !== 'test') {\n  app.use(morgan('combined'));\n}\n\n// TODO: 添加路由\n\nif (process.env.NODE_ENV !== 'test') {\n  app.listen(PORT, '0.0.0.0', () => {\n    console.log(`[服务] 已启动，端口 ${PORT}`);\n  });\n}\n\nexport default app;"
+}

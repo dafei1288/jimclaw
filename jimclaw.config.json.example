@@ -1,0 +1,32 @@
+{
+  "llm_configs": {
+    "openai_fast": {
+      "provider": "openai",
+      "modelName": "gpt-4o-mini",
+      "baseUrl": "https://www.dmxapi.cn/v1",
+      "apiKey": "xxxx",
+      "temperature": 0.7
+    }
+  },
+  "agents": {
+    "pm": "openai",
+    "architect": {
+      "default":   "openai",
+      "reasoning": "openai"
+    },
+    "coder": {
+      "default":   "openai",
+      "coding":    "openai",
+      "reasoning": "openai"
+    },
+    "qa": {
+      "default":  "openai",
+      "coding":   "openai"
+    }
+  },
+  "global": {
+    "maxRetries": 20,
+    "workspaceDir": "./workspace",
+    "enableEvolution": true
+  }
+}
