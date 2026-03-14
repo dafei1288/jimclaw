@@ -107,6 +107,20 @@ public/
 - **Atomic Skills**: Each skill performs one task and returns a plain string result.
 - **Chain-first addNode**: New nodes must be added inside the `new StateGraph(...).addNode(...)` chain — not as separate `workflow.addNode()` calls — so TypeScript correctly infers valid node names for `addConditionalEdges`.
 
+## 核心开发哲学（铁律）
+
+### 1. 语言无关性 (Language Agnostic)
+JimClaw 是为全语言自动化设计的。严禁在系统层（Nodes/Core）编写针对特定语言（如仅支持 JavaScript）的硬编码逻辑。任何涉及文件操作、路径解析或环境搭建的改进，必须同等考虑 Python, Go, Java 等所有支持语言的兼容性。
+
+### 2. 技能优先 (Skill-Driven Autonomy)
+凡是 Agent 可以通过 Skill 或 MCP 工具完成的操作（如端口探测、网络调研、代码诊断），严禁在 Graph Node 逻辑中代劳。必须通过 Prompt 指引 Agent 主动调用工具获取真实数据，并基于工具反馈确立“架构契约”。
+
+### 3. 极致透明 (Zero Log Swallowing)
+严禁吞掉或隐藏任何执行日志。
+- Agent 的所有 Prompt、Thinking 和回复必须持久化。
+- 工具调用的原始入参和 Stdout/Stderr 必须全量记录。
+- 严禁在 Coder 节点中掩盖工具报错（如 Lint 失败也标记为成功）。
+
 ## 编码约束（对 AI 助手强制执行）
 
 ### 1. 必须使用中文
@@ -119,7 +133,7 @@ public/
 
 | 禁止硬编码的内容 | 正确做法 |
 |----------------|---------|
-| 文件名 `"server.js"` / `"unit_test.js"` | 从 `state.subTasks` 提取：`subTasks.find(t => /server/i.test(t.fileTarget))?.fileTarget` |
+| 文件名 `"server.js"` / `"unit_test.js"` | 从 `state.subTasks` 提取：`getEntryPoint(state)` |
 | 文件扩展名 `.js` / `.ts` / `.py` | 从 `spec.language` 或 `task.fileTarget` 的扩展名动态判断 |
 | 端口号 `3000` / `8080` | 从 `manifest.services[].port` 或 `process.env.PORT` 获取 |
 | 测试命令 `"node unit_test.js"` | 从 `spec.testCommand` 获取 |
@@ -143,7 +157,7 @@ await shell.run("node unit_test.js");
 // ✅ 正确：从状态动态提取
 const allFiles = state.subTasks.map(t => t.fileTarget);
 const testFile = allFiles.find(f => /test|spec/i.test(f)) ?? "unit_test.js";
-const implFile = allFiles.find(f => !/test|spec/i.test(f) && !f.endsWith("package.json")) ?? "server.js";
+const implFile = getImplementationFile(state);
 
 // ✅ 正确：从环境变量获取端口
 const PORT = parseInt(process.env.PORT || "3000", 10);

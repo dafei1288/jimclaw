@@ -1,14 +1,22 @@
 import chalk from "chalk";
 import { Team } from "./agents/team";
-import { createJimClowGraph } from "./core/graph";
+import { createJimClawGraph } from "./core/graph";
 
 // ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
 function agentColor(sender: string) {
-  if (sender.includes("观止")) return chalk.blue;
-  if (sender.includes("独孤")) return chalk.magenta;
-  if (sender.includes("星河")) return chalk.yellow;
-  if (sender.includes("清扬")) return chalk.green;
+  const agentKey = Object.keys(Team).find(key => (Team as any)[key].getPersona().name === sender);
+  const colorName = agentKey ? (Team as any)[agentKey].getPersona().color : null;
+  
+  if (colorName && (chalk as any)[colorName]) {
+    return (chalk as any)[colorName];
+  }
+
+  // Fallback for hardcoded names if metadata is missing
+  if (sender.includes("观止")) return chalk.cyan;
+  if (sender.includes("独孤")) return chalk.yellow;
+  if (sender.includes("星河")) return chalk.green;
+  if (sender.includes("清扬")) return chalk.magenta;
   return chalk.gray;
 }
 
@@ -133,7 +141,7 @@ function renderNodeState(nodeName: string, stateUpdate: any) {
 
     case "coder": {
       const retry = (stateUpdate.retryCount ?? 1) - 1;
-      if (retry > 0) console.log(chalk.magenta(`  重试轮次: ${retry}`));
+      if (retry > 0) console.log(chalk.yellow(`  重试轮次: ${retry}`));
       if (stateUpdate.subTasks?.length) {
         const done = stateUpdate.subTasks.filter((t: any) => t.status === "completed");
         const failed = stateUpdate.subTasks.filter((t: any) => t.status === "failed");
@@ -220,9 +228,9 @@ function renderNodeState(nodeName: string, stateUpdate: any) {
 
     case "architect_mediation":
       if (stateUpdate.mediationDirectives?.length) {
-        console.log(chalk.yellow(`  仲裁发现 ${stateUpdate.mediationDirectives.length} 个冲突点，修复指令：`));
+        console.log(chalk.magenta(`  仲裁发现 ${stateUpdate.mediationDirectives.length} 个冲突点，修复指令：`));
         stateUpdate.mediationDirectives.forEach((d: any) => {
-          console.log(chalk.yellow(`    [${d.file}]`) + chalk.white(` ${d.action}: ${d.detail.slice(0, 100)}`));
+          console.log(chalk.magenta(`    [${d.file}]`) + chalk.white(` ${d.action}: ${d.detail.slice(0, 100)}`));
         });
       }
       break;
@@ -261,7 +269,9 @@ async function runTUI() {
   console.log(chalk.gray("─".repeat(60) + "\n"));
 
   const onEvent = makeOnEvent();
-  const app = await createJimClowGraph(Team, onEvent);
+  const app = await createJimClawGraph(Team, onEvent);
+
+  let trackedContainerId: string | null = null;
 
   try {
     const stream = await app.stream(
@@ -279,12 +289,14 @@ async function runTUI() {
         mediationDirectives: null,
         packageJsonHash: "",
       },
-      { recursionLimit: 100 }
+      { recursionLimit: 500 }
     );
 
     for await (const chunk of stream) {
       const nodeName = Object.keys(chunk)[0];
       const stateUpdate = (chunk as any)[nodeName];
+      // 追踪 containerId，用于异常时兜底清理
+      if (stateUpdate.containerId) trackedContainerId = stateUpdate.containerId;
       const label = NODE_LABELS[nodeName] || nodeName.toUpperCase();
 
       printSection(label);
@@ -296,6 +308,18 @@ async function runTUI() {
     const msg = error?.message || JSON.stringify(error, null, 2);
     console.error(chalk.bold.red(`\n❌ 会话失败: ${msg}`));
     if (!error?.message) console.error(chalk.red("完整错误:"), error);
+    // 兜底清理：图执行异常时 persistence 节点不会运行，需在此处清理孤立容器
+    if (trackedContainerId) {
+      console.error(chalk.yellow(`\n[兜底清理] 正在移除孤立容器 ${trackedContainerId}...`));
+      try {
+        const { exec } = await import("child_process");
+        const { promisify } = await import("util");
+        await promisify(exec)(`docker rm -f ${trackedContainerId} 2>/dev/null || true`);
+        console.error(chalk.green(`[兜底清理] 容器已清理`));
+      } catch {
+        console.error(chalk.red(`[兜底清理] 容器清理失败，请手动执行: docker rm -f ${trackedContainerId}`));
+      }
+    }
   }
 }
 

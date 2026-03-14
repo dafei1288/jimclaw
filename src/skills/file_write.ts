@@ -18,7 +18,7 @@ export const FileWriteSkill = new Skill({
       // 鲁棒性改进：如果 content 中包含 Markdown 代码块（如 ```python ... ```），只提取代码内容
       let cleanContent = content;
       const codeBlockRegex = /```(?:\w+)?\s*\n([\s\S]*?)\n\s*```/g;
-      const matches = [...content.matchAll(codeBlockRegex)];
+      const matches = Array.from(content.matchAll(codeBlockRegex));
       
       if (matches.length > 0) {
         // 如果有多个代码块，合并它们（通常一个文件只有一个，但这里做个通用处理）
@@ -43,7 +43,21 @@ export const FileWriteSkill = new Skill({
       if (!workspaceRoot) {
         throw new Error("JIMCLAW_WORKSPACE 未设置：禁止在 workspace 目录外写入文件。");
       }
-      const absolutePath = path.resolve(workspaceRoot, filePath);
+
+      // 容错：agent 有时会传入绝对路径（含路径名拼写错误）
+      // 若绝对路径在 workspace 内，转为相对路径；若在 workspace 外，拒绝写入
+      let resolvedFilePath = filePath;
+      if (path.isAbsolute(filePath)) {
+        const normalizedFile = path.normalize(filePath);
+        const normalizedRoot = path.normalize(workspaceRoot);
+        if (normalizedFile.startsWith(normalizedRoot + path.sep) || normalizedFile === normalizedRoot) {
+          resolvedFilePath = path.relative(workspaceRoot, normalizedFile);
+        } else {
+          throw new Error(`安全限制：绝对路径 "${filePath}" 不在 workspace 目录内，请使用相对路径。`);
+        }
+      }
+
+      const absolutePath = path.resolve(workspaceRoot, resolvedFilePath);
       // 路径安全检查：防止 ../../../ 等路径穿越攻击
       if (!absolutePath.startsWith(workspaceRoot + path.sep) && absolutePath !== workspaceRoot) {
         throw new Error(`安全限制：不允许写入 workspace 目录外的路径 "${filePath}"。`);

@@ -1,7 +1,7 @@
 {
   "name": "jimclaw",
   "version": "1.0.0",
-  "description": "NeoClaw 是一个借鉴了 Claude Code, OpenClaw 和 OpenCode 设计理念的智能体系统。它旨在通过拟人化的角色设定、执着的循环迭代（Sisyphus 协议）以及基于复盘的自我进化，实现高度自主的代码开发与维护。",
+  "description": "JimClaw 是一个借鉴了 Claude Code, OpenClaw 和 OpenCode 设计理念的智能体系统。它旨在通过拟人化的角色设定、执着的循环迭代（Sisyphus 协议）以及基于复盘的自我进化，实现高度自主的代码开发与维护。",
   "main": "index.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

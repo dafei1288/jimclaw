@@ -1,693 +1,1076 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="zh-CN" class="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>JimClaw 控制台</title>
+  <title>JimClaw - Professional Command Center</title>
+  
   <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/lucide@latest"></script>
   <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
   <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
-  <style>
-    :root {
-      --bg:     #0f1117;
-      --bg2:    #1a1d27;
-      --bg3:    #22263a;
-      --border: #2e3248;
-      --accent: #5b7cfa;
-      --accent2:#7c5bfa;
-      --green:  #34d399;
-      --red:    #f87171;
-      --orange: #fb923c;
-      --yellow: #fbbf24;
-      --text:   #e2e8f0;
-      --muted:  #64748b;
-      --r:      8px;
+
+  <script>
+    tailwind.config = {
+      darkMode: 'class',
+      theme: {
+        extend: {
+          colors: {
+            background: '#0f172a', // slate-900
+            surface: '#1e293b',    // slate-800
+            primary: '#6366f1',    // indigo-500
+          }
+        }
+      }
     }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); font-size: 14px; height: 100vh; display: flex; flex-direction: column; overflow: hidden; }
+  </script>
+  <style>
+    body { background-color: #0f172a; color: #f8fafc; margin: 0; overflow: hidden; height: 100vh; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .scrollbar::-webkit-scrollbar { width: 8px; height: 8px; }
+    .scrollbar::-webkit-scrollbar-track { background: transparent; }
+    .scrollbar::-webkit-scrollbar-thumb { background: #334155; border-radius: 4px; }
+    .scrollbar::-webkit-scrollbar-thumb:hover { background: #475569; }
+    
+    .toast { animation: slideIn 0.3s ease-out forwards; }
+    .toast.hide { animation: slideOut 0.3s ease-in forwards; }
+    @keyframes slideIn { from { transform: translateX(100%); opacity: 0; } to { transform: translateX(0); opacity: 1; } }
+    @keyframes slideOut { from { transform: translateX(0); opacity: 1; } to { transform: translateX(100%); opacity: 0; } }
 
-    /* ── 顶栏 ── */
-    header { display: flex; align-items: center; gap: 12px; padding: 10px 20px; background: var(--bg2); border-bottom: 1px solid var(--border); flex-shrink: 0; }
-    .logo { font-size: 18px; font-weight: 700; color: var(--accent); letter-spacing: .5px; }
-    .logo span { color: var(--accent2); }
-    .status-badge { padding: 3px 10px; border-radius: 20px; font-size: 12px; font-weight: 600; background: var(--bg3); color: var(--muted); }
-    .status-badge.running  { background: #1a2e4a; color: #60a5fa; }
-    .status-badge.finished { background: #0f2a1e; color: var(--green); }
-    .status-badge.error    { background: #2a1010; color: var(--red); }
-    .node-pill { padding: 3px 10px; border-radius: 4px; font-size: 11px; background: var(--bg3); border: 1px solid var(--border); color: var(--muted); }
-    .header-input { flex: 1; display: flex; gap: 8px; max-width: 640px; margin-left: auto; }
-    .header-input input { flex: 1; background: var(--bg3); border: 1px solid var(--border); border-radius: var(--r); padding: 7px 14px; color: var(--text); font-size: 13px; outline: none; }
-    .header-input input:focus { border-color: var(--accent); }
-    .btn { background: var(--accent); color: #fff; border: none; border-radius: var(--r); padding: 7px 18px; font-weight: 600; cursor: pointer; font-size: 13px; white-space: nowrap; }
-    .btn:hover { background: var(--accent2); }
-    .btn:disabled { opacity: .4; cursor: default; }
-
-    /* ── 布局 ── */
-    .layout { display: flex; flex: 1; overflow: hidden; }
-
-    /* ── 左栏 ── */
-    .sidebar { width: 240px; flex-shrink: 0; background: var(--bg2); border-right: 1px solid var(--border); display: flex; flex-direction: column; overflow-y: auto; padding: 14px; gap: 18px; }
-    .sidebar h3 { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 8px; }
-
-    /* 阶段 */
-    .phase-list { display: flex; flex-direction: column; gap: 3px; }
-    .phase-item { display: flex; align-items: center; gap: 8px; padding: 5px 8px; border-radius: 6px; font-size: 12px; color: var(--muted); }
-    .phase-item.active { background: #1a2e4a; color: #60a5fa; }
-    .phase-item.done   { color: var(--green); }
-    .phase-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--border); flex-shrink: 0; }
-    .phase-item.active .phase-dot { background: #60a5fa; box-shadow: 0 0 6px #60a5fa88; }
-    .phase-item.done   .phase-dot { background: var(--green); }
-    .phase-dur { margin-left: auto; font-size: 10px; color: var(--muted); }
-
-    /* 重试 */
-    .retry-dots { display: flex; gap: 3px; flex-wrap: wrap; }
-    .retry-dot  { width: 9px; height: 9px; border-radius: 2px; background: var(--border); }
-    .retry-dot.used { background: var(--orange); }
-
-    /* 团队 */
-    .team-card { background: var(--bg3); border-radius: 6px; padding: 8px 10px; border: 1px solid var(--border); margin-bottom: 6px; }
-    .team-card .t-name  { font-weight: 600; font-size: 12px; }
-    .team-card .t-role  { font-size: 11px; color: var(--muted); margin-top: 1px; }
-    .team-card .t-model { font-size: 10px; color: var(--accent); margin-top: 4px; }
-
-    /* ── 主区域 ── */
-    .main-panel { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
-
-    /* 审批横幅 */
-    .approval-banner { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #1e1a3a; border-bottom: 1px solid #4a3a7a; flex-shrink: 0; }
-    .approval-banner span { flex: 1; font-size: 13px; color: #c4b5fd; }
-    .btn-approve { background: var(--green); color: #000; border: none; border-radius: 6px; padding: 6px 16px; font-weight: 700; cursor: pointer; font-size: 13px; }
-
-    /* 标签页 */
-    .tabs { display: flex; border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--bg2); }
-    .tab  { padding: 10px 18px; font-size: 13px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
-    .tab:hover { color: var(--text); }
-    .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
-    .tab-badge { display: inline-block; background: var(--red); color: #fff; border-radius: 10px; font-size: 10px; padding: 0 5px; margin-left: 4px; vertical-align: middle; }
-
-    /* 内容区 */
-    .tab-content { display: none; flex: 1; min-height: 0; overflow-y: auto; padding: 14px; gap: 8px; }
-    .tab-content.active { display: flex; flex-direction: column; }
-
-    /* ── 日志条目 ── */
-    .log-entry { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; flex-shrink: 0; }
-    .log-header { display: flex; align-items: center; gap: 8px; padding: 7px 12px; cursor: pointer; user-select: none; }
-    .log-header:hover { background: var(--bg3); }
-    .log-type { font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 4px; flex-shrink: 0; }
-    .t-thinking  { background: #1a2e4a; color: #93c5fd; }
-    .t-artifact  { background: #0f2a1e; color: var(--green); }
-    .t-phase     { background: #1e1a3a; color: #a78bfa; }
-    .t-llm_start { background: #2a2010; color: var(--yellow); }
-    .t-llm_end   { background: #2a2010; color: var(--yellow); }
-    .t-tool      { background: #1a2a2a; color: #5eead4; }
-    .t-chat      { background: #1a2a1a; color: #86efac; }
-    .t-error     { background: #2a1010; color: var(--red); }
-    .log-sender  { font-weight: 600; font-size: 12px; flex-shrink: 0; }
-    .log-preview { flex: 1; font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .log-time    { font-size: 11px; color: var(--muted); flex-shrink: 0; }
-    .log-body    { padding: 10px 14px; border-top: 1px solid var(--border); font-size: 12px; white-space: pre-wrap; word-break: break-all; max-height: 420px; overflow-y: auto; line-height: 1.6; }
-    .log-entry.collapsed .log-body { display: none; }
-
-    /* ── 子任务 ── */
-    .tasks-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 8px; flex-shrink: 0; }
-    .task-card  { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 12px; }
-    .task-card.completed { border-color: #1a4a30; }
-    .task-card.failed    { border-color: #4a1a1a; }
-    .ts-pending   { color: var(--muted); }
-    .ts-completed { color: var(--green); }
-    .ts-failed    { color: var(--red); }
-    .task-status { font-size: 11px; font-weight: 700; margin-bottom: 5px; }
-    .task-file   { font-size: 12px; font-weight: 600; margin-bottom: 3px; }
-    .task-desc   { font-size: 11px; color: var(--muted); line-height: 1.4; }
-    .task-err    { font-size: 11px; color: var(--red); margin-top: 6px; padding: 6px; background: #2a1010; border-radius: 4px; white-space: pre-wrap; word-break: break-all; }
-
-    /* ── 文件浏览 ── */
-    .files-layout { display: flex; gap: 10px; height: 100%; min-height: 0; overflow: hidden; }
-    .file-tree { width: 210px; flex-shrink: 0; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow-y: auto; min-height: 0; padding: 6px; }
-    .file-tree-item { padding: 4px 8px; border-radius: 4px; font-size: 12px; cursor: pointer; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-    .file-tree-item:hover    { background: var(--bg3); color: var(--text); }
-    .file-tree-item.selected { background: #1a2e4a; color: #93c5fd; }
-    .file-viewer { flex: 1; background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); overflow: hidden; display: flex; flex-direction: column; min-width: 0; }
-    .file-viewer-hdr { padding: 8px 14px; border-bottom: 1px solid var(--border); font-size: 12px; font-weight: 600; color: var(--muted); flex-shrink: 0; }
-    .file-viewer-body { flex: 1; overflow: auto; }
-    .file-viewer-body pre { margin: 0; }
-    .file-viewer-body code { font-family: 'Cascadia Code','Fira Code',monospace !important; font-size: 12px !important; }
-    .file-placeholder { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--muted); font-size: 13px; }
-
-    /* ── 详情面板 ── */
-    .detail-block { margin-bottom: 14px; flex-shrink: 0; }
-    .detail-block h4 { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin-bottom: 8px; }
-    .qa-panel  { background: #2a1010; border: 1px solid #4a2020; border-radius: var(--r); padding: 14px; }
-    .qa-panel h4 { color: var(--red); }
-    .qa-tag    { display: inline-block; background: #4a2020; color: var(--red); border-radius: 4px; padding: 2px 8px; font-size: 11px; margin: 2px; }
-    .qa-err    { font-size: 12px; color: #fca5a5; padding: 5px 0; border-bottom: 1px solid #3a1a1a; white-space: pre-wrap; }
-    .qa-err:last-child { border-bottom: none; }
-    .med-panel { background: #2a1800; border: 1px solid #4a2c00; border-radius: var(--r); padding: 14px; }
-    .med-panel h4 { color: var(--orange); }
-    .med-item  { background: #1a1000; border-radius: 6px; padding: 10px; margin-top: 8px; border: 1px solid #3a2000; }
-    .med-file  { font-size: 12px; font-weight: 700; color: var(--orange); margin-bottom: 4px; }
-    .med-action{ font-size: 11px; background: #3a2000; color: #fed7aa; display: inline-block; padding: 1px 6px; border-radius: 3px; margin-bottom: 4px; }
-    .med-detail{ font-size: 12px; color: #fde68a; line-height: 1.5; }
-    .deploy-panel { background: var(--bg2); border: 1px solid var(--border); border-radius: var(--r); padding: 14px; }
-    .deploy-panel.success { border-color: #1a4a30; background: #0a1e14; }
-    .deploy-panel.failed  { border-color: #4a1a1a; background: #1a0a0a; }
-    .deploy-url a { font-size: 16px; font-weight: 700; color: var(--green); text-decoration: none; }
-    .deploy-url a:hover { text-decoration: underline; }
-    .brief-item { font-size: 12px; padding: 5px 0; border-bottom: 1px solid var(--border); line-height: 1.5; }
-    .brief-item:last-child { border-bottom: none; }
-
-    /* ── 空状态 ── */
-    .empty { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 200px; gap: 8px; color: var(--muted); }
-    .empty .ico { font-size: 32px; }
-
-    /* ── 回到底部按钮 ── */
-    .scroll-btn { position: absolute; bottom: 20px; right: 20px; background: var(--accent); color: #fff; border: none; border-radius: 20px; padding: 6px 16px; font-size: 12px; font-weight: 600; cursor: pointer; box-shadow: 0 2px 12px rgba(0,0,0,.5); z-index: 20; transition: opacity .15s; }
-    .scroll-btn:hover { background: var(--accent2); }
-
-    /* ── 工具 ── */
-    .hidden { display: none !important; }
-    ::-webkit-scrollbar { width: 5px; height: 5px; }
-    ::-webkit-scrollbar-track { background: transparent; }
-    ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    /* Fix highlight.js background */
+    pre code.hljs { background: transparent !important; padding: 0 !important; }
   </style>
 </head>
-<body>
+<body class="flex flex-col h-screen">
 
-<!-- 顶栏 -->
-<header>
-  <div class="logo">Jim<span>Claw</span> 🦾</div>
-  <div class="status-badge" id="statusBadge">空闲</div>
-  <div class="node-pill" id="nodePill">-</div>
-  <div class="header-input">
-    <input id="goalInput" type="text" placeholder="描述需求，例如：实现一个带前端的 Todo List..." />
-    <button class="btn" id="runBtn" onclick="startTask()">▶ 启动</button>
+  <!-- Toasts -->
+  <div id="toastContainer" class="fixed bottom-4 right-4 z-50 flex flex-col gap-2"></div>
+
+  <!-- Header -->
+  <header class="h-auto min-h-16 bg-surface border-b border-slate-700 flex flex-col sm:flex-row items-center justify-between px-4 py-2 sm:px-6 sm:py-0 shrink-0 shadow-md gap-2">
+    <div class="flex items-center gap-2 sm:gap-4 w-full sm:w-auto shrink-0 justify-between sm:justify-start">
+      <div class="flex items-center gap-2">
+        <i data-lucide="cpu" class="w-5 h-5 sm:w-6 sm:h-6 text-primary"></i>
+        <h1 class="text-base sm:text-xl font-bold tracking-wider uppercase">JimClaw</h1>
+      </div>
+      <span class="px-2 py-1 text-xs bg-slate-700 rounded-md text-slate-300" id="statusBadge">Idle</span>
+    </div>
+
+    <div class="flex-1 max-w-2xl w-full relative flex order-3 sm:order-2">
+      <input type="text" id="goalInput" placeholder="输入协作目标..." class="w-full bg-slate-900 border border-slate-700 rounded-l-lg py-2 pl-3 pr-4 text-sm focus:outline-none focus:border-primary text-slate-200" />
+      <button onclick="startTask()" id="runBtn" class="bg-primary hover:bg-indigo-400 text-white px-4 sm:px-6 py-2 rounded-r-lg text-sm font-semibold transition-colors shrink-0 whitespace-nowrap">执行</button>
+    </div>
+
+    <div class="flex items-center gap-2 sm:gap-4 text-xs sm:text-sm text-slate-400 w-full sm:w-auto justify-between sm:justify-end shrink-0 order-2 sm:order-3">
+      <button onclick="openFeedbackBanner()" class="flex items-center gap-1 px-2 py-1 text-[10px] sm:text-xs border border-slate-600 rounded-md text-slate-400 hover:text-amber-400 hover:border-amber-500 transition-colors whitespace-nowrap" title="发送人工反馈">
+        <i data-lucide="message-square" class="w-3 h-3"></i>
+        <span class="hidden sm:inline">人工反馈</span>
+      </button>
+      <span class="px-2 py-1 text-[10px] sm:text-xs border border-slate-600 rounded-md text-slate-400 whitespace-nowrap" id="nodeBadge">Node: -</span>
+      <span class="whitespace-nowrap">重试: <span id="retryCount" class="text-amber-400 font-mono">0 / 5</span></span>
+    </div>
+  </header>
+
+  <!-- Approval Modal -->
+  <div id="approvalModal" class="hidden fixed inset-0 z-[100] flex items-center justify-center p-4 bg-background/80 backdrop-blur-sm">
+    <div class="bg-surface border border-primary/30 rounded-2xl shadow-2xl max-w-lg w-full overflow-hidden animate-in fade-in zoom-in duration-300">
+      <div class="p-6 md:p-8 flex flex-col items-center text-center">
+        <div class="w-16 h-16 bg-primary/10 rounded-full flex items-center justify-center mb-6">
+          <i data-lucide="shield-check" class="w-8 h-8 text-primary animate-pulse"></i>
+        </div>
+        <h2 class="text-xl md:text-2xl font-bold mb-3 tracking-tight">需要架构授权</h2>
+        <p class="text-slate-400 text-sm md:text-base leading-relaxed mb-8">架构师已根据您的需求完成了技术方案设计与 API 契约定义。在启动自动化开发前，请审阅设计方案并授权执行。</p>
+        
+        <div class="grid grid-cols-2 gap-4 w-full">
+          <button onclick="approve()" class="bg-primary hover:bg-indigo-400 text-white py-3 rounded-xl font-bold transition-all shadow-lg shadow-primary/20 flex items-center justify-center gap-2">
+            <i data-lucide="check-circle" class="w-5 h-5"></i> 授权执行
+          </button>
+          <button onclick="switchTab('dashboard'); document.getElementById('approvalModal').classList.add('hidden')" class="bg-slate-800 hover:bg-slate-700 text-slate-300 py-3 rounded-xl font-bold transition-all border border-slate-700 flex items-center justify-center gap-2">
+            <i data-lucide="eye" class="w-5 h-5"></i> 审阅方案
+          </button>
+        </div>
+        <button onclick="openFeedbackBanner(); document.getElementById('approvalModal').classList.add('hidden')" class="mt-6 text-slate-500 hover:text-amber-400 text-xs transition-colors flex items-center gap-1">
+          <i data-lucide="message-square" class="w-3 h-3"></i> 提出修改建议（拒绝并反馈）
+        </button>
+      </div>
+    </div>
   </div>
-</header>
 
-<!-- 主布局 -->
-<div class="layout">
-
-  <!-- 左侧栏 -->
-  <aside class="sidebar">
-    <div>
-      <h3>执行阶段</h3>
-      <div class="phase-list" id="phaseList"></div>
+  <!-- Human Feedback Banner -->
+  <div id="feedbackBanner" class="hidden bg-amber-900/80 border-b border-amber-500 px-4 md:px-6 py-2 md:py-3 flex items-center justify-between shrink-0">
+    <div class="flex items-center gap-2 md:gap-3 text-amber-100">
+      <i data-lucide="message-circle-warning" class="w-4 h-4 md:w-5 md:h-5 text-amber-300"></i>
+      <input type="text" id="feedbackInput" placeholder="输入您的质疑、建议或协助..." class="bg-amber-950/50 border border-amber-700 rounded px-3 py-1 text-sm text-amber-100 placeholder-amber-400/50 flex-1 max-w-md focus:outline-none focus:border-amber-500">
     </div>
-    <div>
-      <h3>重试轮次</h3>
-      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-        <div class="retry-dots" id="retryDots"></div>
-        <span id="retryLabel" style="font-size:12px;color:var(--muted)">0 轮</span>
-      </div>
+    <div class="flex items-center gap-2">
+      <button onclick="sendFeedback('challenge')" class="bg-rose-600 hover:bg-rose-500 text-white px-3 py-1.5 rounded text-xs font-semibold transition-colors">质疑</button>
+      <button onclick="sendFeedback('assist')" class="bg-emerald-600 hover:bg-emerald-500 text-white px-3 py-1.5 rounded text-xs font-semibold transition-colors">协助</button>
+      <button onclick="closeFeedbackBanner()" class="text-amber-400 hover:text-amber-300 px-2 py-1 text-xs">关闭</button>
     </div>
-    <div>
-      <h3>团队成员</h3>
-      <div id="teamList"></div>
-    </div>
-  </aside>
-
-  <!-- 主面板 -->
-  <div class="main-panel" style="position:relative;">
-
-    <!-- 审批横幅 -->
-    <div class="approval-banner hidden" id="approvalBanner">
-      <span>⏸ 方案设计完成，等待人工审批后开始编码</span>
-      <button class="btn-approve" onclick="approve()">批准 ✓</button>
-    </div>
-
-    <!-- 标签页头 -->
-    <div class="tabs">
-      <div class="tab active" data-tab="logs"    onclick="switchTab(this)">实时日志</div>
-      <div class="tab"        data-tab="tasks"   onclick="switchTab(this)">子任务 <span class="tab-badge hidden" id="taskBadge">0</span></div>
-      <div class="tab"        data-tab="files"   onclick="switchTab(this)">工程文件</div>
-      <div class="tab"        data-tab="details" onclick="switchTab(this)">详情 <span class="tab-badge hidden" id="detailBadge">!</span></div>
-    </div>
-
-    <!-- 日志 -->
-    <div class="tab-content active" id="tab-logs">
-      <div class="empty" id="logsEmpty"><div class="ico">📋</div><div>等待任务启动…</div></div>
-    </div>
-
-    <!-- 回到底部按钮 -->
-    <button class="scroll-btn hidden" id="scrollBtn" onclick="scrollLogToBottom()">↓ 最新</button>
-
-    <!-- 子任务 -->
-    <div class="tab-content" id="tab-tasks">
-      <div class="empty" id="tasksEmpty"><div class="ico">🗂</div><div>尚无子任务</div></div>
-      <div class="tasks-grid" id="tasksGrid"></div>
-    </div>
-
-    <!-- 工程文件 -->
-    <div class="tab-content" id="tab-files">
-      <div class="files-layout">
-        <div class="file-tree" id="fileTree">
-          <div style="color:var(--muted);font-size:12px;padding:8px;">工作空间尚未就绪</div>
-        </div>
-        <div class="file-viewer" id="fileViewer">
-          <div class="file-placeholder">← 从左侧选择文件查看</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- 详情 -->
-    <div class="tab-content" id="tab-details">
-      <div class="empty" id="detailsEmpty"><div class="ico">🔍</div><div>运行后此处显示详细信息</div></div>
-
-      <div class="detail-block hidden" id="deployBlock">
-        <h4>部署结果</h4>
-        <div class="deploy-panel" id="deployPanel"></div>
-      </div>
-
-      <div class="detail-block hidden" id="qaBlock">
-        <div class="qa-panel">
-          <h4>❌ QA 失败详情</h4>
-          <div id="qaContent" style="margin-top:10px;"></div>
-        </div>
-      </div>
-
-      <div class="detail-block hidden" id="medBlock">
-        <div class="med-panel">
-          <h4>🔧 架构师仲裁指令</h4>
-          <div id="medContent"></div>
-        </div>
-      </div>
-
-      <div class="detail-block hidden" id="briefBlock">
-        <h4>团队共识（Project Brief）</h4>
-        <div id="briefContent"></div>
-      </div>
-    </div>
-
   </div>
-</div>
 
-<script>
-// ── 阶段配置 ──────────────────────────────────────────────────────────────────
-const PHASES = [
-  { key: 'requirement',  label: '需求分析' },
-  { key: 'design',       label: '系统设计' },
-  { key: 'sync',         label: '契约校验' },
-  { key: 'approval',     label: '人工审批' },
-  { key: 'planning',     label: '任务编排' },
-  { key: 'coding',       label: '代码实现' },
-  { key: 'verification', label: '测试验证' },
-  { key: 'deployment',   label: '部署上线' },
-];
+  <!-- Global Workflow Pipeline -->
+  <div class="bg-surface border-b border-slate-700 px-4 md:px-8 py-3 shrink-0 shadow-sm">
+    <div id="pipelineStages" class="flex items-center justify-between max-w-7xl mx-auto gap-1"></div>
+  </div>
 
-const TYPE_LABEL = {
-  thinking: '思考', artifact: '产出', 'phase-change': '阶段',
-  llm_call_start: 'LLM↑', llm_response: 'LLM↓', tool_use: '工具',
-  error: '错误',
-};
-const TYPE_CLASS = {
-  thinking: 't-thinking', artifact: 't-artifact', 'phase-change': 't-phase',
-  llm_call_start: 't-llm_start', llm_response: 't-llm_end', tool_use: 't-tool',
-  error: 't-error',
-};
-
-// 每个 agent 专属颜色（日志 sender 与团队卡片共用）
-const SENDER_COLOR = {
-  '阿历克斯': '#93c5fd',   // PM       — 蓝
-  '索菲亚':   '#a78bfa',   // Architect — 紫
-  '阿雷':     '#34d399',   // Coder    — 绿
-  '艾瑞丝':   '#fb923c',   // QA       — 橙
-  'System':   '#64748b',   // 系统     — 灰
-};
-
-// ── 全局状态 ──────────────────────────────────────────────────────────────────
-let session = null;
-let currentTab = 'logs';
-let workspacePath = null;
-let selectedFile = null;
-let autoScroll = true;   // 日志是否跟随滚动到底部
-
-// ── Socket.io ─────────────────────────────────────────────────────────────────
-const socket = io();
-
-socket.on('session-sync', (s) => {
-  session = s;
-  rebuildAll(s);
-});
-
-socket.on('workspace-ready', ({ path }) => {
-  workspacePath = path;
-  if (currentTab === 'files') refreshFileTree();
-});
-
-socket.on('agent-event', (ev) => {
-  appendLog(ev);
-  if (ev.type === 'phase-change') updatePhases(ev.content);
-  if (ev.type === 'approval_required') showApproval(true);
-});
-
-socket.on('state-update', (u) => {
-  if (!session) session = {};
-  if (u.node) { session.currentNode = u.node; document.getElementById('nodePill').textContent = u.node; }
-  if (u.retryCount !== undefined) { session.retryCount = u.retryCount; renderRetry(u.retryCount); }
-  if (u.subTasks)              { session.subTasks = u.subTasks; renderTasks(u.subTasks); }
-  if (u.qaFailures !== undefined) { session.qaFailures = u.qaFailures; renderQA(u.qaFailures); }
-  if (u.mediationDirectives !== undefined) { session.mediationDirectives = u.mediationDirectives; renderMediation(u.mediationDirectives); }
-  if (u.projectBrief?.length)  { session.projectBrief = [...(session.projectBrief||[]), ...u.projectBrief]; renderBrief(session.projectBrief); }
-  if (u.deploymentStatus)      { session.deployment = u.deploymentStatus; renderDeploy(u.deploymentStatus); }
-  if (u.codeLog?.length && currentTab === 'files') refreshFileTree();
-});
-
-socket.on('task-finished', ({ success }) => {
-  setStatus(success ? 'finished' : 'error', success ? '已完成' : '失败');
-  document.getElementById('runBtn').disabled = false;
-  showApproval(false);
-  if (workspacePath) refreshFileTree();
-});
-
-socket.on('task-error', ({ message }) => {
-  setStatus('error', '出错');
-  document.getElementById('runBtn').disabled = false;
-  appendLog({ type: 'error', sender: 'System', content: message, timestamp: nowStr() });
-});
-
-// ── 操作 ──────────────────────────────────────────────────────────────────────
-function startTask() {
-  const goal = document.getElementById('goalInput').value.trim();
-  if (!goal) return;
-  resetUI();
-  setStatus('running', '运行中');
-  document.getElementById('runBtn').disabled = true;
-  socket.emit('run-task', { userGoal: goal });
-}
-
-function approve() {
-  socket.emit('approve-task', { approved: true });
-  showApproval(false);
-}
-
-document.getElementById('goalInput').addEventListener('keydown', e => {
-  if (e.key === 'Enter') startTask();
-});
-
-// ── UI 工具 ───────────────────────────────────────────────────────────────────
-function setStatus(type, label) {
-  const el = document.getElementById('statusBadge');
-  el.className = 'status-badge' + (type ? ' ' + type : '');
-  el.textContent = label;
-}
-
-function showApproval(show) {
-  document.getElementById('approvalBanner').classList.toggle('hidden', !show);
-}
-
-function switchTab(el) {
-  const name = el.dataset.tab;
-  currentTab = name;
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.tab === name));
-  document.querySelectorAll('.tab-content').forEach(c => c.classList.toggle('active', c.id === 'tab-' + name));
-  // 切换到日志页时，若不在底部则显示回底部按钮
-  const btn = document.getElementById('scrollBtn');
-  if (name === 'logs') {
-    btn.classList.toggle('hidden', autoScroll);
-  } else {
-    btn.classList.add('hidden');
-  }
-  if (name === 'files') refreshFileTree();
-}
-
-function nowStr() {
-  return new Date().toLocaleTimeString('zh-CN', { hour12: false });
-}
-
-function escHtml(s) {
-  return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-}
-
-function resetUI() {
-  document.getElementById('tab-logs').innerHTML = '<div class="empty" id="logsEmpty"><div class="ico">📋</div><div>等待任务启动…</div></div>';
-  document.getElementById('tasksGrid').innerHTML = '';
-  document.getElementById('tasksEmpty').classList.remove('hidden');
-  document.getElementById('taskBadge').classList.add('hidden');
-  document.getElementById('detailBadge').classList.add('hidden');
-  document.getElementById('detailsEmpty').classList.remove('hidden');
-  ['deployBlock','qaBlock','medBlock','briefBlock'].forEach(id => document.getElementById(id).classList.add('hidden'));
-  document.getElementById('nodePill').textContent = '-';
-  renderRetry(0);
-  PHASES.forEach(p => {
-    const el = document.getElementById('ph-' + p.key);
-    if (el) { el.className = 'phase-item'; el.querySelector('.phase-dot').className = 'phase-dot'; el.querySelector('.phase-dur').textContent = ''; }
-  });
-  workspacePath = null; selectedFile = null;
-  document.getElementById('fileTree').innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px;">工作空间尚未就绪</div>';
-  document.getElementById('fileViewer').innerHTML = '<div class="file-placeholder">← 从左侧选择文件查看</div>';
-}
-
-// ── 阶段 ──────────────────────────────────────────────────────────────────────
-function buildPhaseList() {
-  document.getElementById('phaseList').innerHTML = PHASES.map(p =>
-    `<div class="phase-item" id="ph-${p.key}">
-      <div class="phase-dot"></div>
-      <span>${p.label}</span>
-      <span class="phase-dur"></span>
-    </div>`
-  ).join('');
-}
-
-function updatePhases(activeKey, phaseData) {
-  let passed = true;
-  PHASES.forEach(p => {
-    const el = document.getElementById('ph-' + p.key);
-    if (!el) return;
-    const dur = phaseData?.[p.key];
-    if (p.key === activeKey) {
-      el.className = 'phase-item active'; passed = false;
-      el.querySelector('.phase-dur').textContent = '';
-    } else if (passed) {
-      el.className = 'phase-item done';
-      const sec = dur?.totalDuration ? Math.round(dur.totalDuration / 1000) + 's' : '';
-      el.querySelector('.phase-dur').textContent = sec;
-    } else {
-      el.className = 'phase-item';
-    }
-  });
-}
-
-// ── 重试 ──────────────────────────────────────────────────────────────────────
-function renderRetry(n) {
-  document.getElementById('retryDots').innerHTML = Array.from({length:10},(_,i) =>
-    `<div class="retry-dot${i<n?' used':''}"></div>`
-  ).join('');
-  document.getElementById('retryLabel').textContent = n + ' 轮';
-}
-
-// ── 团队 ──────────────────────────────────────────────────────────────────────
-function renderTeam(team) {
-  document.getElementById('teamList').innerHTML = (team||[]).map(m => {
-    const color = SENDER_COLOR[m.name] || 'var(--muted)';
-    return `<div class="team-card" style="border-left:3px solid ${color};">
-      <div class="t-name" style="color:${color};">${m.name}</div>
-      <div class="t-role">${m.role}</div>
-      <div class="t-model">⚙ ${m.model || '—'}</div>
-    </div>`;
-  }).join('');
-}
-
-// ── 日志 ──────────────────────────────────────────────────────────────────────
-function appendLog(ev) {
-  const container = document.getElementById('tab-logs');
-  const empty = document.getElementById('logsEmpty');
-  if (empty) empty.remove();
-
-  const tc = TYPE_CLASS[ev.type] || 't-chat';
-  const tl = TYPE_LABEL[ev.type] || '消息';
-  const body = ev.metadata ? JSON.stringify(ev.metadata, null, 2) : (ev.content || '');
-  const preview = (ev.content || '').slice(0, 100).replace(/\n/g,' ');
-  const uid = 'lg' + Date.now().toString(36) + Math.random().toString(36).slice(2);
-  const senderColor = SENDER_COLOR[ev.sender] || 'var(--text)';
-
-  const div = document.createElement('div');
-  div.className = 'log-entry collapsed';
-  div.innerHTML =
-    `<div class="log-header" onclick="document.getElementById('${uid}').closest('.log-entry').classList.toggle('collapsed')">
-      <span class="log-type ${tc}">${tl}</span>
-      <span class="log-sender" style="color:${senderColor};">${escHtml(ev.sender||'')}</span>
-      <span class="log-preview">${escHtml(preview)}</span>
-      <span class="log-time">${ev.timestamp||nowStr()}</span>
-    </div>
-    <div class="log-body" id="${uid}">${escHtml(body)}</div>`;
-  container.appendChild(div);
-
-  if (autoScroll) {
-    container.scrollTop = container.scrollHeight;
-  } else if (currentTab === 'logs') {
-    document.getElementById('scrollBtn').classList.remove('hidden');
-  }
-}
-
-function scrollLogToBottom() {
-  const container = document.getElementById('tab-logs');
-  container.scrollTop = container.scrollHeight;
-  autoScroll = true;
-  document.getElementById('scrollBtn').classList.add('hidden');
-}
-
-// ── 子任务 ────────────────────────────────────────────────────────────────────
-function renderTasks(tasks) {
-  if (!tasks?.length) return;
-  document.getElementById('tasksEmpty').classList.add('hidden');
-  const badge = document.getElementById('taskBadge');
-  badge.classList.remove('hidden');
-  badge.textContent = tasks.length;
-  document.getElementById('tasksGrid').innerHTML = tasks.map(t =>
-    `<div class="task-card ${t.status}">
-      <div class="task-status ts-${t.status}">
-        ${{pending:'○ 等待', completed:'✓ 完成', failed:'✗ 失败'}[t.status]||t.status}
+  <main class="flex-1 flex overflow-hidden flex-col lg:flex-row">
+    <!-- Sidebar: Team -->
+    <aside class="w-full lg:w-64 bg-surface border-r border-slate-700 flex flex-col shrink-0 max-h-48 lg:max-h-full overflow-hidden">
+      <div class="p-3 lg:p-4 border-b border-slate-700 text-xs font-bold text-slate-300 uppercase tracking-widest flex items-center gap-2">
+        <i data-lucide="users" class="w-4 h-4 text-slate-400"></i> 智能体矩阵
       </div>
-      <div class="task-file">📄 ${escHtml(t.fileTarget)}</div>
-      <div class="task-desc">${escHtml(t.description||'')}</div>
-      ${t.lastError ? `<div class="task-err">${escHtml(t.lastError.slice(0,200))}</div>` : ''}
-    </div>`
-  ).join('');
-}
+      <div class="flex-1 overflow-y-auto scrollbar p-2 lg:p-4 space-y-2 lg:space-y-3" id="teamList"></div>
+    </aside>
 
-// ── QA 失败 ───────────────────────────────────────────────────────────────────
-function renderQA(qa) {
-  const block = document.getElementById('qaBlock');
-  if (!qa) { block.classList.add('hidden'); return; }
-  block.classList.remove('hidden');
-  document.getElementById('detailBadge').classList.remove('hidden');
-  document.getElementById('detailsEmpty').classList.add('hidden');
-  const files  = (qa.failedFiles||[]).map(f => `<span class="qa-tag">${escHtml(f)}</span>`).join('');
-  const errors = (qa.testErrors||[]).map(e => `<div class="qa-err">${escHtml(e)}</div>`).join('');
-  document.getElementById('qaContent').innerHTML =
-    `<div style="margin-bottom:8px;">${files||'<span style="color:var(--muted)">（无失败文件记录）</span>'}</div>${errors}`;
-}
+    <!-- Main Content -->
+    <section class="flex-1 flex flex-col min-w-0 bg-background relative">
+      <!-- Tabs -->
+      <div class="flex bg-surface border-b border-slate-700 shrink-0 overflow-x-auto">
+        <button onclick="switchTab('live')" id="tab-live" class="px-3 sm:px-6 py-2 sm:py-3 text-xs sm:text-sm font-medium border-b-2 border-primary text-white transition-colors whitespace-nowrap">实时终端</button>
+        <button onclick="switchTab('dashboard')" id="tab-dashboard" class="px-3 sm:px-6 py-2 sm:py-3 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors whitespace-nowrap">决策与质量看板</button>
+        <button onclick="switchTab('workspace')" id="tab-workspace" class="px-3 sm:px-6 py-2 sm:py-3 text-xs sm:text-sm font-medium border-b-2 border-transparent text-slate-400 hover:text-slate-200 transition-colors whitespace-nowrap">文件资产浏览器</button>
+      </div>
 
-// ── 仲裁指令 ──────────────────────────────────────────────────────────────────
-function renderMediation(dirs) {
-  const block = document.getElementById('medBlock');
-  if (!dirs?.length) { block.classList.add('hidden'); return; }
-  block.classList.remove('hidden');
-  document.getElementById('detailBadge').classList.remove('hidden');
-  document.getElementById('detailsEmpty').classList.add('hidden');
-  document.getElementById('medContent').innerHTML = dirs.map(d =>
-    `<div class="med-item">
-      <div class="med-file">📁 ${escHtml(d.file)}</div>
-      <div class="med-action">${escHtml(d.action)}</div>
-      <div class="med-detail">${escHtml(d.detail)}</div>
-    </div>`
-  ).join('');
-}
+      <!-- Tab Contents -->
+      <div class="flex-1 relative overflow-hidden">
+        
+        <!-- Live Terminal -->
+        <div id="view-live" class="absolute inset-0 flex flex-col p-2 md:p-4 bg-slate-900">
+          <div id="logStream" class="flex-1 overflow-y-auto scrollbar space-y-2 md:space-y-4 pr-1 md:pr-2 font-mono text-xs md:text-sm">
+            <div class="text-slate-500 italic flex items-center gap-2 justify-center h-full opacity-50">
+              <i data-lucide="terminal" class="w-6 h-6 md:w-8 md:h-8"></i>
+              <span class="text-xs md:text-sm">等待系统启动...</span>
+            </div>
+          </div>
+        </div>
 
-// ── 部署结果 ──────────────────────────────────────────────────────────────────
-function renderDeploy(dep) {
-  if (!dep || dep.status === 'none') return;
-  const block = document.getElementById('deployBlock');
-  block.classList.remove('hidden');
-  document.getElementById('detailsEmpty').classList.add('hidden');
-  const running = dep.status === 'running';
-  const panel = document.getElementById('deployPanel');
-  panel.className = 'deploy-panel ' + (running ? 'success' : 'failed');
-  panel.innerHTML = running
-    ? `<div style="color:var(--green);font-weight:700;font-size:14px;">🚀 部署成功</div>
-       <div class="deploy-url" style="margin-top:8px;"><a href="${escHtml(dep.url||'')}" target="_blank">🔗 ${escHtml(dep.url||'')}</a></div>`
-    : `<div style="color:var(--red);font-weight:700;font-size:14px;">❌ 部署失败</div>
-       <div style="color:var(--muted);font-size:12px;margin-top:6px;">请查看日志了解详情</div>`;
-}
+        <!-- Dashboard -->
+        <div id="view-dashboard" class="hidden absolute inset-0 overflow-y-auto scrollbar p-3 md:p-6">
+          <div class="max-w-6xl mx-auto space-y-3 md:space-y-6">
 
-// ── 团队共识 ──────────────────────────────────────────────────────────────────
-function renderBrief(brief) {
-  if (!brief?.length) return;
-  document.getElementById('briefBlock').classList.remove('hidden');
-  document.getElementById('detailsEmpty').classList.add('hidden');
-  document.getElementById('briefContent').innerHTML =
-    brief.map(b => `<div class="brief-item">${escHtml(b)}</div>`).join('');
-}
+            <!-- Deployment -->
+            <div id="deployBlock" class="hidden bg-emerald-900/20 border border-emerald-500/30 rounded-xl p-3 md:p-6 shadow-sm">
+              <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3">
+                <div>
+                  <h3 class="text-emerald-400 font-bold mb-1 md:mb-2 flex items-center gap-2 text-sm md:text-base"><i data-lucide="rocket" class="w-4 h-4 md:w-5 md:h-5"></i> 服务已部署</h3>
+                  <p class="text-slate-300 text-xs md:text-sm font-mono break-all" id="deployInfo"></p>
+                </div>
+                <a id="deployUrl" target="_blank" class="bg-emerald-600 hover:bg-emerald-500 text-white px-4 md:px-6 py-2 rounded-lg text-xs md:text-sm font-medium transition-colors whitespace-nowrap">打开预览</a>
+              </div>
+            </div>
 
-// ── 文件浏览器 ────────────────────────────────────────────────────────────────
-async function refreshFileTree() {
-  if (!workspacePath) return;
-  try {
-    const res = await fetch('/api/workspace/files');
-    const { files } = await res.json();
-    const tree = document.getElementById('fileTree');
-    if (!files?.length) {
-      tree.innerHTML = '<div style="color:var(--muted);font-size:12px;padding:8px;">工作空间为空</div>';
-      return;
+            <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 md:gap-6">
+              <!-- Brief -->
+              <div class="bg-surface border border-slate-700 rounded-xl p-3 md:p-5 shadow-sm flex flex-col">
+                <h3 class="text-indigo-400 font-bold mb-2 md:mb-4 flex items-center gap-2 shrink-0 text-sm md:text-base"><i data-lucide="book-open" class="w-4 h-4"></i> 项目共识</h3>
+                <div id="briefContent" class="space-y-2 md:space-y-3 text-xs md:text-sm text-slate-300 flex-1 overflow-y-auto scrollbar max-h-[300px] md:max-h-[400px]">
+                  <span class="text-slate-500 italic">暂无记录</span>
+                </div>
+              </div>
+
+              <!-- SubTasks -->
+              <div class="bg-surface border border-slate-700 rounded-xl p-3 md:p-5 shadow-sm flex flex-col">
+                <h3 class="text-indigo-400 font-bold mb-2 md:mb-4 flex items-center gap-2 shrink-0 text-sm md:text-base"><i data-lucide="list-todo" class="w-4 h-4"></i> 行动清单</h3>
+                <div id="tasksContent" class="space-y-2 text-xs md:text-sm flex-1 overflow-y-auto scrollbar max-h-[300px] md:max-h-[400px]">
+                  <span class="text-slate-500 italic">暂无任务</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- Issues -->
+            <div id="issueBlock" class="hidden space-y-4">
+              <h3 class="text-rose-400 font-bold flex items-center gap-2 text-sm md:text-base"><i data-lucide="bug" class="w-4 h-4"></i> 缺陷追踪看板 (Issue Tracker)</h3>
+              <div id="issueContent" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+            </div>
+
+            <!-- QA -->
+            <div id="qaBlock" class="hidden bg-rose-900/10 border border-rose-500/30 rounded-xl p-3 md:p-5 shadow-sm">
+              <h3 class="text-rose-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="alert-circle" class="w-4 h-4"></i> 质量异常分析</h3>
+              <div id="qaContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
+            </div>
+
+            <!-- Mediation -->
+            <div id="medBlock" class="hidden bg-amber-900/10 border border-amber-500/30 rounded-xl p-3 md:p-5 shadow-sm">
+              <h3 class="text-amber-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="git-merge" class="w-4 h-4"></i> 架构干预指令</h3>
+              <div id="medContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
+            </div>
+
+            <!-- Fix Plan -->
+            <div id="fixPlanBlock" class="hidden bg-sky-900/10 border border-sky-500/30 rounded-xl p-3 md:p-5 shadow-sm">
+              <h3 class="text-sky-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="handshake" class="w-4 h-4"></i> QA-Coder 修复协商</h3>
+              <div id="fixPlanContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
+            </div>
+
+          </div>
+        </div>
+
+        <!-- Workspace -->
+        <div id="view-workspace" class="hidden absolute inset-0 flex flex-col md:flex-row">
+          <div class="w-full md:w-72 h-48 md:h-auto border-r border-slate-700 bg-surface flex flex-col shrink-0">
+            <div class="p-2 md:p-3 border-b border-slate-700 text-xs font-bold text-slate-400 flex justify-between items-center bg-slate-800/80">
+              <span class="flex items-center gap-2"><i data-lucide="folder-tree" class="w-4 h-4"></i> 文件树</span>
+              <button onclick="refreshFileTree()" class="hover:text-white transition-colors" title="刷新"><i data-lucide="refresh-cw" class="w-3 h-3"></i></button>
+            </div>
+            <div class="flex-1 overflow-y-auto scrollbar p-2" id="fileTree"></div>
+          </div>
+          <div class="flex-1 flex flex-col min-w-0 bg-[#0d1117]"> <!-- GitHub Dark Background -->
+            <div id="fileHeader" class="h-10 border-b border-slate-700 flex items-center px-2 md:px-4 text-xs md:text-sm font-mono text-slate-400 bg-surface shadow-sm shrink-0 truncate">
+              请在左侧选择文件
+            </div>
+            <div class="flex-1 overflow-auto scrollbar p-2 md:p-4 relative">
+              <div id="filePlaceholder" class="absolute inset-0 flex items-center justify-center text-slate-600 opacity-50 flex-col gap-4">
+                <i data-lucide="file-code-2" class="w-12 h-12 md:w-16 md:h-16"></i>
+                <span class="tracking-widest uppercase text-[10px] md:text-xs font-bold">Workspace File Viewer</span>
+              </div>
+              <pre class="m-0"><code id="codeBlock" class="text-xs md:text-sm font-mono leading-relaxed"></code></pre>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+  </main>
+
+  <script>
+    // Include full class names for Tailwind CSS JIT compilation scanning
+    // 节点名称本地化映射
+    const NODE_NAME_MAP = {
+      'pm': '需求分析',
+      'architect': '架构设计',
+      'contract_sync': '契约同步',
+      'approval': '人工审批',
+      'orchestrator': '任务拆解',
+      'coder': '代码开发',
+      'infra_setup': '环境准备',
+      'terminal': '测试执行',
+      'verifier': '代码预检',
+      'qa': '质量测试',
+      'fix_plan': '修复协商',
+      'architect_mediation': '架构干预',
+      'deploy': '服务部署',
+      'post_mortem': '复盘总结',
+      'persistence': '结果归档'
+    };
+
+    // 格式化节点名称为用户友好的中文
+    function formatNodeName(nodeName) {
+      if (!nodeName) return '未知';
+      // 精确匹配
+      if (NODE_NAME_MAP[nodeName]) return NODE_NAME_MAP[nodeName];
+      // 模糊匹配（处理组合节点名，如 orchestrator_coder）
+      for (const [key, value] of Object.entries(NODE_NAME_MAP)) {
+        if (nodeName.includes(key)) return value;
+      }
+      // 默认返回原名称
+      return nodeName;
     }
-    tree.innerHTML = files.map(f =>
-      `<div class="file-tree-item${f===selectedFile?' selected':''}" title="${f}" onclick="openFile('${escHtml(f).replace(/'/g,"\\'")}')">
-        ${fileIcon(f)} ${escHtml(f)}
-      </div>`
-    ).join('');
-  } catch {}
-}
 
-async function openFile(rel) {
-  selectedFile = rel;
-  document.querySelectorAll('.file-tree-item').forEach(el => el.classList.toggle('selected', el.title === rel));
-  const viewer = document.getElementById('fileViewer');
-  viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-placeholder">加载中…</div>`;
-  try {
-    const res = await fetch('/api/workspace/file?path=' + encodeURIComponent(rel));
-    const { content } = await res.json();
-    const ext = rel.split('.').pop() || '';
-    const langMap = { ts:'typescript', js:'javascript', json:'json', html:'html', py:'python', md:'markdown', css:'css', yml:'yaml', yaml:'yaml' };
-    const lang = langMap[ext] || 'plaintext';
-    const hi = hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
-    viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-viewer-body"><pre><code>${hi}</code></pre></div>`;
-  } catch {
-    viewer.innerHTML = `<div class="file-viewer-hdr">${escHtml(rel)}</div><div class="file-placeholder">读取失败</div>`;
-  }
-}
+    const AGENT_META_DEFAULTS = {
+      '观止': { icon: 'user-cog', role: 'Project Manager', color: 'cyan' },
+      '独孤': { icon: 'pen-tool', role: 'Chief Architect', color: 'yellow' },
+      '星河': { icon: 'terminal', role: 'Senior Coder', color: 'green' },
+      '清扬': { icon: 'search-check', role: 'QA Engineer', color: 'magenta' },
+      'System': { icon: 'settings', role: 'Kernel', color: 'slate' }
+    };
 
-function fileIcon(f) {
-  if (/\.(ts|tsx)$/.test(f)) return '📜';
-  if (/\.(js|jsx)$/.test(f)) return '📜';
-  if (/\.json$/.test(f)) return '📋';
-  if (/\.html?$/.test(f)) return '🌐';
-  if (/\.md$/.test(f)) return '📝';
-  if (/\.py$/.test(f)) return '🐍';
-  if (/\.(css|scss)$/.test(f)) return '🎨';
-  return '📄';
-}
+    let socket, session;
+    let selectedAgentFilter = null;
 
-// ── 页面刷新同步重建 ──────────────────────────────────────────────────────────
-function rebuildAll(s) {
-  const statusMap = { Running:'running', Finished:'finished', Error:'error', Idle:'' };
-  const labelMap  = { Running:'运行中', Finished:'已完成', Error:'出错', Idle:'空闲' };
-  setStatus(statusMap[s.status]||'', labelMap[s.status]||s.status);
-  document.getElementById('nodePill').textContent = s.currentNode || '-';
-  document.getElementById('goalInput').value = s.userGoal || '';
-  document.getElementById('runBtn').disabled = s.status === 'Running';
+    // 获取智能体的颜色类名映射
+    function getAgentColorClasses(agentName) {
+      const agent = session?.team?.find(a => a.name === agentName);
+      const color = agent?.color || AGENT_META_DEFAULTS[agentName]?.color || 'slate';
+      
+      // 这里的键必须是 chalk 颜色名，值必须是 Tailwind 的基础颜色名
+      const colorMap = {
+        'cyan': 'cyan',
+        'yellow': 'amber',
+        'green': 'emerald',
+        'magenta': 'rose',
+        'blue': 'indigo',
+        'gray': 'slate',
+        'slate': 'slate'
+      };
+      
+      const c = colorMap[color] || 'slate';
+      
+      // 注意：Tailwind 动态类名必须完整出现才能被扫描，或者使用 style 属性
+      const configs = {
+        cyan:    { text: 'text-cyan-400',    border: 'border-l-cyan-500',    icon: 'text-cyan-500',    bg: 'bg-cyan-500/10',    bgActive: 'bg-cyan-900/30',    bgPing: 'bg-cyan-500',    hex: '#22d3ee' },
+        amber:   { text: 'text-amber-400',   border: 'border-l-amber-500',   icon: 'text-amber-500',   bg: 'bg-amber-500/10',   bgActive: 'bg-amber-900/30',   bgPing: 'bg-amber-500',   hex: '#fbbf24' },
+        emerald: { text: 'text-emerald-400', border: 'border-l-emerald-500', icon: 'text-emerald-500', bg: 'bg-emerald-500/10', bgActive: 'bg-emerald-900/30', bgPing: 'bg-emerald-500', hex: '#34d399' },
+        rose:    { text: 'text-rose-400',    border: 'border-l-rose-500',    icon: 'text-rose-500',    bg: 'bg-rose-500/10',    bgActive: 'bg-rose-900/30',    bgPing: 'bg-rose-500',    hex: '#fb7185' },
+        indigo:  { text: 'text-indigo-400',  border: 'border-l-indigo-500',  icon: 'text-indigo-500',  bg: 'bg-indigo-500/10',  bgActive: 'bg-indigo-900/30',  bgPing: 'bg-indigo-500',  hex: '#818cf8' },
+        slate:   { text: 'text-slate-400',   border: 'border-l-slate-500',   icon: 'text-slate-500',   bg: 'bg-slate-500/10',   bgActive: 'bg-slate-900/30',   bgPing: 'bg-slate-500',   hex: '#94a3b8' }
+      };
+      
+      return configs[c] || configs.slate;
+    }
 
-  renderRetry(s.retryCount || 0);
-  renderTeam(s.team);
-  updatePhases(s.currentPhase, s.phaseData);
+    // 为日志内容中的智能体名字着色
+    function colorizeAgentNames(content) {
+      if (!content) return '';
+      let result = escapeHtml(content);
 
-  // 重放事件日志
-  const logContainer = document.getElementById('tab-logs');
-  logContainer.innerHTML = '';
-  (s.events || []).forEach(appendLog);
+      if (session?.team) {
+        session.team.forEach(agent => {
+          const classes = getAgentColorClasses(agent.name);
+          const regex = new RegExp(`(${agent.name})`, 'g');
+          result = result.replace(regex, `<span class="${classes.text} font-bold">$1</span>`);
+        });
+      }
 
-  renderTasks(s.subTasks);
-  renderQA(s.qaFailures);
-  renderMediation(s.mediationDirectives);
-  renderDeploy(s.deployment);
-  renderBrief(s.projectBrief);
+      return result;
+    }
 
-  if (s.workspacePath) { workspacePath = s.workspacePath; }
-  if (s.requiresApproval && s.status === 'Running') showApproval(true);
-}
+    function showToast(msg, type='info') {
+      const container = document.getElementById('toastContainer');
+      const toast = document.createElement('div');
+      let colors = 'bg-slate-800 border-slate-600 text-white';
+      if (type === 'err') colors = 'bg-rose-900/90 border-rose-500 text-rose-100';
+      if (type === 'ok') colors = 'bg-emerald-900/90 border-emerald-500 text-emerald-100';
+      
+      toast.className = `toast px-4 py-3 rounded-lg border shadow-lg text-sm flex items-center gap-2 ${colors} max-w-sm break-words`;
+      toast.innerHTML = `<span>${escapeHtml(msg)}</span>`;
+      container.appendChild(toast);
+      
+      setTimeout(() => {
+        toast.classList.add('hide');
+        setTimeout(() => toast.remove(), 300);
+      }, 4000);
+    }
 
-// ── 初始化 ────────────────────────────────────────────────────────────────────
-buildPhaseList();
-renderRetry(0);
+    function init() {
+      if (typeof io === 'undefined') { showToast("Socket.io 加载失败", 'err'); return; }
+      socket = io();
+      setupSocket();
+      lucide.createIcons();
+      switchTab('live');
+    }
 
-// 日志容器滚动监听：用户向上滚时停止自动追底，回到底部时恢复
-document.getElementById('tab-logs').addEventListener('scroll', function() {
-  const atBottom = this.scrollHeight - this.scrollTop - this.clientHeight < 80;
-  if (atBottom === autoScroll) return;
-  autoScroll = atBottom;
-  if (currentTab === 'logs') {
-    document.getElementById('scrollBtn').classList.toggle('hidden', autoScroll);
-  }
-});
-</script>
+    function setupSocket() {
+      socket.on('connect', () => showToast("已连接到 JimClaw 服务器", 'ok'));
+      socket.on('disconnect', () => showToast("已断开连接", 'err'));
+
+      socket.on('session-sync', s => {
+        session = s;
+        updateUI();
+        filterLogs();
+      });
+      socket.on('state-update', s => {
+        session = s;
+        updateUI();
+        // 确保日志流在状态更新后重新渲染（处理刷新页面后的情况）
+        if (session && session.events && document.getElementById('logStream').children.length === 0) {
+          filterLogs();
+        }
+      });
+
+      socket.on('agent-event', ev => {
+        if (!session) session = { events: [] };
+        if (!session.events) session.events = [];
+        session.events.push(ev);
+        if (!selectedAgentFilter || ev.sender === selectedAgentFilter) {
+          appendLog(ev);
+        }
+      });
+      
+      socket.on('task-finished', () => { 
+        showToast("任务执行完成", 'ok'); 
+        document.getElementById('runBtn').disabled = false;
+        document.getElementById('runBtn').innerText = '执行';
+        switchTab('dashboard');
+      });
+      socket.on('task-error', (err) => {
+        showToast("任务出错: " + (err.message || "未知错误"), 'err');
+        document.getElementById('runBtn').disabled = false;
+        document.getElementById('runBtn').innerText = '执行';
+      });
+
+      // Human-in-the-loop 事件处理
+      socket.on('human-feedback-received', (feedback) => {
+        showToast(`人工反馈已记录: ${feedback.content}`, 'ok');
+        // 刷新看板以显示更新的共识
+        updateUI();
+      });
+      socket.on('human-feedback-ack', (ack) => {
+        if (ack.success) {
+          showToast("反馈已发送", 'ok');
+          closeFeedbackBanner();
+        } else {
+          showToast("反馈发送失败", 'err');
+        }
+      });
+    }
+
+    // Human-in-the-loop 函数
+    function openFeedbackBanner() {
+      document.getElementById('feedbackBanner').classList.remove('hidden');
+      document.getElementById('feedbackInput').focus();
+    }
+
+    function closeFeedbackBanner() {
+      document.getElementById('feedbackBanner').classList.add('hidden');
+      document.getElementById('feedbackInput').value = '';
+    }
+
+    function sendFeedback(type) {
+      const content = document.getElementById('feedbackInput').value.trim();
+      if (!content) {
+        showToast("请输入反馈内容", 'err');
+        return;
+      }
+
+      socket.emit('human-feedback', {
+        type,
+        content,
+        relatedNode: session?.currentNode
+      });
+
+      showToast("正在发送反馈...", 'info');
+    }
+
+    function updateUI() {
+      if (!session) return;
+      
+      // Header status
+      const statusBadge = document.getElementById('statusBadge');
+      statusBadge.textContent = session.status || 'Idle';
+      if (session.status === 'Running') {
+        statusBadge.className = 'px-2 py-1 text-xs bg-indigo-500 text-white rounded-md ml-2 shadow-[0_0_8px_rgba(99,102,241,0.6)] animate-pulse border border-indigo-400';
+      } else if (session.status === 'Error') {
+        statusBadge.className = 'px-2 py-1 text-xs bg-rose-500 text-white rounded-md ml-2 border border-rose-400';
+      } else {
+        statusBadge.className = 'px-2 py-1 text-xs bg-slate-700 text-slate-300 rounded-md ml-2 border border-slate-600';
+      }
+      
+      document.getElementById('nodeBadge').textContent = `Node: ${session.currentNode || '-'}`;
+      document.getElementById('retryCount').textContent = `${session.retryCount || 0} / ${session.maxRetries || 5}`;
+
+      // Approval Modal
+      const modal = document.getElementById('approvalModal');
+      if (session.requiresApproval && session.status === 'Running') {
+        modal.classList.remove('hidden');
+      } else {
+        modal.classList.add('hidden');
+      }
+
+      renderTeam(session.team);
+      renderPipeline();
+      renderConsensus(session);
+      renderTasks(session.subTasks);
+      renderIssues(session.issueTracker);
+      renderQA(session.qaFailures);
+      renderFixPlan(session.fixPlan);
+      renderMediation(session.mediationDirectives);
+      renderDeploy(session.deployment);
+      
+      lucide.createIcons();
+    }
+
+    function renderTeam(team) {
+      const container = document.getElementById('teamList');
+      if (!team || !Array.isArray(team)) return;
+
+      const NODE_AGENT_MAP = {
+        'pm': '观止', 'orchestrator': '观止', 'post_mortem': '观止',
+        'architect': '独孤', 'architect_mediation': '独孤',
+        'coder': '星河', 'verifier': '星河', 'lint_fix': '星河', 'diagnose_code': '星河',
+        'fix_plan': '清扬',  // QA 主导协商，Coder 配合
+        'contract_sync': '清扬', 'infra_setup': '清扬', 'terminal': '清扬', 'qa': '清扬', 'deploy': '清扬',
+      };
+
+      const isCurrentNode = (nodeName, agentName) => {
+        if (!nodeName) return false;
+        const normalizedNode = nodeName.toLowerCase();
+        for (const [node, owner] of Object.entries(NODE_AGENT_MAP)) {
+          if (normalizedNode.includes(node) && owner === agentName) return true;
+        }
+        return false;
+      };
+
+      container.innerHTML = team.map(m => {
+        const meta = AGENT_META_DEFAULTS[m.name] || AGENT_META_DEFAULTS['System'];
+        const classes = getAgentColorClasses(m.name);
+        const isActive = isCurrentNode(session.currentNode, m.name);
+        const isFiltered = selectedAgentFilter === m.name;
+
+        let bgClass = 'bg-slate-800/30';
+        let inlineStyle = '';
+        if (isActive) {
+          bgClass = `${classes.bgActive}`;
+          inlineStyle = `style="box-shadow: 0 0 15px ${classes.hex}44"`; // 44 是透明度
+        }
+        if (isFiltered) {
+          bgClass = `${classes.bg} border-primary`;
+        }
+
+        // Models list
+        const modelsHtml = Object.entries(m.models || {}).map(([mode, model]) => `
+          <div class="flex items-center justify-between gap-1 md:gap-2 mt-1 px-1.5 md:px-2 py-0.5 bg-slate-900/50 rounded border border-slate-700/50">
+            <span class="text-[8px] md:text-[9px] uppercase font-bold text-slate-500">${mode}</span>
+            <span class="text-[9px] md:text-[10px] text-slate-300 font-mono truncate max-w-[60px] md:max-w-[100px]" title="${model}">${model.split('/').pop()}</span>
+          </div>
+        `).join('');
+
+        return `
+          <div onclick="toggleAgentFilter('${m.name}')" ${inlineStyle} class="p-2 md:p-3 rounded-lg border border-slate-700 border-l-4 ${classes.border} ${bgClass} transition-all shadow-sm cursor-pointer hover:bg-slate-800/50 relative overflow-hidden group">
+            <div class="flex items-center gap-2 md:gap-3 mb-1.5 md:mb-2 relative z-10">
+              <div class="shrink-0">
+                <i data-lucide="${meta.icon}" class="w-4 h-4 md:w-5 md:h-5 ${classes.icon} ${isActive ? 'animate-pulse' : ''}"></i>
+              </div>
+              <div class="flex-1 min-w-0">
+                <div class="text-xs md:text-sm font-bold ${classes.text} truncate">${escapeHtml(m.name)}</div>
+                <div class="text-[9px] md:text-[10px] text-slate-400 uppercase tracking-wider truncate">${escapeHtml(m.role || meta.role)}</div>
+              </div>
+              ${isActive ? `<div class="shrink-0 flex items-center gap-1">
+                <span class="animate-pulse w-2 h-2 rounded-full ${classes.bgPing}"></span>
+                <span class="text-[9px] md:text-[10px] font-bold ${classes.text}">工作中</span>
+              </div>` : ''}
+            </div>
+            <div class="space-y-1 mt-1 md:mt-2 relative z-10">
+              ${modelsHtml}
+            </div>
+          </div>
+        `;
+      }).join('');
+    }
+
+    function toggleAgentFilter(name) {
+      if (selectedAgentFilter === name) {
+        selectedAgentFilter = null;
+        showToast("已恢复全量日志", "info");
+      } else {
+        selectedAgentFilter = name;
+        showToast(`已开启 ${name} 日志过滤`, "info");
+      }
+      updateUI();
+      filterLogs();
+    }
+
+    function filterLogs() {
+      const stream = document.getElementById('logStream');
+      stream.innerHTML = '';
+      if (!session || !session.events) {
+        stream.innerHTML = '<div class="text-slate-500 italic flex items-center gap-2 justify-center h-full opacity-50"><i data-lucide="terminal" class="w-8 h-8"></i><span>等待系统启动...</span></div>';
+        lucide.createIcons({ portal: stream });
+        return;
+      }
+
+      session.events.forEach(ev => {
+        if (!selectedAgentFilter || ev.sender === selectedAgentFilter) {
+          appendLog(ev);
+        }
+      });
+    }
+
+    function appendLog(ev) {
+      const stream = document.getElementById('logStream');
+      const emptyState = stream.querySelector('.opacity-50');
+      if (emptyState) emptyState.remove();
+
+      const div = document.createElement('div');
+      const meta = AGENT_META_DEFAULTS[ev.sender] || AGENT_META_DEFAULTS['System'];
+      const classes = getAgentColorClasses(ev.sender);
+
+      let detailHtml = '';
+      if (ev.type === 'llm_call_start' && ev.metadata?.prompt) {
+        detailHtml = `
+          <details class="mt-2 group">
+            <summary class="text-[9px] md:text-[10px] font-bold text-slate-500 cursor-pointer hover:text-slate-300 uppercase tracking-widest list-none flex items-center gap-1">
+              <i data-lucide="chevron-right" class="w-3 h-3 group-open:rotate-90 transition-transform"></i> 查看 Prompt 详情
+            </summary>
+            <div class="mt-2 p-2 md:p-3 bg-slate-950 rounded-lg border border-slate-800 text-[10px] md:text-xs text-slate-400 font-mono whitespace-pre-wrap max-h-64 md:max-h-96 overflow-y-auto scrollbar">${escapeHtml(ev.metadata.prompt)}</div>
+            ${ev.metadata.system ? `<div class="mt-1 text-[8px] md:text-[9px] text-slate-600 uppercase font-bold px-1">System Prompt included</div>` : ''}
+          </details>
+        `;
+      } else if (ev.type === 'llm_call_end' && ev.metadata?.response) {
+        detailHtml = `
+          <details class="mt-2 group">
+            <summary class="text-[9px] md:text-[10px] font-bold text-emerald-600/70 cursor-pointer hover:text-emerald-500 uppercase tracking-widest list-none flex items-center gap-1">
+              <i data-lucide="chevron-right" class="w-3 h-3 group-open:rotate-90 transition-transform"></i> 查看 LLM 完整响应
+            </summary>
+            <div class="mt-2 p-2 md:p-3 bg-slate-950 rounded-lg border border-emerald-900/20 text-[10px] md:text-xs text-emerald-200/70 font-mono whitespace-pre-wrap max-h-64 md:max-h-96 overflow-y-auto scrollbar">${escapeHtml(ev.metadata.response)}</div>
+          </details>
+        `;
+      } else if (ev.type === 'tool_use') {
+        detailHtml = `
+          <div class="mt-2 flex items-center gap-1 md:gap-2 text-[9px] md:text-[10px] font-bold text-amber-500/70 uppercase">
+            <i data-lucide="wrench" class="w-3 h-3"></i> 执行动作: <span class="${classes.text}">${escapeHtml(ev.sender)}</span> 调用工具
+          </div>
+          <details class="mt-1 group">
+            <summary class="text-[8px] md:text-[9px] font-bold text-slate-600 cursor-pointer hover:text-slate-400 uppercase tracking-widest list-none flex items-center gap-1">
+              <i data-lucide="chevron-right" class="w-2 h-2 group-open:rotate-90 transition-transform"></i> 查看工具输出详情
+            </summary>
+            <div class="mt-2 p-2 md:p-3 bg-slate-950 rounded-lg border border-amber-900/20 text-[10px] md:text-xs text-amber-200/60 font-mono whitespace-pre-wrap max-h-48 md:max-h-64 overflow-y-auto scrollbar">${colorizeAgentNames(ev.content)}</div>
+          </details>
+        `;
+      }
+
+      div.className = 'flex gap-2 md:gap-4 mb-3 md:mb-5 text-xs md:text-sm animate-in slide-in-from-bottom-2 duration-300';
+      
+      // 构建气泡样式：全边框对应色 + 微弱背景 + 对应色文字
+      const bubbleBorderClass = classes.border.replace('border-l-', 'border-');
+      const bubbleBgClass = classes.bg;
+      
+      div.innerHTML = `
+        <div class="mt-1 shrink-0 p-1.5 md:p-2 bg-slate-800 rounded-lg border border-slate-700 h-fit">
+          <i data-lucide="${meta.icon}" class="w-4 h-4 md:w-5 md:h-5 ${classes.icon}"></i>
+        </div>
+        <div class="flex-1 min-w-0">
+          <div class="flex flex-wrap items-center gap-1 md:gap-2 mb-1.5">
+            <span class="font-bold ${classes.text} text-xs md:text-sm uppercase tracking-tight">${escapeHtml(ev.sender)}</span>
+            <span class="text-[10px] text-slate-500 font-mono">${ev.timestamp || new Date().toLocaleTimeString()}</span>
+            <span class="text-[8px] px-1.5 py-0.5 rounded ${bubbleBgClass} ${classes.text} border border-${classes.hex === '#94a3b8' ? 'slate' : ''}-500/20 font-bold uppercase tracking-widest">${ev.type.replace('_', ' ')}</span>
+          </div>
+          <!-- 消息内容气泡：文字颜色、边框、背景全部彩色化 -->
+          <div class="${classes.text} opacity-90 whitespace-pre-wrap ${bubbleBgClass} rounded-2xl rounded-tl-none p-3 md:p-4 border ${bubbleBorderClass} border-opacity-30 shadow-sm leading-relaxed text-[11px] md:text-sm font-medium">
+            ${colorizeAgentNames(ev.content)}
+          </div>
+          ${detailHtml}
+        </div>
+      `;
+      stream.appendChild(div);
+      stream.scrollTop = stream.scrollHeight;
+      lucide.createIcons({ portal: div });
+    }
+
+    function renderConsensus(session) {
+      const container = document.getElementById('briefContent');
+      const core = session.consensusCore;
+      const progress = session.consensusProgress;
+      const notes = session.meetingNotes || [];
+
+      if (!core && notes.length === 0 && !progress) {
+        container.innerHTML = '<span class="text-slate-500 italic flex h-full items-center justify-center">暂无记录</span>';
+        return;
+      }
+
+      let html = '';
+
+      // 第一层：项目核心
+      if (core) {
+        html += `<div class="mb-3">
+          <div class="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+            <i data-lucide="layers" class="w-3 h-3"></i> 项目核心
+          </div>
+          <div class="p-2 border-l-2 border-indigo-500 bg-indigo-500/10 rounded-r text-xs space-y-1">
+            <div><span class="text-slate-400">项目：</span><span class="text-slate-200 font-medium">${escapeHtml(core.projectTitle)}</span></div>`;
+        if (core.techStack) {
+          html += `<div><span class="text-slate-400">技术栈：</span><span class="text-slate-200">${escapeHtml(core.techStack)}</span>`;
+          if (core.port) html += `<span class="text-slate-400 ml-2">端口：</span><span class="text-emerald-400 font-mono">${core.port}</span>`;
+          html += `</div>`;
+        }
+        if (core.architectureSummary) {
+          html += `<div><span class="text-slate-400">架构：</span><span class="text-slate-200">${escapeHtml(core.architectureSummary)}</span></div>`;
+        }
+        if (core.requirements && core.requirements.length > 0) {
+          html += `<div class="mt-1"><span class="text-slate-400">需求：</span>
+            <ul class="mt-0.5 space-y-0.5 pl-3">
+              ${core.requirements.map((r, i) => `<li class="text-slate-300 list-disc list-inside">${i+1}. ${escapeHtml(r)}</li>`).join('')}
+            </ul></div>`;
+        }
+        if (core.criticalDecisions && core.criticalDecisions.length > 0) {
+          html += `<div class="mt-1"><span class="text-slate-400">关键决策：</span>
+            <ul class="mt-0.5 space-y-0.5 pl-3">
+              ${core.criticalDecisions.map(d => `<li class="text-amber-300 list-disc list-inside">${escapeHtml(d)}</li>`).join('')}
+            </ul></div>`;
+        }
+        html += `</div></div>`;
+      }
+
+      // 第二层：当前进度
+      if (progress) {
+        const total = (progress.completedFiles.length + progress.pendingFiles.length) || 1;
+        const pct = Math.round(progress.completedFiles.length / total * 100);
+        html += `<div class="mb-3">
+          <div class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+            <i data-lucide="activity" class="w-3 h-3"></i> 当前进度（第 ${progress.currentRound} 轮）
+          </div>
+          <div class="p-2 border-l-2 border-emerald-500 bg-emerald-500/10 rounded-r text-xs space-y-1">
+            <div class="flex items-center gap-2">
+              <span class="text-slate-400">完成 ${progress.completedFiles.length}/${total}</span>
+              <div class="flex-1 bg-slate-700 rounded-full h-1">
+                <div class="bg-emerald-500 h-1 rounded-full transition-all" style="width:${pct}%"></div>
+              </div>
+              <span class="text-emerald-400 font-mono">${pct}%</span>
+            </div>`;
+        if (progress.completedFiles.length > 0) {
+          html += `<div class="text-slate-400">已完成：<span class="text-emerald-300 font-mono">${progress.completedFiles.map(f => escapeHtml(f)).join(', ')}</span></div>`;
+        }
+        if (progress.pendingFiles.length > 0) {
+          html += `<div class="text-slate-400">待完成：<span class="text-slate-300 font-mono">${progress.pendingFiles.map(f => escapeHtml(f)).join(', ')}</span></div>`;
+        }
+        if (progress.openIssues && progress.openIssues.length > 0) {
+          html += `<div class="text-slate-400 mt-1">未解决问题：
+            <ul class="mt-0.5 space-y-0.5 pl-3">
+              ${progress.openIssues.map(i => `<li class="text-rose-300 list-disc list-inside">${escapeHtml(i)}</li>`).join('')}
+            </ul></div>`;
+        }
+        html += `</div></div>`;
+      }
+
+      // 第三层：会议纪要
+      if (notes.length > 0) {
+        html += `<div class="mb-2">
+          <div class="text-xs font-bold text-amber-400 uppercase tracking-wider mb-1 flex items-center gap-1">
+            <i data-lucide="scroll-text" class="w-3 h-3"></i> 沟通纪要
+          </div>
+          <div class="space-y-1">`;
+        notes.forEach(note => {
+          html += `<div class="p-2 border-l-2 border-amber-500/40 bg-amber-500/5 rounded-r text-xs">
+            <span class="text-amber-400 font-mono mr-1">[${escapeHtml(note.id)}]</span>
+            <span class="text-slate-300">${escapeHtml(note.summary)}</span>
+          </div>`;
+        });
+        html += `</div></div>`;
+      }
+
+      container.innerHTML = html || '<span class="text-slate-500 italic flex h-full items-center justify-center">暂无记录</span>';
+      lucide.createIcons({ portal: container });
+    }
+
+    function renderTasks(tasks) {
+      const container = document.getElementById('tasksContent');
+      if (!tasks || !Array.isArray(tasks) || tasks.length === 0) {
+        container.innerHTML = '<span class="text-slate-500 italic flex h-full items-center justify-center">等待任务拆解...</span>';
+        return;
+      }
+      const done = tasks.filter(t => t.status === 'completed').length;
+      container.innerHTML = `
+        <div class="text-xs text-slate-500 mb-2 flex items-center gap-2">
+          <span class="text-emerald-400 font-bold">${done}</span> / ${tasks.length} 完成
+          <div class="flex-1 bg-slate-700 rounded-full h-1">
+            <div class="bg-emerald-500 h-1 rounded-full transition-all" style="width:${Math.round(done/tasks.length*100)}%"></div>
+          </div>
+        </div>
+        ${tasks.map(t => {
+          const isDone = t.status === 'completed';
+          const isFailed = t.status === 'failed';
+          const bgClass = isDone ? 'bg-emerald-900/10 border-emerald-900/30' : isFailed ? 'bg-rose-900/10 border-rose-900/30' : 'bg-slate-800/50 border-slate-700/50';
+          const iconName = isDone ? 'check-circle' : isFailed ? 'x-circle' : 'circle';
+          const iconColor = isDone ? 'text-emerald-400' : isFailed ? 'text-rose-400' : 'text-slate-500';
+          const statusColor = isDone ? 'text-emerald-400 bg-emerald-900/30 border-emerald-800' : isFailed ? 'text-rose-400 bg-rose-900/30 border-rose-800' : 'text-slate-400 bg-slate-900/50 border-slate-700/50';
+          return `
+            <div class="flex items-start gap-3 p-3 border rounded shadow-sm ${bgClass}">
+              <i data-lucide="${iconName}" class="w-4 h-4 ${iconColor} shrink-0 mt-0.5"></i>
+              <div class="flex-1 min-w-0">
+                <div class="text-xs font-mono text-slate-300 truncate font-bold" title="${escapeHtml(t.fileTarget)}">${escapeHtml(t.fileTarget)}</div>
+                ${t.description ? `<div class="text-[11px] text-slate-500 mt-0.5 line-clamp-2">${escapeHtml(t.description)}</div>` : ''}
+                ${isFailed && t.lastError ? `<div class="text-[10px] text-rose-400 mt-1 font-mono line-clamp-2">${escapeHtml(t.lastError.slice(0, 120))}</div>` : ''}
+              </div>
+              <span class="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded border shrink-0 ${statusColor}">${escapeHtml(t.status)}</span>
+            </div>
+          `;
+        }).join('')}
+      `;
+    }
+
+    function renderIssues(issues) {
+      const el = document.getElementById('issueBlock');
+      const content = document.getElementById('issueContent');
+      if (!issues || !Array.isArray(issues) || issues.length === 0) {
+        el.classList.add('hidden');
+        return;
+      }
+      el.classList.remove('hidden');
+      
+      const severityMap = {
+        critical: { color: 'text-rose-500', bg: 'bg-rose-500/10', border: 'border-rose-500/30', icon: 'zap' },
+        major: { color: 'text-amber-500', bg: 'bg-amber-500/10', border: 'border-amber-500/30', icon: 'alert-circle' },
+        minor: { color: 'text-blue-500', bg: 'bg-blue-500/10', border: 'border-blue-500/30', icon: 'info' }
+      };
+
+      content.innerHTML = issues.map(i => {
+        const isResolved = i.status === 'resolved';
+        const s = severityMap[i.severity] || severityMap.minor;
+        const opacity = isResolved ? 'opacity-50 grayscale' : '';
+        
+        return `
+          <div class="p-4 border rounded-xl shadow-sm transition-all ${s.bg} ${s.border} ${opacity}">
+            <div class="flex items-center justify-between mb-3">
+              <div class="flex items-center gap-2">
+                <i data-lucide="${isResolved ? 'check-square' : s.icon}" class="w-4 h-4 ${isResolved ? 'text-emerald-400' : s.color}"></i>
+                <span class="text-xs font-bold font-mono ${isResolved ? 'text-emerald-400' : s.color}">${escapeHtml(i.id)}</span>
+                <span class="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-slate-900/50 text-slate-400 border border-slate-700">${escapeHtml(i.severity)}</span>
+              </div>
+              <span class="text-[10px] font-bold px-2 py-0.5 rounded ${isResolved ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'}">
+                ${isResolved ? '已解决' : '待处理'}
+              </span>
+            </div>
+            <h4 class="text-sm font-bold text-slate-200 mb-2 leading-tight">${escapeHtml(i.title)}</h4>
+            <p class="text-[11px] text-slate-400 mb-3 leading-relaxed line-clamp-3">${escapeHtml(i.description)}</p>
+            <div class="flex flex-wrap gap-1">
+              ${(i.relatedFiles || []).map(f => `<span class="text-[9px] font-mono bg-slate-950/50 text-slate-500 px-1.5 py-0.5 rounded border border-slate-800">${escapeHtml(f)}</span>`).join('')}
+            </div>
+          </div>
+        `;
+      }).join('');
+      lucide.createIcons({ portal: content });
+    }
+
+    const PIPELINE_STAGES = [
+      { key: 'requirement', label: '需求分析', nodes: ['pm'] },
+      { key: 'design',      label: '架构设计', nodes: ['architect'] },
+      { key: 'sync',        label: '契约同步', nodes: ['contract_sync'] },
+      { key: 'planning',    label: '任务拆解', nodes: ['orchestrator'] },
+      { key: 'coding',      label: '编码开发', nodes: ['coder', 'verifier', 'architect_mediation'] },
+      { key: 'fix_planning',label: '修复协商', nodes: ['fix_plan'] },
+      { key: 'verification',label: '质量测试', nodes: ['infra_setup', 'terminal', 'qa'] },
+      { key: 'deployment',  label: '服务部署', nodes: ['deploy'] },
+      { key: 'review',      label: '复盘归档', nodes: ['post_mortem', 'persistence'] },
+    ];
+
+    function renderPipeline() {
+      const container = document.getElementById('pipelineStages');
+      if (!container || !session) return;
+
+      const currentPhase = session.currentPhase || 'idle';
+      const phaseData = session.phaseData || {};
+      const isRunning = session.status === 'Running';
+
+      // 找到当前活跃阶段的索引
+      const activeStageIdx = PIPELINE_STAGES.findIndex(s => s.key === currentPhase);
+
+      container.innerHTML = PIPELINE_STAGES.map((stage, i) => {
+        const data = phaseData[stage.key] || {};
+        
+        // 逻辑判定：
+        // 1. 是否正在进行：Key 匹配且正在运行
+        const isActive = stage.key === currentPhase && isRunning;
+        // 2. 是否已完成：索引小于当前活跃阶段，或者后端明确标记完成
+        const isDone = (activeStageIdx > i) || (data.status === 'completed');
+        // 3. 是否等待中
+        const isPending = !isActive && !isDone;
+
+        const duration = data.totalDuration
+          ? `${(data.totalDuration / 1000).toFixed(0)}s`
+          : isActive ? '进行中' : '';
+
+        // 颜色映射
+        let dotColor = 'bg-slate-600';
+        let labelColor = 'text-slate-500';
+        let lineColor = 'bg-slate-700';
+
+        if (isActive) {
+          dotColor = 'bg-indigo-500 shadow-[0_0_10px_#6366f1]';
+          labelColor = 'text-indigo-300 font-bold';
+        } else if (isDone) {
+          dotColor = 'bg-emerald-500';
+          labelColor = 'text-emerald-400';
+          lineColor = 'bg-emerald-600';
+        }
+
+        return `
+          <div class="flex items-center ${i < PIPELINE_STAGES.length - 1 ? 'flex-1' : ''}">
+            <div class="flex flex-col items-center gap-1 shrink-0 relative">
+              <div class="w-2.5 h-3.5 md:w-3 md:h-3 rounded-full ${dotColor} ${isActive ? 'animate-pulse' : ''} transition-all duration-500"></div>
+              <span class="text-[8px] md:text-[10px] ${labelColor} whitespace-nowrap text-center leading-tight absolute top-5 left-1/2 -translate-x-1/2">${stage.label}</span>
+            </div>
+            ${i < PIPELINE_STAGES.length - 1 ? `<div class="flex-1 h-[2px] mx-2 ${lineColor} transition-colors duration-500"></div>` : ''}
+          </div>
+        `;
+      }).join('');
+
+      // 给容器增加一点底部间距，因为文字是绝对定位的
+      container.style.paddingBottom = '20px';
+      lucide.createIcons({ portal: container });
+    }
+
+    function renderQA(qa) {
+      const el = document.getElementById('qaBlock');
+      const content = document.getElementById('qaContent');
+      
+      if (!qa || typeof qa !== 'object') {
+        el.classList.add('hidden');
+        return;
+      }
+      
+      const errors = Array.isArray(qa.testErrors) ? qa.testErrors : (qa.testErrors ? [qa.testErrors] : []);
+      if (errors.length === 0) {
+        el.classList.add('hidden');
+        return;
+      }
+
+      el.classList.remove('hidden');
+      content.innerHTML = errors.map(e => `<pre class="p-4 bg-rose-950/30 border border-rose-900/50 rounded-lg text-xs text-rose-300 overflow-x-auto scrollbar font-mono leading-relaxed">${escapeHtml(typeof e === 'string' ? e : JSON.stringify(e, null, 2))}</pre>`).join('');
+    }
+
+    function renderMediation(dirs) {
+      const el = document.getElementById('medBlock');
+      const content = document.getElementById('medContent');
+      if (!dirs || !Array.isArray(dirs) || dirs.length === 0) {
+        el.classList.add('hidden');
+        return;
+      }
+      el.classList.remove('hidden');
+      content.innerHTML = dirs.map(d => `
+        <div class="p-4 bg-amber-950/30 border border-amber-900/50 rounded-lg text-sm shadow-sm">
+          <div class="font-bold text-amber-400 mb-2 font-mono flex items-center gap-2"><i data-lucide="file-warning" class="w-4 h-4"></i> ${escapeHtml(d.file || 'Unknown File')}</div>
+          <div class="text-amber-200/90 leading-relaxed bg-amber-950/50 p-3 rounded">${escapeHtml(d.detail || '')}</div>
+        </div>
+      `).join('');
+    }
+
+    function renderFixPlan(plan) {
+      const el = document.getElementById('fixPlanBlock');
+      const content = document.getElementById('fixPlanContent');
+      if (!plan || !Array.isArray(plan) || plan.length === 0) {
+        el.classList.add('hidden');
+        return;
+      }
+      el.classList.remove('hidden');
+      const statusIcon = { approved: '✅', corrected: '🔧', pending: '⏳' };
+      const statusLabel = { approved: 'QA 批准', corrected: 'QA 已纠正', pending: '待 QA 审核' };
+      const statusColor = { approved: 'text-emerald-400', corrected: 'text-amber-400', pending: 'text-slate-400' };
+      content.innerHTML = plan.map(p => `
+        <div class="p-4 bg-sky-950/30 border border-sky-900/50 rounded-lg text-sm shadow-sm">
+          <div class="font-bold text-sky-400 mb-2 font-mono flex items-center gap-2">
+            <i data-lucide="file-code" class="w-4 h-4"></i>
+            ${escapeHtml(p.fileTarget || 'Unknown File')}
+            <span class="ml-auto text-xs font-normal ${statusColor[p.qaApproval] || 'text-slate-400'}">
+              ${statusIcon[p.qaApproval] || '⏳'} ${statusLabel[p.qaApproval] || p.qaApproval}
+            </span>
+          </div>
+          <div class="mb-2">
+            <span class="text-xs text-slate-400 uppercase tracking-wider">根因分析</span>
+            <div class="mt-1 text-sky-100/80 bg-sky-950/50 p-2 rounded leading-relaxed">${escapeHtml(p.diagnosis || '')}</div>
+          </div>
+          <div class="${p.qaFeedback ? 'mb-2' : ''}">
+            <span class="text-xs text-slate-400 uppercase tracking-wider">修复方案</span>
+            <div class="mt-1 text-sky-100/80 bg-sky-950/50 p-2 rounded leading-relaxed">${escapeHtml(p.proposedChange || '')}</div>
+          </div>
+          ${p.qaFeedback ? `
+          <div>
+            <span class="text-xs text-amber-400 uppercase tracking-wider">QA 纠正意见</span>
+            <div class="mt-1 text-amber-100/80 bg-amber-950/50 p-2 rounded leading-relaxed">${escapeHtml(p.qaFeedback)}</div>
+          </div>` : ''}
+        </div>
+      `).join('');
+      lucide.createIcons();
+    }
+
+    function renderDeploy(dep) {
+      const el = document.getElementById('deployBlock');
+      if (!dep || (dep.status !== 'success' && dep.status !== 'deployed')) {
+        el.classList.add('hidden');
+        return;
+      }
+      el.classList.remove('hidden');
+      document.getElementById('deployInfo').textContent = dep.url || 'None';
+      const btn = document.getElementById('deployUrl');
+      if (dep.url) {
+        btn.href = dep.url;
+        btn.style.display = 'inline-block';
+      } else {
+        btn.style.display = 'none';
+      }
+    }
+
+    function switchTab(tabId) {
+      ['live', 'dashboard', 'workspace'].forEach(t => {
+        const view = document.getElementById('view-' + t);
+        const btn = document.getElementById('tab-' + t);
+        if (t === tabId) {
+          view.classList.remove('hidden');
+          btn.classList.add('border-primary', 'text-white');
+          btn.classList.remove('border-transparent', 'text-slate-400');
+        } else {
+          view.classList.add('hidden');
+          btn.classList.remove('border-primary', 'text-white');
+          btn.classList.add('border-transparent', 'text-slate-400');
+        }
+      });
+      if (tabId === 'workspace') refreshFileTree();
+    }
+
+    async function refreshFileTree() {
+      const tree = document.getElementById('fileTree');
+      try {
+        const res = await fetch('/api/workspace/files');
+        const { files } = await res.json();
+        if (!files || files.length === 0) {
+          tree.innerHTML = '<div class="text-slate-500 text-sm p-3 flex justify-center italic">工作区为空</div>';
+          return;
+        }
+        
+        // Ensure consistent sorting
+        files.sort();
+        
+        tree.innerHTML = files.map(f => `
+          <div onclick="openFile('${f}')" class="p-2 hover:bg-slate-800 rounded cursor-pointer flex items-center gap-3 text-slate-300 hover:text-white transition-colors group mb-1">
+            <i data-lucide="file-code" class="w-4 h-4 text-slate-500 group-hover:text-primary shrink-0"></i>
+            <span class="text-xs font-mono truncate" title="${escapeHtml(f)}">${escapeHtml(f)}</span>
+          </div>
+        `).join('');
+        lucide.createIcons({ portal: tree });
+      } catch (e) { 
+        tree.innerHTML = '<div class="text-rose-400 text-sm p-3 text-center">获取文件失败</div>';
+      }
+    }
+
+    async function openFile(path) {
+      document.getElementById('fileHeader').textContent = path;
+      const codeBlock = document.getElementById('codeBlock');
+      const placeholder = document.getElementById('filePlaceholder');
+      if (placeholder) placeholder.style.display = 'none';
+      
+      codeBlock.innerHTML = '<span class="text-slate-500 animate-pulse block text-center mt-10">加载中...</span>';
+      
+      try {
+        const res = await fetch('/api/workspace/file?path=' + encodeURIComponent(path));
+        const data = await res.json();
+        
+        if (data.error) {
+          codeBlock.innerHTML = `<span class="text-rose-400 block p-4">错误: ${escapeHtml(data.error)}</span>`;
+          return;
+        }
+
+        const ext = path.split('.').pop()?.toLowerCase();
+        const langMap = { ts: 'typescript', js: 'javascript', py: 'python', json: 'json', md: 'markdown', html: 'html', css: 'css', sh: 'bash', yml: 'yaml', yaml: 'yaml' };
+        const lang = langMap[ext] || 'plaintext';
+        
+        if (window.hljs) {
+          codeBlock.className = `text-sm font-mono leading-relaxed hljs language-${lang}`;
+          codeBlock.innerHTML = hljs.highlight(data.content || '', { language: lang, ignoreIllegals: true }).value;
+        } else {
+          codeBlock.textContent = data.content;
+          codeBlock.className = 'text-sm font-mono leading-relaxed text-slate-300';
+        }
+      } catch (e) {
+        codeBlock.innerHTML = '<span class="text-rose-400 block p-4">读取文件异常</span>';
+      }
+    }
+
+    function startTask() {
+      const goal = document.getElementById('goalInput').value.trim();
+      if (!goal) {
+        showToast("请输入协作目标", "err");
+        return;
+      }
+      document.getElementById('runBtn').disabled = true;
+      document.getElementById('runBtn').innerText = '启动中...';
+      document.getElementById('logStream').innerHTML = '';
+      switchTab('live');
+      
+      if (session) session.events = [];
+      socket.emit('run-task', { userGoal: goal });
+      showToast("任务已提交至智能矩阵", "info");
+    }
+
+    function approve() { 
+      socket.emit('approve-task', { approved: true }); 
+      document.getElementById('approvalModal').classList.add('hidden'); 
+      showToast("已批准架构方案，继续执行", "ok"); 
+      switchTab('live');
+    }
+
+    function escapeHtml(s) { 
+      return String(s || '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); 
+    }
+
+    window.onload = init;
+  </script>
 </body>
 </html>

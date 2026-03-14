@@ -1,5 +1,5 @@
 import { Team } from "./agents/team";
-import { createJimClowGraph } from "./core/graph";
+import { createJimClawGraph } from "./core/graph";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -8,7 +8,7 @@ async function cleanWorkspace() {
   const workspaceDir = path.join(process.cwd(), "workspace");
   try {
     const entries = await fs.readdir(workspaceDir);
-    const runDirs = entries.filter(d => d.startsWith("run_")).sort();
+    const runDirs = entries.filter((d) => d.startsWith("run_")).sort();
     const toDelete = runDirs.slice(0, Math.max(0, runDirs.length - 10));
     for (const dir of toDelete) {
       await fs.rm(path.join(workspaceDir, dir), { recursive: true, force: true });
@@ -34,7 +34,7 @@ async function main() {
   console.log(`🚀 Starting JimClaw: Multi-Agent Collaboration Session for goal: "${userGoal}"`);
 
   // 1. 初始化协作图
-  const app = await createJimClowGraph(Team);
+  const app = await createJimClawGraph(Team);
 
   // 2. 运行图
   const finalState = await app.invoke(
@@ -51,7 +51,7 @@ async function main() {
       qaFailures: null,
       packageJsonHash: "",
     },
-    { recursionLimit: 100 }
+    { recursionLimit: 500 }
   );
 
   console.log(`\n--- Session Completed ---`);

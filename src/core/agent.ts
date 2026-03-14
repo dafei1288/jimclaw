@@ -4,6 +4,9 @@ import { Skill } from "./skill";
 import { BaseChatModel } from "@langchain/core/language_models/chat_models";
 import { ModelManager } from "../utils/models";
 import { SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage } from "@langchain/core/messages";
+import * as fs from "fs/promises";
+import * as path from "path";
+import { AuditLogger } from "../utils/audit";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -22,6 +25,7 @@ export interface AgentPersona {
   role: string;
   specialty: string;
   personality: string;
+  color?: string; // 终端显示的颜色（支持 chalk 颜色名称）
 }
 
 /**
@@ -67,6 +71,10 @@ export class BaseAgent {
       ? `\n--- 当前工作空间 ---\n路径：${workspaceDir}\n重要：所有 shell 命令对项目文件的操作（find、cat、ls 等）必须限定在此目录内，禁止在此路径之外搜索项目源代码。\n-------------------------------------------`
       : "";
     return `
+--- 最高优先级语言指令 ---
+所有回复、思考过程、日志消息、团队沟通必须使用中文（简体）。代码标识符、变量名、函数名、技术术语保持英文，遵循工程惯例。此指令优先于任何其他设定。
+--------------------------
+
 You are ${this.persona.name}, a ${this.persona.role} in a world-class AI software team.
 Your specialty is: ${this.persona.specialty}.
 Your personality: ${this.persona.personality}.
@@ -109,6 +117,9 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
       ...messages.map(m => m.role === 'user' ? new HumanMessage(m.content) : m)
     ];
 
+    // 审计记录：输入 Prompt
+    await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Input Prompt]\n\n**System Prompt:**\n${systemPrompt}\n\n**User Messages:**\n${messages[messages.length - 1]?.content || "(Initial)"}`);
+
     if (eventCallback) {
       eventCallback({
         type: "llm_call_start",
@@ -148,14 +159,22 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
           console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
           if (error.response?.data) {
             console.error("Raw API Response Data:", JSON.stringify(error.response.data, null, 2));
+            await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Critical Error]\n\nRaw API Response Data:\n\`\`\`json\n${JSON.stringify(error.response.data, null, 2)}\n\`\`\``);
           } else {
             console.error("Error Detail:", error);
+            await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Critical Error]\n\nError Detail:\n${error.message || error}`);
           }
           throw error;
         }
       }
 
       const toolCalls = response.tool_calls ?? [];
+      
+      // 审计记录：模型输出内容
+      if (response.content) {
+        await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Response Content]\n\n${response.content}`);
+      }
+
       if (toolCalls.length === 0) break;
 
       currentMessages.push(response as AIMessage);
@@ -163,9 +182,36 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
       for (const toolCall of toolCalls) {
         const tool = this.tools.find(t => t.name === toolCall.name);
         let result: string;
+        
+        // 解析 args：LangChain 传过来的 args 可能是被冻结的对象，也可能是一个 JSON 字符串
+        let toolArgs: any = {};
+        if (typeof toolCall.args === "string") {
+          try {
+            toolArgs = JSON.parse(toolCall.args);
+          } catch (e) {
+            toolArgs = toolCall.args;
+          }
+        } else {
+          toolArgs = JSON.parse(JSON.stringify(toolCall.args || {}));
+        }
+        
+        // 关键逻辑：自动补全文件路径，防止 Agent 在根目录乱搞
+        if (options?.workspaceDir && typeof toolArgs === "object") {
+          if (typeof toolArgs.file_path === "string" && !path.isAbsolute(toolArgs.file_path)) {
+            toolArgs.file_path = path.join(options.workspaceDir, toolArgs.file_path);
+          }
+          if (typeof toolArgs.path === "string" && !path.isAbsolute(toolArgs.path)) {
+            toolArgs.path = path.join(options.workspaceDir, toolArgs.path);
+          }
+        }
+
+        // 审计记录：工具调用请求
+        await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Tool Call: ${toolCall.name}]\n\n**Args:**\n\`\`\`json\n${JSON.stringify(toolArgs, null, 2)}\n\`\`\``);
+
         if (tool) {
           try {
-            result = await tool.invoke(toolCall.args);
+            // 将修改后的参数传给工具（LangChain 的 invoke 支持对象格式输入）
+            result = await tool.invoke(toolArgs);
           } catch (e: any) {
             result = `Error: ${e.message}`;
           }
@@ -173,13 +219,17 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
           result = `Unknown tool: ${toolCall.name}`;
         }
 
-        console.log(`[Agent:${this.persona.name}] 工具调用: ${toolCall.name}(${JSON.stringify(toolCall.args)}) → ${String(result).slice(0, 300)}`);
+        console.log(`[Agent:${this.persona.name}] 工具调用: ${toolCall.name}(${JSON.stringify(toolArgs)}) → ${String(result).slice(0, 300)}`);
+
+        // 审计记录：工具调用结果
+        await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Tool Result: ${toolCall.name}]\n\n**Output:**\n${String(result)}`);
 
         if (eventCallback) {
           eventCallback({
             type: "tool_use",
             sender: this.persona.name,
-            content: String(result),  // 完整结果，dashboard 展开可见全文
+            content: String(result),
+            tool: toolCall.name
           });
         }
 

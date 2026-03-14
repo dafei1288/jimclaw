@@ -16,7 +16,10 @@ export const FileReadSkill = new Skill({
       const content = await fs.readFile(path, "utf-8");
       return content;
     } catch (error: any) {
-      throw new Error(`Could not read file at ${path}: ${error.message}`);
+      if (error.code === 'ENOENT') {
+        return `[系统提示]: 文件 "${path}" 尚未创建或不存在。如果该文件是你在本轮任务中需要生成的依赖文件，请根据 [接口契约 (ApiContract)] 和 [技术规范 (TechSpec)] 直接进行编码，不要尝试读取它。`;
+      }
+      return `[错误]: 无法读取文件 ${path}: ${error.message}`;
     }
   },
 });

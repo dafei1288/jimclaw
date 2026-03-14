@@ -1,10 +1,10 @@
 import { Team } from "./agents/team";
-import { createJimClowGraph } from "./core/graph";
+import { createJimClawGraph } from "./core/graph";
 
 async function simulate() {
   console.log(`🚀 [JimClaw] Starting Simulation Flow...\n`);
 
-  const app = await createJimClowGraph(Team);
+  const app = await createJimClawGraph(Team);
   // 模拟流程中的各节点
   let state: any = {
     userGoal: "a simple Counter app with increment and decrement",
@@ -25,7 +25,7 @@ async function simulate() {
   // 为了让此脚本能编译通过并体现流程，我们将其修改为调用 app.invoke 的完整流程测试。
   
   console.log("--- Starting Agentic Workflow (Invoke) ---");
-  const finalState = await app.invoke(state, { recursionLimit: 100 });
+  const finalState = await app.invoke(state, { recursionLimit: 500 });
 
   console.log(`\n--- Session Completed ---`);
   console.log(`Final Status: ${finalState.isDone ? "SUCCESS" : "FAILED"}`);

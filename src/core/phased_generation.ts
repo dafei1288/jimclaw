@@ -519,7 +519,7 @@ export function validateImplementationCode(code: string, language: string): {
 export function extractCodeBlock(response: string, language?: string): string {
   // 尝试匹配 markdown 代码块
   const codeBlockRegex = /```(?:\w*)\n([\s\S]*?)```/g;
-  const matches = [...response.matchAll(codeBlockRegex)];
+  const matches = Array.from(response.matchAll(codeBlockRegex));
 
   if (matches.length > 0) {
     // 返回最长的代码块
