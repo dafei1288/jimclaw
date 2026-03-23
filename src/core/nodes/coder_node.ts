@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as ts from "typescript";
 import { JimClawState, FileChangeEntry, ConsensusProgress } from "../graph_types";
 import { BaseAgent } from "../agent";
 import {
@@ -8,6 +9,65 @@ import {
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, extractCodeFromResponse } from "../../utils/common";
+
+function validateGeneratedFileContent(fileTarget: string, content: string): string | null {
+  const trimmed = content.trim();
+  const ext = path.extname(fileTarget).toLowerCase();
+
+  if (!trimmed) {
+    return "生成内容为空，不能作为有效文件提交";
+  }
+
+  if (ext === ".json") {
+    try {
+      JSON.parse(trimmed);
+      return null;
+    } catch (error: any) {
+      return `JSON 格式校验失败: ${error.message || error}`;
+    }
+  }
+
+  if (ext === ".ts" || ext === ".tsx" || ext === ".js" || ext === ".jsx") {
+    const diagnostics = ts.transpileModule(content, {
+      fileName: fileTarget,
+      reportDiagnostics: true,
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.CommonJS,
+      },
+    }).diagnostics || [];
+    if (diagnostics.length > 0) {
+      return diagnostics
+        .map((diag) => `语法错误: ${ts.flattenDiagnosticMessageText(diag.messageText, "\n")}`)
+        .join("; ");
+    }
+
+    const looksLikeObjectFragment =
+      trimmed.startsWith("{") &&
+      trimmed.endsWith("}") &&
+      !/(export|import|const|let|var|function|class|interface|type|enum|=>|module\.exports|return|\=)/.test(trimmed);
+    if (looksLikeObjectFragment) {
+      return "检测到孤立对象片段，缺少完整模块或语句结构";
+    }
+  }
+
+  return null;
+}
+
+function areTaskDependenciesSatisfied(
+  task: { dependencies?: string[] },
+  subTasks: Array<{ id: string; fileTarget: string; status: string }>,
+  filesContent: Record<string, string>,
+): boolean {
+  const dependencies = task.dependencies || [];
+  if (dependencies.length === 0) return true;
+
+  return dependencies.every((dependency) => {
+    if (filesContent[dependency] !== undefined) return true;
+    const dependencyTask = subTasks.find((item) => item.fileTarget === dependency || item.id === dependency);
+    return dependencyTask?.status === "completed";
+  });
+}
 
 /**
  * Coder 节点：负责根据子任务编写代码
@@ -44,6 +104,10 @@ export async function coderNode(
   for (const task of subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
+      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) {
+        emit("thinking", "System", `[Coder] 暂缓 ${task.fileTarget}，其依赖尚未完成: ${(task.dependencies || []).join(", ")}`, { task });
+        continue;
+      }
 
       emit("thinking", agents.coder.getPersona().name, `正在实现: ${task.fileTarget}`, { task });
 
@@ -192,6 +256,13 @@ CMD ["node", "dist/index.js"]`;
            formatError = `提取的内容包含 Markdown 格式的汇报或总结性文字，这被判定为非纯净代码。请重新输出，严禁在代码块中包含任何自然语言说明。`;
         }
 
+        if (!formatError) {
+          const validationError = validateGeneratedFileContent(task.fileTarget, finalCode);
+          if (validationError) {
+            formatError = validationError;
+          }
+        }
+
         if (!formatError && !toolError) isSuccess = true;
       }
 
@@ -208,12 +279,42 @@ CMD ["node", "dist/index.js"]`;
       }
 
       if (isSuccess && !toolError && !formatError) {
-        filesContent[task.fileTarget] = finalCode;
         const filePath = path.join(WORKSPACE, task.fileTarget);
+        const previousCode = filesContent[task.fileTarget];
+        const previousStatus = task.status;
+        const previousError = task.lastError;
+        const codeLogStartIndex = codeLogEntries.length;
+        try {
+          filesContent[task.fileTarget] = finalCode;
         await fs.mkdir(path.dirname(filePath), { recursive: true });
         await fs.writeFile(filePath, finalCode);
         task.status = "completed";
+        delete task.lastError;
         codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "written" });
+        const incrementalResult = {
+          code: JSON.stringify(filesContent, null, 2),
+          subTasks: [...subTasks],
+          codeLog: [...(state.codeLog || []), ...codeLogEntries]
+        };
+        await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
+        } catch (e: any) {
+          if (previousCode === undefined) {
+            delete filesContent[task.fileTarget];
+            await fs.rm(filePath, { force: true }).catch(() => undefined);
+          } else {
+            filesContent[task.fileTarget] = previousCode;
+            await fs.mkdir(path.dirname(filePath), { recursive: true });
+            await fs.writeFile(filePath, previousCode);
+          }
+          task.status = "failed";
+          task.lastError = `状态保存失败: ${e.message || e}`;
+          if (previousError) {
+            task.lastError = `${previousError}; ${task.lastError}`;
+          }
+          codeLogEntries.splice(codeLogStartIndex);
+          codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "error", error: task.lastError });
+          console.error(`${logPrefix("System")} [Coder] 任务失败 (${task.fileTarget}): ${task.lastError}`);
+        }
       } else {
         task.status = "failed";
         task.lastError = toolError || formatError || extractResult.error || "代码提取失败或工具执行异常";
@@ -222,12 +323,6 @@ CMD ["node", "dist/index.js"]`;
       }
 
       // 3. 写一个存一个：每完成一个文件立即持久化状态，防止截断导致全盘丢失
-      const incrementalResult = {
-        code: JSON.stringify(filesContent, null, 2),
-        subTasks: [...subTasks],
-        codeLog: [...(state.codeLog || []), ...codeLogEntries]
-      };
-      await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
   }
 
   const completedList = subTasks.filter(t => t.status === "completed").map(t => t.fileTarget);
@@ -255,6 +350,10 @@ CMD ["node", "dist/index.js"]`;
     consensusProgress,
     meetingNotes: [meetingNote],
   };
-  await saveBoulder({ ...state, ...result }, "coder_final");
+  try {
+    await saveBoulder({ ...state, ...result }, "coder_final");
+  } catch (e) {
+    console.error(`${logPrefix("System")} [Coder] 最终状态保存失败: ${e}`);
+  }
   return result;
 }

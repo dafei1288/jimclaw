@@ -91,6 +91,9 @@ npm install
 # 推荐：终端实时监控
 npx ts-node src/tui.ts "实现一个 todo list REST API，带完整测试"
 
+# 从 checkpoint 恢复并继续执行
+npx ts-node src/index.ts --replay workspace/run_xxx coder_final-r2
+
 # Web 看板（访问 http://localhost:3000）
 npx ts-node src/server.ts
 
@@ -121,7 +124,7 @@ src/
   index.ts        # 标准 CLI 入口
 public/
   index.html      # React Web 看板（单文件，含仲裁指令面板）
-workspace/        # 每次运行的隔离产物目录（gitignored）
+workspace/        # 每次运行的隔离产物目录（gitignored，含 boulder.json / trace-index.json / checkpoints/ / nodes/）
 KNOWLEDGE.md      # 自动进化的知识库（post_mortem 节点写入）
 jimclaw.config.json  # 模型配置、maxRetries、workspace 路径
 ```
@@ -144,6 +147,31 @@ jimclaw.config.json  # 模型配置、maxRetries、workspace 路径
   }
 }
 ```
+
+---
+
+## 当前优先级
+
+当前路线已调整为先补执行完整性，再扩展新能力：
+
+1. 执行完整性与回归测试：补齐坏文件拦截、状态一致性、失败 run 摘要与纪要保底
+2. 状态追踪增强：已补 `trace-index.json` 和 `checkpoints/` 作为基础索引与成功节点锚点，后续继续扩展任务溯源图谱和分支回溯入口
+3. 编排能力增强：容器资源配额配置化、并行子任务、多 workspace 会话
+4. 前端生态扩展：Vue / React / Svelte 支持、组件测试、E2E 测试
+
+当前还提供了两个恢复预览接口：
+
+- `GET /api/workspace/checkpoints`：列出当前 run 的 checkpoint
+- `GET /api/workspace/checkpoint?id=<checkpointId>`：返回 checkpoint 的 replay 预览状态
+
+另外支持 CLI 续跑：
+
+- `npx ts-node src/index.ts --replay <workspacePath> <checkpointId>`：从指定 checkpoint 继续执行，并复用原 workspace 与 trace 链
+
+Web 端的 workspace 页也提供了 checkpoint 列表和“继续”按钮，可直接从当前 run 的锚点续跑；续跑不会新建 `run_*`，而是在原 workspace 内继续写入 `boulder.json / trace-index.json / checkpoints/`。
+另外，核心工具层已经补了 workspace 产物一致性校验，用于检查 `boulder.json / trace-index.json / checkpoints` 之间的 trace、节点和 round 是否对齐，以及 `subTasks` 和 `trace-index.files` 是否联动一致，后续回放和溯源图谱会直接复用这套规则。
+针对最新 run 暴露出的工具链问题，`lint_fix` 现在会把 `prettier` 的安装/网络不可用识别为非阻塞环境告警，不再把这类瞬时工具问题误判成代码失败；但真正的 `prettier` 解析/语法错误仍然会阻塞。
+另外，`coder` 现在会遵守 `orchestrator` 产出的文件依赖顺序，只处理依赖已完成的子任务，避免先写 controller、后补 model/service 这类跨文件契约漂移。
 
 ---
 

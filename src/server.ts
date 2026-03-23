@@ -3,6 +3,7 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import { Team } from "./agents/team";
 import { createJimClawGraph } from "./core/graph";
+import { buildReplayStateFromSnapshot, loadCheckpointSnapshot, loadTraceIndex, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
 import { ModelManager } from "./utils/models";
 import path from "path";
 import * as fs from "fs/promises";
@@ -106,6 +107,8 @@ let currentSession: any = {
   consensusCore: null,
   consensusProgress: null,
   meetingNotes: [],
+  lastFailedNode: "",
+  lastFailureSummary: "",
   team: [], // 初始为空，由下方初始化
 };
 
@@ -123,49 +126,38 @@ io.on("connection", (socket) => {
   // 握手：立即同步当前所有进度
   socket.emit("session-sync", currentSession);
 
-  socket.on("run-task", async (data: { userGoal: string }) => {
-    const { userGoal } = data;
-    const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
-    console.log(
-      `Starting task for client ${socket.id}: ${userGoal} | maxRetries: ${globalMaxRetries}`
-    );
+  const createBaseGraphState = (userGoal: string, maxRetries: number) => ({
+    userGoal,
+    messages: [],
+    teamChatLog: [],
+    retryCount: 0,
+    maxRetries,
+    isDone: false,
+    contract: null,
+    spec: null,
+    manifest: null,
+    subTasks: [],
+    code: "",
+    testResults: "",
+    qaFailures: null,
+    issueTracker: [],
+    mediationDirectives: null,
+    fixPlan: null,
+    projectBrief: [],
+    codeLog: [],
+    packageJsonHash: "",
+  });
 
-    // 任务开始时强制刷新一次 Team 信息，确保模型显示正确
-    const latestTeam = getTeamInfo();
-
-    // 重置全局 Session
-    currentSession = {
-      userGoal,
-      status: "Running",
-      currentPhase: "requirement",
-      phaseData: {
-        requirement: { startTime: Date.now(), status: "active" },
-      },
-      currentNode: "-",
-      retryCount: 0,
-      maxRetries: globalMaxRetries,
-      logs: [],
-      events: [],
-      deployment: { status: "none", url: null },
-      contract: null,
-      spec: null,
-      subTasks: [],
-      testResults: "",
-      qaFailures: null,
-      issueTracker: [],
-      mediationDirectives: null,
-      fixPlan: null,
-      projectBrief: [],
-      codeLog: [],
-      consensusCore: null,
-      consensusProgress: null,
-      meetingNotes: [],
-      workspacePath: null,
-      team: latestTeam, // 注入最新的团队信息
-    };
-
+  const runGraphSession = async (
+    latestTeam: any[],
+    initialSession: any,
+    initialGraphState: any,
+    graphOptions?: { workspacePath?: string; traceId?: string }
+  ) => {
     let trackedContainerId: string | null = null;
     try {
+      currentSession = initialSession;
+
       const appGraph = await createJimClawGraph(Team, (event) => {
         if (event.type === "workspace-ready") {
           currentSession.workspacePath = event.metadata?.workspacePath || null;
@@ -175,7 +167,6 @@ io.on("connection", (socket) => {
           const newPhase = event.content;
           const oldPhase = currentSession.currentPhase;
 
-          // 结束旧阶段
           if (oldPhase && currentSession.phaseData[oldPhase]) {
             const phase = currentSession.phaseData[oldPhase];
             phase.endTime = Date.now();
@@ -183,7 +174,6 @@ io.on("connection", (socket) => {
             phase.status = "completed";
           }
 
-          // 开始新阶段
           currentSession.currentPhase = newPhase;
           if (!currentSession.phaseData[newPhase]) {
             currentSession.phaseData[newPhase] = { totalDuration: 0 };
@@ -193,70 +183,34 @@ io.on("connection", (socket) => {
         }
         currentSession.events.push({ ...event, timestamp: new Date().toLocaleTimeString() });
         io.emit("agent-event", event);
-      });
-      const stream = await (appGraph as any).stream(
-        {
-          userGoal,
-          messages: [],
-          teamChatLog: [],
-          retryCount: 0,
-          maxRetries: globalMaxRetries,
-          isDone: false,
-          contract: null,
-          spec: null,
-          manifest: null,
-          subTasks: [],
-          code: "",
-          testResults: "",
-          qaFailures: null,
-          issueTracker: [],
-          mediationDirectives: null,
-          fixPlan: null,
-          projectBrief: [],
-          codeLog: [],
-          packageJsonHash: "",
-        },
-        { recursionLimit: 500 }
-      );
+      }, graphOptions);
+
+      const stream = await (appGraph as any).stream(initialGraphState, { recursionLimit: 500 });
 
       for await (const chunk of stream) {
         const nodeName = Object.keys(chunk)[0];
         const stateUpdate = (chunk as any)[nodeName];
 
-        // 追踪 containerId，用于异常时兜底清理
         if (stateUpdate.containerId) trackedContainerId = stateUpdate.containerId;
 
-        // 更新全局镜像
         currentSession.currentNode = nodeName;
         if (stateUpdate.teamChatLog) currentSession.logs.push(...stateUpdate.teamChatLog);
-        if (stateUpdate.retryCount !== undefined)
-          currentSession.retryCount = stateUpdate.retryCount;
-        if (stateUpdate.maxRetries !== undefined)
-          currentSession.maxRetries = stateUpdate.maxRetries;
+        if (stateUpdate.retryCount !== undefined) currentSession.retryCount = stateUpdate.retryCount;
+        if (stateUpdate.maxRetries !== undefined) currentSession.maxRetries = stateUpdate.maxRetries;
         if (stateUpdate.deploymentStatus) currentSession.deployment = stateUpdate.deploymentStatus;
         if (stateUpdate.contract) currentSession.contract = stateUpdate.contract;
         if (stateUpdate.spec) currentSession.spec = stateUpdate.spec;
-        // 确保 subTasks 数组（包括空数组）被正确传递
         if ("subTasks" in stateUpdate) {
           currentSession.subTasks = stateUpdate.subTasks;
           console.log(`[Server] subTasks updated: ${currentSession.subTasks.length} tasks`);
         }
         if (stateUpdate.testResults) currentSession.testResults = stateUpdate.testResults;
-        if (stateUpdate.qaFailures !== undefined)
-          currentSession.qaFailures = stateUpdate.qaFailures;
-        if (stateUpdate.issueTracker !== undefined)
-          currentSession.issueTracker = stateUpdate.issueTracker;
-        if (stateUpdate.mediationDirectives !== undefined)
-          currentSession.mediationDirectives = stateUpdate.mediationDirectives;
-        if (stateUpdate.fixPlan !== undefined)
-          currentSession.fixPlan = stateUpdate.fixPlan;
+        if (stateUpdate.qaFailures !== undefined) currentSession.qaFailures = stateUpdate.qaFailures;
+        if (stateUpdate.issueTracker !== undefined) currentSession.issueTracker = stateUpdate.issueTracker;
+        if (stateUpdate.mediationDirectives !== undefined) currentSession.mediationDirectives = stateUpdate.mediationDirectives;
+        if (stateUpdate.fixPlan !== undefined) currentSession.fixPlan = stateUpdate.fixPlan;
+        if (stateUpdate.requiresApproval !== undefined) currentSession.requiresApproval = stateUpdate.requiresApproval;
 
-        // 显式同步审批状态
-        if (stateUpdate.requiresApproval !== undefined) {
-          currentSession.requiresApproval = stateUpdate.requiresApproval;
-        }
-
-        // 增量合并
         if (stateUpdate.projectBrief && Array.isArray(stateUpdate.projectBrief)) {
           const uniqueBrief = new Set([
             ...currentSession.projectBrief,
@@ -268,37 +222,30 @@ io.on("connection", (socket) => {
         if (stateUpdate.codeLog && Array.isArray(stateUpdate.codeLog)) {
           currentSession.codeLog = [...currentSession.codeLog, ...stateUpdate.codeLog];
         }
-        if (stateUpdate.consensusCore !== undefined)
-          currentSession.consensusCore = stateUpdate.consensusCore;
-        if (stateUpdate.consensusProgress !== undefined)
-          currentSession.consensusProgress = stateUpdate.consensusProgress;
+        if (stateUpdate.consensusCore !== undefined) currentSession.consensusCore = stateUpdate.consensusCore;
+        if (stateUpdate.consensusProgress !== undefined) currentSession.consensusProgress = stateUpdate.consensusProgress;
         if (stateUpdate.meetingNotes && Array.isArray(stateUpdate.meetingNotes)) {
           const map = new Map((currentSession.meetingNotes || []).map((n: any) => [n.id, n]));
           stateUpdate.meetingNotes.forEach((n: any) => map.set(n.id, n));
           currentSession.meetingNotes = Array.from(map.values());
         }
+        if (stateUpdate.lastFailedNode !== undefined) currentSession.lastFailedNode = stateUpdate.lastFailedNode;
+        if (stateUpdate.lastFailureSummary !== undefined) currentSession.lastFailureSummary = stateUpdate.lastFailureSummary;
 
-        // 确保团队信息在每次推送中都包含
         if (!currentSession.team || currentSession.team.length === 0) {
           currentSession.team = latestTeam;
         }
 
-        // 广播
         io.emit("state-update", currentSession);
 
-        // 如果需要审批
         if (stateUpdate.requiresApproval) {
           console.log(`Node ${nodeName} requires approval. Pausing stream...`);
           await new Promise<void>((resolve) => {
-            socket.once(
-              "approve-task",
-              (approvalData: { approved: boolean; feedback?: string }) => {
-                // 审批完成后清除状态，防止重复触发
-                currentSession.requiresApproval = false;
-                io.emit("state-update", currentSession);
-                resolve();
-              }
-            );
+            socket.once("approve-task", () => {
+              currentSession.requiresApproval = false;
+              io.emit("state-update", currentSession);
+              resolve();
+            });
           });
         }
       }
@@ -316,7 +263,10 @@ io.on("connection", (socket) => {
       io.emit("task-finished", { success: true });
     } catch (error: any) {
       console.error("[Server] 任务执行失败:", error);
-      // 兜底清理：图执行异常时 persistence 节点不会运行，需在此处清理孤立容器
+      if (error?.jimclawFailure) {
+        currentSession.lastFailedNode = error.jimclawFailure.node;
+        currentSession.lastFailureSummary = error.jimclawFailure.summary;
+      }
       if (trackedContainerId) {
         console.error(`[Server] 兜底清理容器 ${trackedContainerId}...`);
         try {
@@ -329,7 +279,114 @@ io.on("connection", (socket) => {
         }
       }
       currentSession.status = "Error";
-      io.emit("task-error", { message: error.message });
+      io.emit("state-update", currentSession);
+      io.emit("task-error", {
+        message: error.message,
+        node: currentSession.lastFailedNode || undefined,
+        summary: currentSession.lastFailureSummary || undefined,
+      });
+    }
+  };
+
+  socket.on("run-task", async (data: { userGoal: string }) => {
+    const { userGoal } = data;
+    const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+    console.log(
+      `Starting task for client ${socket.id}: ${userGoal} | maxRetries: ${globalMaxRetries}`
+    );
+    const latestTeam = getTeamInfo();
+    await runGraphSession(
+      latestTeam,
+      {
+        userGoal,
+        status: "Running",
+        currentPhase: "requirement",
+        phaseData: {
+          requirement: { startTime: Date.now(), status: "active" },
+        },
+        currentNode: "-",
+        retryCount: 0,
+        maxRetries: globalMaxRetries,
+        logs: [],
+        events: [],
+        deployment: { status: "none", url: null },
+        contract: null,
+        spec: null,
+        subTasks: [],
+        testResults: "",
+        qaFailures: null,
+        issueTracker: [],
+        mediationDirectives: null,
+        fixPlan: null,
+        projectBrief: [],
+        codeLog: [],
+        consensusCore: null,
+        consensusProgress: null,
+        meetingNotes: [],
+        lastFailedNode: "",
+        lastFailureSummary: "",
+        workspacePath: null,
+        team: latestTeam,
+      },
+      createBaseGraphState(userGoal, globalMaxRetries)
+    );
+  });
+
+  socket.on("replay-task", async (data: { checkpointId: string }) => {
+    const checkpointId = data?.checkpointId;
+    const wsPath = currentSession.workspacePath;
+    if (!wsPath || !checkpointId) {
+      socket.emit("task-error", { message: "缺少 workspace 或 checkpointId" });
+      return;
+    }
+
+    const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+    const latestTeam = getTeamInfo();
+
+    try {
+      const snapshot = await loadCheckpointSnapshot(wsPath, checkpointId);
+      const replayState = prepareReplayStateFromCheckpoint(snapshot);
+      replayState.maxRetries = globalMaxRetries;
+
+      await runGraphSession(
+        latestTeam,
+        {
+          userGoal: `[Replay] ${checkpointId}`,
+          status: "Running",
+          currentPhase: "replay",
+          phaseData: {
+            replay: { startTime: Date.now(), status: "active" },
+          },
+          currentNode: snapshot.node,
+          retryCount: replayState.retryCount || 0,
+          maxRetries: globalMaxRetries,
+          logs: [],
+          events: [],
+          deployment: { status: "none", url: null },
+          contract: replayState.contract || null,
+          spec: replayState.spec || null,
+          subTasks: replayState.subTasks || [],
+          testResults: "",
+          qaFailures: null,
+          issueTracker: replayState.issueTracker || [],
+          mediationDirectives: replayState.mediationDirectives || null,
+          fixPlan: replayState.fixPlan || null,
+          projectBrief: replayState.projectBrief || [],
+          codeLog: replayState.codeLog || [],
+          consensusCore: replayState.consensusCore || null,
+          consensusProgress: replayState.consensusProgress || null,
+          meetingNotes: replayState.meetingNotes || [],
+          lastFailedNode: "",
+          lastFailureSummary: "",
+          workspacePath: wsPath,
+          replaySourceCheckpoint: checkpointId,
+          team: latestTeam,
+        },
+        replayState,
+        { workspacePath: wsPath, traceId: snapshot.traceId }
+      );
+    } catch (error: any) {
+      socket.emit("task-error", { message: error.message || String(error) });
     }
   });
 
@@ -425,6 +482,46 @@ app.get("/api/workspace/file", async (req, res) => {
     res.json({ content });
   } catch {
     res.status(404).json({ error: "File not found" });
+  }
+});
+
+app.get("/api/workspace/checkpoints", async (_req, res) => {
+  const wsPath = currentSession.workspacePath;
+  if (!wsPath) return res.json({ checkpoints: [], workspacePath: null });
+  const traceIndex = await loadTraceIndex(wsPath);
+  res.json({
+    checkpoints: traceIndex?.checkpoints || [],
+    workspacePath: wsPath,
+    lastNode: traceIndex?.lastNode || null,
+    lastFailure: traceIndex?.lastFailure || null,
+  });
+});
+
+app.get("/api/workspace/checkpoint", async (req, res) => {
+  const wsPath = currentSession.workspacePath;
+  const checkpointId = req.query.id as string;
+  if (!wsPath || !checkpointId) {
+    return res.status(400).json({ error: "Missing checkpoint id" });
+  }
+
+  try {
+    const snapshot = await loadCheckpointSnapshot(wsPath, checkpointId);
+    const replayState = buildReplayStateFromSnapshot(snapshot.state || {});
+    const subTasks = Array.isArray(replayState.subTasks) ? replayState.subTasks : [];
+    const completedFiles = subTasks.filter((task: any) => task.status === "completed").map((task: any) => task.fileTarget);
+    const pendingFiles = subTasks.filter((task: any) => task.status !== "completed").map((task: any) => task.fileTarget);
+
+    res.json({
+      checkpointId,
+      node: snapshot.node,
+      timestamp: snapshot.timestamp,
+      retryCount: replayState.retryCount || 0,
+      completedFiles,
+      pendingFiles,
+      replayState,
+    });
+  } catch (error: any) {
+    res.status(404).json({ error: error.message || String(error) });
   }
 });
 

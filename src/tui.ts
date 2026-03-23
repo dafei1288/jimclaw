@@ -288,6 +288,8 @@ async function runTUI() {
         qaFailures: null,
         mediationDirectives: null,
         packageJsonHash: "",
+        lastFailedNode: "",
+        lastFailureSummary: "",
       },
       { recursionLimit: 500 }
     );
@@ -307,6 +309,10 @@ async function runTUI() {
   } catch (error: any) {
     const msg = error?.message || JSON.stringify(error, null, 2);
     console.error(chalk.bold.red(`\n❌ 会话失败: ${msg}`));
+    if (error?.jimclawFailure) {
+      console.error(chalk.yellow(`失败节点: ${error.jimclawFailure.node}`));
+      console.error(chalk.yellow(`失败摘要: ${error.jimclawFailure.summary}`));
+    }
     if (!error?.message) console.error(chalk.red("完整错误:"), error);
     // 兜底清理：图执行异常时 persistence 节点不会运行，需在此处清理孤立容器
     if (trackedContainerId) {
