@@ -213,6 +213,13 @@
               <button onclick="refreshFileTree()" class="hover:text-white transition-colors" title="刷新"><i data-lucide="refresh-cw" class="w-3 h-3"></i></button>
             </div>
             <div class="flex-1 overflow-y-auto scrollbar p-2" id="fileTree"></div>
+            <div class="border-t border-slate-700 bg-slate-900/40">
+              <div class="p-2 md:p-3 text-xs font-bold text-slate-400 flex justify-between items-center">
+                <span class="flex items-center gap-2"><i data-lucide="history" class="w-4 h-4"></i> Checkpoints</span>
+                <button onclick="refreshCheckpoints()" class="hover:text-white transition-colors" title="刷新"><i data-lucide="refresh-cw" class="w-3 h-3"></i></button>
+              </div>
+              <div class="max-h-48 overflow-y-auto scrollbar p-2 pt-0" id="checkpointList"></div>
+            </div>
           </div>
           <div class="flex-1 flex flex-col min-w-0 bg-[#0d1117]"> <!-- GitHub Dark Background -->
             <div id="fileHeader" class="h-10 border-b border-slate-700 flex items-center px-2 md:px-4 text-xs md:text-sm font-mono text-slate-400 bg-surface shadow-sm shrink-0 truncate">
@@ -380,12 +387,14 @@
         showToast("任务执行完成", 'ok'); 
         document.getElementById('runBtn').disabled = false;
         document.getElementById('runBtn').innerText = '执行';
+        refreshCheckpoints();
         switchTab('dashboard');
       });
       socket.on('task-error', (err) => {
         showToast("任务出错: " + (err.message || "未知错误"), 'err');
         document.getElementById('runBtn').disabled = false;
         document.getElementById('runBtn').innerText = '执行';
+        refreshCheckpoints();
       });
 
       // Human-in-the-loop 事件处理
@@ -982,7 +991,10 @@
           btn.classList.add('border-transparent', 'text-slate-400');
         }
       });
-      if (tabId === 'workspace') refreshFileTree();
+      if (tabId === 'workspace') {
+        refreshFileTree();
+        refreshCheckpoints();
+      }
     }
 
     async function refreshFileTree() {
@@ -1008,6 +1020,52 @@
       } catch (e) { 
         tree.innerHTML = '<div class="text-rose-400 text-sm p-3 text-center">获取文件失败</div>';
       }
+    }
+
+    async function refreshCheckpoints() {
+      const list = document.getElementById('checkpointList');
+      try {
+        const res = await fetch('/api/workspace/checkpoints');
+        const data = await res.json();
+        const checkpoints = data.checkpoints || [];
+        if (checkpoints.length === 0) {
+          list.innerHTML = '<div class="text-slate-500 text-xs p-2 italic">暂无 checkpoint</div>';
+          return;
+        }
+
+        list.innerHTML = checkpoints
+          .slice()
+          .sort((a, b) => String(b.timestamp).localeCompare(String(a.timestamp)))
+          .map(cp => `
+            <div class="mb-2 rounded border border-slate-700 bg-slate-800/60 p-2">
+              <div class="flex items-center justify-between gap-2">
+                <div class="min-w-0">
+                  <div class="text-[11px] font-mono text-indigo-300 truncate">${escapeHtml(cp.id)}</div>
+                  <div class="text-[10px] text-slate-400">${escapeHtml(formatNodeName(cp.node))} · R${cp.round}</div>
+                  <div class="text-[10px] text-slate-500 truncate">${escapeHtml(cp.timestamp || '')}</div>
+                </div>
+                <button onclick="replayCheckpoint('${cp.id}')" class="shrink-0 rounded bg-indigo-600 px-2 py-1 text-[10px] font-semibold text-white hover:bg-indigo-500 transition-colors">继续</button>
+              </div>
+            </div>
+          `).join('');
+        lucide.createIcons({ portal: list });
+      } catch (e) {
+        list.innerHTML = '<div class="text-rose-400 text-xs p-2">获取 checkpoint 失败</div>';
+      }
+    }
+
+    function replayCheckpoint(checkpointId) {
+      if (!socket) {
+        showToast('Socket 未连接', 'err');
+        return;
+      }
+      document.getElementById('runBtn').disabled = true;
+      document.getElementById('runBtn').innerText = '续跑中...';
+      document.getElementById('logStream').innerHTML = '';
+      switchTab('live');
+      if (session) session.events = [];
+      socket.emit('replay-task', { checkpointId });
+      showToast(`已从 ${checkpointId} 启动续跑`, 'info');
     }
 
     async function openFile(path) {

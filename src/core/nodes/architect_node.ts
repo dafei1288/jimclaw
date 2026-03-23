@@ -5,11 +5,39 @@ import { BaseAgent } from "../agent";
 import {
   logPrefix,
   buildSystemContext,
+  ensureTypeScriptTestBaseline,
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 import { getTemplateEngine } from "../template_engine";
 import { REQUIRED_MIDDLEWARE, MiddlewareSpec } from "../middleware_standards";
+
+function normalizeNodeDependencyLayout(spec: any): any {
+  const language = String(spec?.language || "").toLowerCase();
+  if (!/typescript|javascript|node/.test(language)) return spec;
+
+  const dependencies = { ...(spec?.dependencies || {}) } as Record<string, string>;
+  const devDependencies = { ...(spec?.devDependencies || {}) } as Record<string, string>;
+
+  // @types/* 只应存在于 devDependencies
+  for (const pkg of Object.keys(dependencies)) {
+    if (pkg.startsWith("@types/")) {
+      devDependencies[pkg] = dependencies[pkg];
+      delete dependencies[pkg];
+    }
+  }
+
+  // mongoose 自带类型定义，保留会导致 npm ETARGET（7.x 不存在）
+  if ("@types/mongoose" in devDependencies) {
+    delete devDependencies["@types/mongoose"];
+  }
+
+  return {
+    ...spec,
+    dependencies,
+    devDependencies,
+  };
+}
 
 /**
  * Architect 节点：负责系统架构设计和技术规范制定
@@ -84,7 +112,8 @@ export async function architectNode(
 
 
   const output = parseJsonFromResponse(extractText(response.content), {});
-  const spec = output.spec || { architecture: "未知", language: "TypeScript", testCommand: "npm test", runCommand: "npm start", entryPoint: "http://localhost:3000", filesToCreate: [] };
+  const rawSpec = output.spec || { architecture: "未知", language: "TypeScript", testCommand: "npm test", runCommand: "npm start", entryPoint: "http://localhost:3000", filesToCreate: [] };
+  const spec = ensureTypeScriptTestBaseline(normalizeNodeDependencyLayout(rawSpec));
   const manifest = output.manifest || { services: [], environment: {} };
   const apiContract = output.apiContract || { endpoints: [] };
 

@@ -1,6 +1,17 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, ConsensusEntry, ConsensusType, ProblemAnalysis, MeetingNote } from "./graph_types";
+import {
+  JimClawState,
+  ConsensusEntry,
+  ConsensusType,
+  ProblemAnalysis,
+  MeetingNote,
+  ExecutionFailureInfo,
+  TraceIndex,
+  TraceCheckpoint,
+  TraceFileSummary,
+  TraceTimelineEntry,
+} from "./graph_types";
 import { ShellExecuteSkill } from "../skills/shell_exec";
 
 /**
@@ -121,6 +132,25 @@ export function analyzeTestProblem(testOutput: string, retryCount: number, hasMe
  * 尝试自动修复环境问题
  */
 export async function tryFixEnvironmentProblem(testOutput: string, state: JimClawState, workspacePath: string): Promise<{ fixed: boolean; action?: string; reason?: string }> {
+  const runInstallCmd = async (cmd: string, timeout: number = 120000) => {
+    if (state.containerId) {
+      await execInContainer(state.containerId, cmd, { timeout });
+    } else {
+      await ShellExecuteSkill.config.run({ command: `cd ${workspacePath} && ${cmd}`, timeout });
+    }
+  };
+
+  // npm ETARGET: 常见于无效版本（例如 @types/mongoose@^7.0.0）
+  if (/No matching version found for @types\/mongoose@|ETARGET/i.test(testOutput)) {
+    try {
+      await runInstallCmd("npm pkg delete devDependencies.@types/mongoose", 60000);
+      await runInstallCmd("npm install --silent", 180000);
+      return { fixed: true, action: "已移除无效依赖 @types/mongoose 并重新安装依赖" };
+    } catch (e: any) {
+      return { fixed: false, reason: `自动修复 ETARGET 失败: ${e.message || e}` };
+    }
+  }
+
   if (/EADDRINUSE/.test(testOutput)) {
     const portMatch = testOutput.match(/port\s+(\d+)/i) || testOutput.match(/:(\d+)\)/);
     if (portMatch) {
@@ -136,16 +166,42 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
     const moduleMatch = testOutput.match(/cannot find module\s+['"]([^'"./][^'"]*)['"]|Cannot find module\s+'([^']+)'/i);
     const moduleName = moduleMatch?.[1] || moduleMatch?.[2];
     if (moduleName) {
-      const installCmd = `npm install ${moduleName} --save --silent`;
-      if (state.containerId) {
-        await execInContainer(state.containerId, installCmd, { timeout: 60000 });
-      } else {
-        await ShellExecuteSkill.config.run({ command: `cd ${workspacePath} && ${installCmd}`, timeout: 60000 });
+      try {
+        const installCmd = `npm install ${moduleName} --save --silent`;
+        await runInstallCmd(installCmd, 60000);
+        return { fixed: true, action: `已安装缺失模块 ${moduleName}` };
+      } catch (e: any) {
+        const errorText = String(e?.message || e || "");
+        if (/No matching version found for @types\/mongoose@|ETARGET/i.test(errorText)) {
+          try {
+            await runInstallCmd("npm pkg delete devDependencies.@types/mongoose", 60000);
+            await runInstallCmd("npm install --silent", 180000);
+            return { fixed: true, action: `安装 ${moduleName} 时发现 @types/mongoose 版本无效，已自动修复并重装依赖` };
+          } catch (fixErr: any) {
+            return { fixed: false, reason: `修复缺失模块失败: ${fixErr.message || fixErr}` };
+          }
+        }
+        return { fixed: false, reason: `安装缺失模块失败: ${errorText}` };
       }
-      return { fixed: true, action: `已安装缺失模块 ${moduleName}` };
     }
   }
   return { fixed: false, reason: "无法自动修复" };
+}
+
+/**
+ * 将原始错误输出归一化为“失败指纹”，用于识别自旋
+ */
+export function buildFailureFingerprint(testOutput: string): string {
+  const lines = (testOutput || "")
+    .split("\n")
+    .map(l => l.trim())
+    .filter(Boolean)
+    .filter(l => /error|fail|exception|cannot find|ts\d+|etarget|eaddrinuse|enoent|not found/i.test(l))
+    .slice(0, 12)
+    .map(l => l.replace(/\d+/g, "#").replace(/\s+/g, " ").toLowerCase());
+
+  const fingerprint = lines.join("|");
+  return fingerprint.slice(0, 500);
 }
 
 /**
@@ -274,6 +330,52 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
   return tasks;
 }
 
+export function ensureTypeScriptTestBaseline(spec: any): any {
+  const language = String(spec?.language || "").toLowerCase();
+  const testCommand = String(spec?.testCommand || "").toLowerCase();
+  if (!language.includes("typescript")) return spec;
+  if (!/(npm test|jest|ts-jest)/.test(testCommand)) return spec;
+
+  const filesToCreate = new Set(spec?.filesToCreate || []);
+  filesToCreate.add("jest.config.cjs");
+  filesToCreate.add("tests/setup.test.ts");
+
+  const devDependencies = { ...(spec?.devDependencies || {}) } as Record<string, string>;
+  if (!devDependencies.jest) devDependencies.jest = "^29.7.0";
+  if (!devDependencies["ts-jest"]) devDependencies["ts-jest"] = "^29.1.1";
+  if (!devDependencies["@types/jest"]) devDependencies["@types/jest"] = "^29.5.11";
+
+  return {
+    ...spec,
+    filesToCreate: Array.from(filesToCreate),
+    devDependencies,
+  };
+}
+
+export function findContractRouteDrift(
+  routeContent: string,
+  contract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined,
+): string[] {
+  const endpoints = contract?.endpoints || [];
+  if (endpoints.length === 0) return [];
+
+  const allowed = new Set(
+    endpoints.map((ep) => `${String(ep.method || "").toUpperCase()} ${String(ep.path || "").trim()}`)
+  );
+
+  const routeRegex = /router\.(get|post|put|delete|patch)\s*\(\s*["'`](.+?)["'`]/gi;
+  const drifts: string[] = [];
+  let match: RegExpExecArray | null;
+  while ((match = routeRegex.exec(routeContent)) !== null) {
+    const actual = `${match[1].toUpperCase()} ${match[2]}`;
+    if (!allowed.has(actual)) {
+      drifts.push(`路由 ${actual} 未在 ApiContract 中声明`);
+    }
+  }
+
+  return drifts;
+}
+
 /**
  * 构建结构化三层共识上下文，供所有节点注入 system prompt
  */
@@ -355,6 +457,272 @@ export async function writeMeetingNote(
   await fs.mkdir(nodesDir, { recursive: true });
   await fs.writeFile(path.join(nodesDir, `${id}.md`), fullContent, "utf-8");
   return { id, phase, round, summary, contentFile: `nodes/${id}.md` };
+}
+
+function trimFailureText(text: string, maxLength: number): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+export async function recordNodeFailure(
+  workspace: string,
+  state: Pick<JimClawState, "retryCount" | "meetingNotes">,
+  nodeName: string,
+  error: unknown
+): Promise<{ failure: ExecutionFailureInfo; meetingNotes: MeetingNote[] }> {
+  const round = state.retryCount || 0;
+  const noteId = `note-${nodeName}-r${round}`;
+  const rawMessage = error instanceof Error ? (error.stack || error.message) : String(error);
+  const firstLine = rawMessage.split(/\r?\n/).find((line) => line.trim()) || rawMessage;
+  const summary = `${nodeName} 节点异常：${trimFailureText(firstLine, 60)}`;
+  const fullContent = [
+    `# ${nodeName} 节点异常`,
+    "",
+    `- 轮次：${round}`,
+    `- 摘要：${summary}`,
+    "",
+    "## 原始错误",
+    "```text",
+    rawMessage || "未知错误",
+    "```",
+    "",
+  ].join("\n");
+
+  const note = await writeMeetingNote(workspace, noteId, nodeName, round, summary, fullContent);
+  const existingNotes = state.meetingNotes || [];
+  const meetingNotes = existingNotes.some((item) => item.id === note.id)
+    ? existingNotes.map((item) => item.id === note.id ? note : item)
+    : [...existingNotes, note];
+
+  return {
+    failure: { node: nodeName, round, summary, noteId },
+    meetingNotes,
+  };
+}
+
+export function buildTraceIndex(
+  state: Pick<JimClawState, "retryCount" | "meetingNotes" | "codeLog" | "lastFailedNode" | "lastFailureSummary">,
+  nodeName: string,
+  traceId: string,
+  timestamp: string,
+  checkpoints: TraceCheckpoint[] = []
+): TraceIndex {
+  const meetingNotes = [...(state.meetingNotes || [])].sort((a, b) => {
+    if (a.round !== b.round) return a.round - b.round;
+    return a.phase.localeCompare(b.phase);
+  });
+  const fileChanges = [...(state.codeLog || [])];
+  const files = fileChanges.reduce<Record<string, TraceFileSummary>>((acc, entry) => {
+    acc[entry.file] = {
+      file: entry.file,
+      lastRound: entry.round,
+      lastStatus: entry.status,
+      taskTitle: entry.taskTitle,
+      lastError: entry.error,
+    };
+    return acc;
+  }, {});
+
+  const timeline: TraceTimelineEntry[] = meetingNotes.map((note) => ({
+    node: note.phase,
+    round: note.round,
+    summary: note.summary,
+  }));
+
+  const currentRound = state.retryCount || 0;
+  const shouldAppendLastNode = timeline.length === 0 || timeline[timeline.length - 1].node !== nodeName;
+  if (shouldAppendLastNode) {
+    timeline.push({
+      node: nodeName,
+      round: currentRound,
+      timestamp,
+      summary: state.lastFailureSummary || undefined,
+    });
+  } else if (!timeline[timeline.length - 1].timestamp) {
+    timeline[timeline.length - 1] = {
+      ...timeline[timeline.length - 1],
+      timestamp,
+    };
+  }
+
+  return {
+    traceId,
+    lastNode: nodeName,
+    retryCount: currentRound,
+    timestamp,
+    meetingNotes,
+    fileChanges,
+    files,
+    timeline,
+    checkpoints,
+    lastFailure: {
+      node: state.lastFailedNode || undefined,
+      summary: state.lastFailureSummary || undefined,
+    },
+  };
+}
+
+const CHECKPOINT_NODES = new Set([
+  "orchestrator",
+  "coder_final",
+  "verifier",
+  "qa",
+  "deploy",
+]);
+
+export function shouldPersistCheckpoint(nodeName: string): boolean {
+  return CHECKPOINT_NODES.has(nodeName);
+}
+
+export function buildCheckpointMeta(
+  nodeName: string,
+  round: number,
+  timestamp: string
+): TraceCheckpoint {
+  const safeNode = nodeName.replace(/[^a-z0-9_-]/gi, "_");
+  return {
+    id: `${safeNode}-r${round}`,
+    node: nodeName,
+    round,
+    timestamp,
+    file: `checkpoints/${safeNode}-r${round}.json`,
+  };
+}
+
+export async function loadTraceIndex(workspace: string): Promise<TraceIndex | null> {
+  try {
+    const raw = await fs.readFile(path.join(workspace, "trace-index.json"), "utf-8");
+    return JSON.parse(raw) as TraceIndex;
+  } catch {
+    return null;
+  }
+}
+
+export async function loadCheckpointSnapshot(workspace: string, checkpointId: string): Promise<any> {
+  const traceIndex = await loadTraceIndex(workspace);
+  const checkpoint = traceIndex?.checkpoints?.find((item) => item.id === checkpointId);
+  if (!checkpoint) {
+    throw new Error(`未找到 checkpoint: ${checkpointId}`);
+  }
+  const raw = await fs.readFile(path.join(workspace, checkpoint.file), "utf-8");
+  return JSON.parse(raw);
+}
+
+export async function validateWorkspaceArtifacts(workspace: string): Promise<{ ok: boolean; errors: string[] }> {
+  const errors: string[] = [];
+  let boulder: any = null;
+  let traceIndex: TraceIndex | null = null;
+
+  try {
+    const raw = await fs.readFile(path.join(workspace, "boulder.json"), "utf-8");
+    boulder = JSON.parse(raw);
+  } catch {
+    errors.push("缂哄皯鎴栨棤娉曡鍙?boulder.json");
+  }
+
+  traceIndex = await loadTraceIndex(workspace);
+  if (!traceIndex) {
+    errors.push("缂哄皯鎴栨棤娉曡鍙?trace-index.json");
+  }
+
+  if (boulder && traceIndex) {
+    if (boulder.traceId !== traceIndex.traceId) {
+      errors.push("boulder.json 涓?traceId 涓?trace-index.json 涓嶄竴鑷?");
+    }
+    if (boulder.node !== traceIndex.lastNode) {
+      errors.push("boulder.json 鏈€鍚庤妭鐐逛笌 trace-index.json.lastNode 涓嶄竴鑷?");
+    }
+    if ((boulder.state?.retryCount || 0) !== traceIndex.retryCount) {
+      errors.push("boulder.json.state.retryCount 涓?trace-index.json.retryCount 涓嶄竴鑷?");
+    }
+  }
+
+  const checkpoints = traceIndex?.checkpoints || [];
+  for (const checkpoint of checkpoints) {
+    const checkpointPath = path.join(workspace, checkpoint.file);
+    try {
+      const raw = await fs.readFile(checkpointPath, "utf-8");
+      const snapshot = JSON.parse(raw);
+      if (traceIndex && snapshot.traceId !== traceIndex.traceId) {
+        errors.push(`checkpoint ${checkpoint.id} 鐨?traceId 涓?trace-index.json 涓嶄竴鑷?`);
+      }
+      if (snapshot.node !== checkpoint.node) {
+        errors.push(`checkpoint ${checkpoint.id} 鐨?node 涓庣储寮曞厓鏁版嵁涓嶄竴鑷?`);
+      }
+      if ((snapshot.state?.retryCount || 0) !== checkpoint.round) {
+        errors.push(`checkpoint ${checkpoint.id} 鐨?retryCount 涓庣储寮曞厓鏁版嵁 round 涓嶄竴鑷?`);
+      }
+    } catch {
+      errors.push(`checkpoint 鏂囦欢缂哄け鎴栨棤娉曡鍙? ${checkpoint.file}`);
+    }
+  }
+
+  const subTasks = Array.isArray(boulder?.state?.subTasks) ? boulder.state.subTasks : [];
+  const fileSummaries = traceIndex?.files || {};
+  for (const task of subTasks) {
+    if (!task?.fileTarget) continue;
+    const summary = fileSummaries[task.fileTarget];
+    if (task.status === "completed") {
+      if (!summary) {
+        errors.push(`subTask ${task.fileTarget} 宸叉爣璁?completed锛屼絾 trace-index.files 涓己灏戝搴旀枃浠舵眹鎬?`);
+        continue;
+      }
+      if (summary.lastStatus !== "written") {
+        errors.push(`subTask ${task.fileTarget} 宸叉爣璁?completed锛屼絾 trace-index.files.lastStatus=${summary.lastStatus}`);
+      }
+    }
+    if (task.status === "failed" && summary?.lastStatus === "written") {
+      errors.push(`subTask ${task.fileTarget} 宸叉爣璁?failed锛屼絾 trace-index.files.lastStatus=written`);
+    }
+  }
+
+  return { ok: errors.length === 0, errors };
+}
+
+export function buildReplayStateFromSnapshot(snapshotState: Partial<JimClawState>): Partial<JimClawState> {
+  return {
+    ...snapshotState,
+    messages: [],
+    teamChatLog: [],
+    requiresApproval: false,
+    deploymentStatus: { status: "none" },
+    qaFailures: null,
+    testResults: "",
+    lastFailedNode: "",
+    lastFailureSummary: "",
+    blockedReason: "",
+    recoveredEnvironment: false,
+    envReady: null,
+    resumeFromNode: "",
+    containerId: "",
+    allocatedHostPort: null,
+    failureFingerprint: "",
+    sameFailureCount: 0,
+  };
+}
+
+export function getResumeNodeFromCheckpoint(nodeName: string): string {
+  switch (nodeName) {
+    case "orchestrator":
+      return "coder";
+    case "coder_final":
+      return "env_guard";
+    case "verifier":
+      return "qa";
+    case "qa":
+      return "qa_resume_router";
+    case "deploy":
+      return "post_mortem";
+    default:
+      return "pm";
+  }
+}
+
+export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state?: Partial<JimClawState> }): Partial<JimClawState> {
+  const replayState = buildReplayStateFromSnapshot(snapshot.state || {});
+  replayState.resumeFromNode = getResumeNodeFromCheckpoint(snapshot.node);
+  return replayState;
 }
 
 /**

@@ -2,6 +2,7 @@ import { JimClawState, ConsensusProgress } from "../graph_types";
 import { BaseAgent } from "../agent";
 import {
   buildSystemContext,
+  ensureTypeScriptTestBaseline,
   generateFallbackSubTasks,
   writeMeetingNote
 } from "../logic_utils";
@@ -20,6 +21,7 @@ export async function orchestratorNode(
 ) {
   startSpan("orchestrator");
   emit("phase-change", "System", "planning");
+  state.spec = ensureTypeScriptTestBaseline(state.spec);
 
   // P1-A：重写 orchestrator prompt，注入 apiContract 和 SubTask schema，明确 contextRequirement 期望
   const orchestratorPrompt = `请基于以下技术方案和 API 接口契约，将开发任务拆解为有序的文件级子任务列表。
@@ -113,6 +115,27 @@ ${JSON.stringify(state.apiContract, null, 2)}
         description: "TypeScript 编译配置（自动注入）",
         dependencies: ["package.json"],
         contextRequirement: `标准 TypeScript 项目配置：target ES2020，module commonjs，outDir dist，rootDir src，strict true，esModuleInterop true。`,
+        status: "pending",
+      });
+    }
+    if (!fileTargetSet.has("jest.config.cjs") && lang.includes("typescript") && /npm test|jest/.test((state.spec?.testCommand || "").toLowerCase())) {
+      const pkgIdx = subTasks.findIndex((t: any) => t.fileTarget === "package.json");
+      subTasks.splice(Math.max(pkgIdx + 1, 0), 0, {
+        id: "task-jest-config-inject",
+        fileTarget: "jest.config.cjs",
+        description: "Jest 测试配置（自动注入）",
+        dependencies: ["package.json"],
+        contextRequirement: "为 TypeScript 项目生成最小可运行的 ts-jest 配置，使用 node 环境并匹配 tests/**/*.test.ts。",
+        status: "pending",
+      });
+    }
+    if (!fileTargetSet.has("tests/setup.test.ts") && lang.includes("typescript") && /npm test|jest/.test((state.spec?.testCommand || "").toLowerCase())) {
+      subTasks.push({
+        id: "task-jest-smoke-test-inject",
+        fileTarget: "tests/setup.test.ts",
+        description: "Jest 基线冒烟测试（自动注入）",
+        dependencies: ["package.json", "jest.config.cjs"],
+        contextRequirement: "生成一个最小的 Jest+ts-jest 冒烟测试文件，验证测试基线可运行。",
         status: "pending",
       });
     }

@@ -1,7 +1,10 @@
-import { JimClawState, Issue, ConsensusProgress } from "../graph_types";
+import { JimClawState, Issue, ConsensusProgress, RepairLedgerEntry } from "../graph_types";
 import { BaseAgent } from "../agent";
 import {
+  analyzeTestProblem,
+  buildFailureFingerprint,
   buildSystemContext,
+  tryFixEnvironmentProblem,
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
@@ -24,6 +27,10 @@ export async function qaNode(
   const rawUnitOutput = state.testResults || "";
   const unitTestFail = /fail|error|✖/i.test(rawUnitOutput);
   const deploymentFail = state.deploymentStatus?.status === 'failed';
+  const failureFingerprint = buildFailureFingerprint(rawUnitOutput);
+  const sameFailureCount = failureFingerprint && state.failureFingerprint === failureFingerprint
+    ? (state.sameFailureCount || 0) + 1
+    : (failureFingerprint ? 1 : 0);
 
   // P0-D：拆分单元测试输出与部署错误，避免 QA 标签混乱
   const unitTestSection = rawUnitOutput.split("[部署验证失败]")[0].trim() || rawUnitOutput;
@@ -34,7 +41,41 @@ export async function qaNode(
   // 1. 如果完全没有错误，且之前的 Issue 都已解决，则直接通过
   const openIssues = (state.issueTracker || []).filter(i => i.status === 'open');
   if (!unitTestFail && !deploymentFail && openIssues.length === 0) {
-    return { isDone: true };
+    return {
+      isDone: true,
+      recoveredEnvironment: false,
+      failureFingerprint: "",
+      sameFailureCount: 0,
+    };
+  }
+
+  // 1.1 环境问题优先自动修复，避免把依赖缺失误判为代码缺陷反复返工
+  const problem = analyzeTestProblem(rawUnitOutput, round, Boolean(state.mediationDirectives?.length));
+  if (problem.type === "environment_problem") {
+    emit("thinking", "System", `检测到环境类故障，尝试自动修复：${problem.reason}`, {});
+    const fixed = await tryFixEnvironmentProblem(rawUnitOutput, state, WORKSPACE);
+    if (fixed.fixed) {
+      const ledger: RepairLedgerEntry[] = [{
+        round,
+        phase: "qa",
+        action: fixed.action || "环境自动修复",
+        result: "success",
+        fingerprint: failureFingerprint || undefined,
+      }];
+      const result = {
+        isDone: false,
+        // 环境修复成功后不消耗重试次数，直接进入下一轮验证链路
+        retryCount: state.retryCount || 0,
+        recoveredEnvironment: true,
+        failureFingerprint,
+        sameFailureCount,
+        qaFailures: { failedFiles: [], testErrors: [fixed.action || "环境修复成功"], failedTestNames: [] },
+        testResults: `${rawUnitOutput}\n[环境自动修复] ${fixed.action || "已完成"}`,
+        repairLedger: ledger,
+      };
+      await saveBoulder({ ...state, ...result }, "qa_env_fix");
+      return result;
+    }
   }
 
   // 静态提取失败的测试文件（比 LLM 更可靠）
@@ -133,6 +174,9 @@ ${JSON.stringify(state.issueTracker || [])}
     issueTracker: issues,
     isDone,
     retryCount: isDone ? (state.retryCount || 0) : (state.retryCount || 0) + 1,
+    recoveredEnvironment: false,
+    failureFingerprint: isDone ? "" : failureFingerprint,
+    sameFailureCount: isDone ? 0 : sameFailureCount,
     qaFailures: {
       // 合并 LLM 识别的文件 + 静态从测试输出提取的失败测试文件（双保险）
       failedFiles: Array.from(new Set([

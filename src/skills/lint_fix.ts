@@ -6,9 +6,38 @@ import path from "path";
 
 const execPromise = promisify(exec);
 
-/**
- * PolyglotLintFixSkill: 多语言自动化代码规范修复技能
- */
+export function classifyPrettierFailure(message: string): "blocking" | "warning" {
+  const text = String(message || "");
+  if (
+    /ENOTFOUND|EAI_AGAIN|ECONNRESET|ECONNREFUSED|ETIMEDOUT|network|registry\.npmjs\.org|could not determine executable|prettier is not recognized|not recognized as an internal or external command|command not found/i.test(
+      text
+    )
+  ) {
+    return "warning";
+  }
+  return "blocking";
+}
+
+async function runPrettierWithFallback(fullPath: string): Promise<string | null> {
+  try {
+    await execPromise(`npx prettier --write "${fullPath}"`);
+    return null;
+  } catch {
+    try {
+      await execPromise(`npx --yes prettier@3 --write "${fullPath}"`);
+      return null;
+    } catch (fallbackError: any) {
+      const message = String(
+        fallbackError?.stderr || fallbackError?.stdout || fallbackError?.message || fallbackError || ""
+      );
+      if (classifyPrettierFailure(message) === "warning") {
+        return `Prettier 暂不可用，已跳过格式化（非阻塞）: ${message.slice(0, 200)}`;
+      }
+      throw fallbackError;
+    }
+  }
+}
+
 export const LintFixSkill = new Skill({
   name: "lint_fix",
   description: "根据文件类型自动修复代码规范和格式问题（支持 TS, JS, Python, Go, JSON, MD 等）。",
@@ -21,45 +50,50 @@ export const LintFixSkill = new Skill({
     const ext = path.extname(file_path).toLowerCase();
 
     try {
-      let command = "";
       switch (ext) {
         case ".ts":
         case ".tsx":
         case ".js":
-        case ".jsx":
-          // JS/TS: Prettier + ESLint
-          await execPromise(`npx prettier --write "${fullPath}"`);
+        case ".jsx": {
+          const prettierWarning = await runPrettierWithFallback(fullPath);
           try {
             await execPromise(`npx eslint --fix "${fullPath}"`);
           } catch (e: any) {
-            if (e.code !== 1) throw e;
+            if (e.code !== 1 && e.code !== 2) {
+              return `文件 ${file_path} 已格式化，但 ESLint 修复失败（非阻塞）：${e.message}`;
+            }
+          }
+          if (prettierWarning) {
+            return `[WARNING] ${prettierWarning}`;
           }
           return `文件 ${file_path} (JS/TS) 已完成格式化和规范修复。`;
+        }
 
         case ".py":
-          // Python: Ruff (extremely fast)
           await execPromise(`ruff format "${fullPath}"`);
           await execPromise(`ruff check --fix "${fullPath}"`);
           return `文件 ${file_path} (Python) 已使用 ruff 完成格式化和规范修复。`;
 
         case ".go":
-          // Go: gofmt
           await execPromise(`gofmt -w "${fullPath}"`);
           return `文件 ${file_path} (Go) 已使用 gofmt 完成格式化。`;
 
         case ".json":
         case ".md":
         case ".yml":
-        case ".yaml":
-          // Common files: Prettier
-          await execPromise(`npx prettier --write "${fullPath}"`);
+        case ".yaml": {
+          const prettierWarning = await runPrettierWithFallback(fullPath);
+          if (prettierWarning) {
+            return `[WARNING] ${prettierWarning}`;
+          }
           return `文件 ${file_path} 已使用 prettier 完成格式化。`;
+        }
 
         default:
           return `未找到文件后缀 ${ext} 的对应规范工具，跳过修复。`;
       }
     } catch (error: any) {
-      return `修复规范时出错 (${file_path}): ${error.message}`;
+      return `修复规范时出错(${file_path}): ${error.message}`;
     }
   },
 });

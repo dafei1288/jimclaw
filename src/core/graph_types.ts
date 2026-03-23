@@ -243,6 +243,63 @@ export interface FixPlanItem {
 }
 
 /**
+ * 环境修复账本：记录每次自动修复动作，避免重复无效尝试
+ */
+export interface RepairLedgerEntry {
+  round: number;
+  phase: string;
+  action: string;
+  result: "success" | "failed";
+  fingerprint?: string;
+}
+
+export interface ExecutionFailureInfo {
+  node: string;
+  round: number;
+  summary: string;
+  noteId: string;
+}
+
+export interface TraceTimelineEntry {
+  node: string;
+  round: number;
+  timestamp?: string;
+  summary?: string;
+}
+
+export interface TraceCheckpoint {
+  id: string;
+  node: string;
+  round: number;
+  timestamp: string;
+  file: string;
+}
+
+export interface TraceFileSummary {
+  file: string;
+  lastRound: number;
+  lastStatus: "written" | "skipped" | "error";
+  taskTitle: string;
+  lastError?: string;
+}
+
+export interface TraceIndex {
+  traceId: string;
+  lastNode: string;
+  retryCount: number;
+  timestamp: string;
+  meetingNotes: MeetingNote[];
+  fileChanges: FileChangeEntry[];
+  files: Record<string, TraceFileSummary>;
+  timeline: TraceTimelineEntry[];
+  checkpoints: TraceCheckpoint[];
+  lastFailure: {
+    node?: string;
+    summary?: string;
+  };
+}
+
+/**
  * 全局状态定义
  */
 export const JimClawState = Annotation.Root({
@@ -355,6 +412,33 @@ export const JimClawState = Annotation.Root({
   }),
   allocatedHostPort: Annotation<number | null>({
     reducer: (x, y) => y ?? x,
+  }),
+  envReady: Annotation<boolean | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  blockedReason: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  resumeFromNode: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  recoveredEnvironment: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  lastFailedNode: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  lastFailureSummary: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  failureFingerprint: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  sameFailureCount: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+  }),
+  repairLedger: Annotation<RepairLedgerEntry[]>({
+    reducer: (x, y) => [...(x || []), ...(y || [])],
   }),
   consensusCore: Annotation<ConsensusCore | null>({
     reducer: (x, y) => y ?? x,

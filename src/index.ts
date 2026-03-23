@@ -1,5 +1,6 @@
 import { Team } from "./agents/team";
 import { createJimClawGraph } from "./core/graph";
+import { loadCheckpointSnapshot, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -27,6 +28,30 @@ async function main() {
   // 改进 7：支持 --clean flag 仅清理不跑任务
   if (process.argv[2] === "--clean") {
     await cleanWorkspace();
+    return;
+  }
+
+  if (process.argv[2] === "--replay") {
+    const workspacePath = process.argv[3];
+    const checkpointId = process.argv[4];
+    if (!workspacePath || !checkpointId) {
+      throw new Error("用法: npx ts-node src/index.ts --replay <workspacePath> <checkpointId>");
+    }
+
+    const snapshot = await loadCheckpointSnapshot(workspacePath, checkpointId);
+    const replayState = prepareReplayStateFromCheckpoint(snapshot);
+
+    console.log(`🚀 Starting JimClaw Replay Session from ${checkpointId}`);
+    console.log(`Resume Path: ${snapshot.node} -> ${replayState.resumeFromNode}`);
+
+    const app = await createJimClawGraph(Team, undefined, {
+      workspacePath,
+      traceId: snapshot.traceId,
+    });
+    const finalState = await app.invoke(replayState, { recursionLimit: 500 });
+
+    console.log(`\n--- Replay Session Completed ---`);
+    console.log("Final Code Content:", finalState.code);
     return;
   }
 

@@ -3,8 +3,32 @@ import { exec } from "child_process";
 import { promisify } from "util";
 import { Skill } from "../core/skill";
 import * as path from "path";
+import * as fs from "fs/promises";
 
 const execAsync = promisify(exec);
+
+async function fileExists(p: string): Promise<boolean> {
+  try {
+    await fs.access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function findNearestPackageRoot(startFilePath: string): Promise<string | null> {
+  let dir = path.dirname(path.resolve(startFilePath));
+  while (true) {
+    if (await fileExists(path.join(dir, "package.json"))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+function isDependencyMissingError(message: string): boolean {
+  return /TS2307: Cannot find module|Cannot find module|Cannot find name 'jest'|TS2582: Cannot find name 'describe'|TS2503: Cannot find namespace 'jest'/i.test(message);
+}
 
 /**
  * 检测 Node.js HTTP 服务器中的常见作用域错误
@@ -108,11 +132,22 @@ export const LSPDiagnoseSkill = new Skill({
         case ".ts":
         case ".tsx":
           // 优先尝试 tsc (非交互式，广泛存在)
+          {
+            const packageRoot = await findNearestPackageRoot(file_path);
+            const hasNodeModules = packageRoot ? await fileExists(path.join(packageRoot, "node_modules")) : false;
+            if (packageRoot && !hasNodeModules) {
+              return "[WARNING] 依赖尚未安装（node_modules 缺失），跳过 TypeScript 类型诊断。请先执行 npm install。";
+            }
+          }
           try {
-            await execAsync(`npx tsc ${file_path} --noEmit --esModuleInterop --skipLibCheck`);
+            await execAsync(`npx tsc ${JSON.stringify(file_path)} --noEmit --esModuleInterop --skipLibCheck`);
             return "[SUCCESS] No TypeScript errors found.";
           } catch (e: any) {
-            return `[ERROR] TypeScript Error:\n${e.stdout || e.message}`;
+            const out = String(e.stdout || e.stderr || e.message || "");
+            if (isDependencyMissingError(out)) {
+              return `[WARNING] 检测到依赖缺失导致的类型错误，已降级为环境告警：\n${out}`;
+            }
+            return `[ERROR] TypeScript Error:\n${out}`;
           }
 
         case ".js":
@@ -127,8 +162,8 @@ export const LSPDiagnoseSkill = new Skill({
 
           // 2. Node.js HTTP 服务器特定错误检测
           // 检测 createServer/get/post 等回调外部的 req/res 引用
-          const jsContent = await execAsync(`cat ${file_path}`);
-          const scopeError = detectHttpServerScopeErrors(jsContent.stdout, file_path);
+          const jsContent = await fs.readFile(file_path, "utf-8");
+          const scopeError = detectHttpServerScopeErrors(jsContent, file_path);
           if (scopeError) {
             return `[ERROR] HTTP Server 作用域错误:\n${scopeError}`;
           }

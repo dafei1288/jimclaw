@@ -118,3 +118,39 @@
 - [ ] 并行子任务：多个 Coder 子进程并行处理独立文件
 - [ ] 多 workspace 会话管理：Web 端支持同时追踪多个任务
 - [ ] 测试套件：为核心 graph 逻辑补充单元测试
+
+---
+
+## 当前实施优先级（2026-03-23 调整）
+
+> 阶段 4 后续默认按下面顺序推进，先补执行完整性和状态追踪，再做并行与前端扩展。
+
+### P0 执行完整性与回归测试
+- [ ] 核心 graph / node 回归测试继续补齐，覆盖中断、重试、仲裁、持久化
+- [ ] 失败 run 产物标准化：最后失败节点、失败摘要、兜底纪要、关键快照
+- [ ] 关键生成结果增加编译/语法/契约三类保底校验
+
+### P1 状态追踪增强与回放基础
+- [~] 任务溯源图谱所需的状态快照索引、节点事件索引、文件变更索引
+  - 已落地 `trace-index.json` 基线，包含最后节点、会议纪要索引、文件变更索引、失败摘要
+- [~] 分支回溯所需的成功节点锚点、状态恢复入口、最小回放能力
+  - 已落地 `checkpoints/` 成功节点锚点基线，当前覆盖 `orchestrator` / `coder_final` / `verifier` / `qa` / `deploy`
+  - 已落地 checkpoint replay 预览入口：可列出 checkpoint，并返回清洗后的恢复态预览
+  - 已落地 CLI 续跑入口：`--replay <workspacePath> <checkpointId>`
+  - 已落地 replay workspace 续写：CLI / Web 续跑复用原 workspace 与 trace 上下文，不再新建新的 `run_*`
+- [~] 核心 graph 状态与持久化一致性测试
+  - 已补 workspace 产物一致性校验器，当前覆盖 `boulder.json / trace-index.json / checkpoints` 的 trace、最后节点、round 对齐
+  - 已补 `subTasks` 与 `trace-index.files` 联动校验，能拦截 completed/failed 状态与文件最后写入状态不一致
+  - 已补 replay 产物一致性回归测试，能拦截 checkpoint trace drift
+  - 已补 `lint_fix` 工具链失败分级：`prettier` 安装/网络失败降级为环境告警，解析错误仍阻塞
+  - 已补 `coder` 依赖顺序约束：只执行依赖已完成的文件任务，避免跨文件契约漂移
+
+### P2 编排能力增强
+- [ ] 容器资源配额改为从 config 配置，而不是固定参数
+- [ ] 并行子任务：多个 Coder 子进程并行处理独立文件
+- [ ] 多 workspace 会话管理：Web 端支持同时追踪多个任务
+
+### P3 前端生态扩展
+- [ ] 现代前端框架支持（Vue 3 / React / Svelte）
+- [ ] 前端组件级单元测试（Testing Library）
+- [ ] 前端 E2E 测试与后端集成（Playwright 跨服务）
