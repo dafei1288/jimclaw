@@ -24,6 +24,13 @@ async function cleanWorkspace() {
   }
 }
 
+export function computeSessionExitCode(finalState: any): number {
+  const deploymentFailed = finalState?.deploymentStatus?.status === "failed";
+  const hasRecordedFailure = Boolean(finalState?.lastFailedNode || finalState?.lastFailureSummary);
+  const incomplete = finalState?.isDone === false && deploymentFailed;
+  return deploymentFailed || hasRecordedFailure || incomplete ? 1 : 0;
+}
+
 async function main() {
   // 改进 7：支持 --clean flag 仅清理不跑任务
   if (process.argv[2] === "--clean") {
@@ -52,6 +59,7 @@ async function main() {
 
     console.log(`\n--- Replay Session Completed ---`);
     console.log("Final Code Content:", finalState.code);
+    process.exitCode = computeSessionExitCode(finalState);
     return;
   }
 
@@ -85,6 +93,12 @@ async function main() {
   finalState.teamChatLog.forEach((log: any) => {
     console.log(`[${log.sender}]: ${log.content}`);
   });
+  process.exitCode = computeSessionExitCode(finalState);
 }
 
-main().catch(console.error);
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}

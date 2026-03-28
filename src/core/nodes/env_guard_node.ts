@@ -1,8 +1,9 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, RepairLedgerEntry } from "../graph_types";
+import { JimClawState, RepairLedgerEntry, ConsensusProgress } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
+import { getDeterministicTemplateScaffold } from "../logic_utils";
 
 function isNodeLikeProject(language?: string): boolean {
   const lang = String(language || "").toLowerCase();
@@ -52,6 +53,72 @@ async function normalizePackageJson(workspace: string): Promise<{ changed: boole
   return { changed, actions };
 }
 
+async function ensureBootstrapScaffold(
+  workspace: string,
+  state: JimClawState
+): Promise<{
+  changed: boolean;
+  code?: string;
+  subTasks?: JimClawState["subTasks"];
+  consensusProgress?: ConsensusProgress;
+  actions: string[];
+}> {
+  const bootstrapTargets = ["package.json", "tsconfig.json", "jest.config.cjs", "tests/setup.test.ts"];
+  const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
+  const subTasks = [...(state.subTasks || [])];
+  const actions: string[] = [];
+  let changed = false;
+
+  for (const fileTarget of bootstrapTargets) {
+    const deterministicContent = getDeterministicTemplateScaffold(state, fileTarget);
+    if (!deterministicContent) continue;
+
+    const absolutePath = path.join(workspace, fileTarget);
+    let fileExists = true;
+    try {
+      await fs.access(absolutePath);
+    } catch {
+      fileExists = false;
+    }
+
+    if (!fileExists) {
+      await fs.mkdir(path.dirname(absolutePath), { recursive: true });
+      await fs.writeFile(absolutePath, deterministicContent, "utf-8");
+      filesContent[fileTarget] = deterministicContent;
+      const relatedTask = subTasks.find((task) => task.fileTarget === fileTarget);
+      if (relatedTask) {
+        relatedTask.status = "completed";
+        delete relatedTask.lastError;
+      }
+      actions.push(`写入模板骨架 ${fileTarget}`);
+      changed = true;
+    } else if (filesContent[fileTarget] === undefined) {
+      const existing = await fs.readFile(absolutePath, "utf-8");
+      filesContent[fileTarget] = existing;
+      changed = true;
+    }
+  }
+
+  if (!changed) {
+    return { changed: false, actions };
+  }
+
+  const completedFiles = subTasks.filter((task) => task.status === "completed").map((task) => task.fileTarget);
+  const pendingFiles = subTasks.filter((task) => task.status !== "completed").map((task) => task.fileTarget);
+  return {
+    changed: true,
+    code: JSON.stringify(filesContent, null, 2),
+    subTasks,
+    consensusProgress: {
+      completedFiles,
+      pendingFiles,
+      currentRound: state.retryCount || 0,
+      openIssues: state.consensusProgress?.openIssues || [],
+    },
+    actions,
+  };
+}
+
 /**
  * Env Guard 节点：在 infra 前做环境预检与确定性修复，避免环境问题进入 coder 自旋
  */
@@ -74,13 +141,29 @@ export async function envGuardNode(
   }
 
   const pkgPath = path.join(WORKSPACE, "package.json");
+  let bootstrapPatch: Partial<JimClawState> = {};
+  try {
+    await fs.access(pkgPath);
+  } catch {
+    const bootstrap = await ensureBootstrapScaffold(WORKSPACE, state);
+    if (bootstrap.changed) {
+      bootstrapPatch = {
+        code: bootstrap.code,
+        subTasks: bootstrap.subTasks,
+        consensusProgress: bootstrap.consensusProgress,
+      };
+      ledger.push({ round, phase: "env_guard", action: bootstrap.actions.join("；"), result: "success" });
+      await AuditLogger.log(WORKSPACE, "Environment", `### [Env Guard Bootstrap]\n\n**Action:** ${bootstrap.actions.join("；")}`);
+    }
+  }
+
   try {
     await fs.access(pkgPath);
   } catch {
     const reason = "[EnvGuard] 缺少 package.json，无法安装依赖。";
     ledger.push({ round, phase: "env_guard", action: "检查 package.json", result: "failed" });
-    await saveBoulder({ ...state, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_missing_pkg");
-    return { envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
+    await saveBoulder({ ...state, ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_missing_pkg");
+    return { ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
   }
 
   try {
@@ -107,19 +190,18 @@ export async function envGuardNode(
     if (toolFailed(installOut)) {
       const reason = `[EnvGuard] 依赖安装失败：\n${truncateForLog(installOut, 800)}`;
       ledger.push({ round, phase: "env_guard", action: "npm install --silent", result: "failed" });
-      await saveBoulder({ ...state, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_install_failed");
-      return { envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
+      await saveBoulder({ ...state, ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_install_failed");
+      return { ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
     }
 
     ledger.push({ round, phase: "env_guard", action: "npm install --silent", result: "success" });
-    const result = { envReady: true, blockedReason: "", recoveredEnvironment: false, repairLedger: ledger };
+    const result = { ...bootstrapPatch, envReady: true, blockedReason: "", recoveredEnvironment: false, repairLedger: ledger };
     await saveBoulder({ ...state, ...result }, "env_guard_ready");
     return result;
   } catch (e: any) {
     const reason = `[EnvGuard] 环境预检异常：${e.message || e}`;
     ledger.push({ round, phase: "env_guard", action: "环境预检", result: "failed" });
-    await saveBoulder({ ...state, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_exception");
-    return { envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
+    await saveBoulder({ ...state, ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger }, "env_guard_exception");
+    return { ...bootstrapPatch, envReady: false, blockedReason: reason, repairLedger: ledger, testResults: `${state.testResults || ""}\n${reason}`.trim() };
   }
 }
-

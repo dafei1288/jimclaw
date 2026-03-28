@@ -1,0 +1,234 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const fs = require("fs/promises");
+const path = require("path");
+const {
+  createTempWorkspace,
+  removeTempWorkspace,
+  createBaseState,
+  createNoopEmit,
+  createNoopStartSpan,
+  createSnapshotRecorder,
+} = require("./test-helpers");
+const { architectNode } = require("../../src/core/nodes/architect_node");
+
+function createArchitectAgent(responses) {
+  let index = 0;
+  return {
+    getPersona() {
+      return { name: "测试架构师" };
+    },
+    async chat() {
+      const content = responses[Math.min(index, responses.length - 1)];
+      index += 1;
+      return { content };
+    },
+  };
+}
+
+test("architect emits technology decision on covered plan", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    contract: {
+      title: "电器销售系统",
+      requirements: ["需要前后端页面和后端 API"],
+      acceptanceCriteria: ["用户可以在前端管理商品"],
+    },
+  });
+  const agent = createArchitectAgent([
+    JSON.stringify({
+      spec: {
+        architecture: "Express 全栈单体",
+        language: "TypeScript",
+        framework: "Express.js ^4.18",
+        testCommand: "npm test",
+        runCommand: "npm start",
+        entryPoint: "src/index.ts",
+        filesToCreate: [
+          "package.json",
+          "tsconfig.json",
+          "src/index.ts",
+          "src/routes/products.ts",
+          "public/index.html",
+          "tests/products.test.ts",
+        ],
+        interfaces: "REST API",
+        dependencies: { express: "^4.18.2" },
+        devDependencies: { typescript: "^5.0.0", jest: "^29.7.0", "ts-jest": "^29.1.1" },
+      },
+      manifest: {
+        services: [{ name: "api", port: 10000, description: "api" }],
+        environment: {},
+        sharedConfig: {},
+      },
+      apiContract: {
+        endpoints: [{ path: "/api/products", method: "GET", description: "商品列表" }],
+      },
+    }),
+    "# README",
+  ]);
+
+  try {
+    const result = await architectNode(
+      state,
+      { architect: agent },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.technologyDecision.backend.framework, "express-typescript");
+    assert.equal(result.validationReport.status, "pass");
+    assert.equal(result.solutionProtocol.coverage.coverageMatrix.length > 0, true);
+    const specJson = JSON.parse(await fs.readFile(path.join(workspace, "spec.json"), "utf-8"));
+    assert.equal(specJson.entryPoint, "src/index.ts");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("architect backfills missing backend coverage from frontend-backend requirement baseline", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    contract: {
+      title: "电器销售系统",
+      requirements: ["需要前后端页面和后端 API"],
+      acceptanceCriteria: ["用户可以在前端管理商品"],
+    },
+  });
+  const agent = createArchitectAgent([
+    JSON.stringify({
+      spec: {
+        architecture: "只有静态页面",
+        language: "TypeScript",
+        framework: "Express.js ^4.18",
+        testCommand: "npm test",
+        runCommand: "npm start",
+        entryPoint: "src/index.ts",
+        filesToCreate: ["package.json", "public/index.html"],
+        interfaces: "REST API",
+        dependencies: { express: "^4.18.2" },
+        devDependencies: { typescript: "^5.0.0" },
+      },
+      manifest: {
+        services: [{ name: "api", port: 10000, description: "api" }],
+        environment: {},
+        sharedConfig: {},
+      },
+      apiContract: {
+        endpoints: [],
+      },
+    }),
+    "# README",
+  ]);
+
+  try {
+    const result = await architectNode(
+      state,
+      { architect: agent },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+    assert.equal(result.validationReport.status, "pass");
+    assert.equal(result.spec.filesToCreate.some((file) => /^src\/routes\/.+\.ts$/i.test(file)), true);
+    assert.equal(result.spec.filesToCreate.some((file) => /^src\/controllers\/.+controller\.ts$/i.test(file)), true);
+    assert.equal(result.spec.filesToCreate.some((file) => /^src\/services\/.+service\.ts$/i.test(file)), true);
+    assert.equal(result.spec.filesToCreate.some((file) => /^src\/models\/.+\.ts$/i.test(file)), true);
+    assert.equal(recorder.snapshots.length > 0, true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("architect enriches heavy full-stack requirements into executable backend and ops skeleton", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    contract: {
+      title: "电器销售系统",
+      requirements: [
+        "需要前后端页面和后端 API",
+        "支持商品列表、添加商品、编辑商品、删除商品",
+        "需要登录认证和权限控制",
+        "需要记录操作审计日志",
+        "需要 Docker 部署和验证脚本",
+      ],
+      acceptanceCriteria: [
+        "用户可以在前端管理商品",
+        "后端需要提供商品 CRUD 接口",
+        "未登录用户不能访问受保护接口",
+        "系统需要输出结构化日志",
+      ],
+    },
+  });
+  const agent = createArchitectAgent([
+    JSON.stringify({
+      spec: {
+        architecture: "Express 全栈单体",
+        language: "TypeScript",
+        framework: "Express.js ^4.18",
+        testCommand: "npm test",
+        runCommand: "npm start",
+        entryPoint: "src/index.ts",
+        filesToCreate: [
+          "package.json",
+          "tsconfig.json",
+          "src/index.ts",
+          "public/index.html",
+        ],
+        interfaces: "REST API",
+        dependencies: { express: "^4.18.2" },
+        devDependencies: { typescript: "^5.0.0", jest: "^29.7.0", "ts-jest": "^29.1.1" },
+      },
+      manifest: {
+        services: [{ name: "api", port: 10000, description: "api" }],
+        environment: {},
+        sharedConfig: {},
+      },
+      apiContract: {
+        endpoints: [
+          { path: "/api/products", method: "GET", description: "商品列表" },
+        ],
+      },
+    }),
+    "# README",
+  ]);
+
+  try {
+    const result = await architectNode(
+      state,
+      { architect: agent },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const files = result.spec.filesToCreate;
+    assert.equal(result.validationReport.status, "pass");
+    assert.equal(files.includes("src/routes/products.ts"), true);
+    assert.equal(files.includes("src/controllers/productController.ts"), true);
+    assert.equal(files.includes("src/services/productService.ts"), true);
+    assert.equal(files.includes("src/models/product.ts"), true);
+    assert.equal(files.includes("src/middleware/auth.ts"), true);
+    assert.equal(files.includes("src/logging/logger.ts"), true);
+    assert.equal(files.includes("scripts/verify.ps1"), true);
+    assert.equal(files.includes("Dockerfile"), true);
+    assert.equal(files.includes("docker-compose.yml"), true);
+    assert.equal(
+      result.apiContract.endpoints.some((endpoint) => endpoint.path === "/api/products" && endpoint.method === "POST"),
+      true
+    );
+    assert.equal(
+      result.apiContract.endpoints.some((endpoint) => endpoint.path === "/api/auth/login" && endpoint.method === "POST"),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});

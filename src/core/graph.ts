@@ -6,7 +6,8 @@ import { ModelManager } from "../utils/models";
 import { JimClawState } from "./graph_types";
 import { getBeijingTime } from "../utils/common";
 import { getTemplateEngine } from "./template_engine";
-import { buildCheckpointMeta, buildTraceIndex, recordNodeFailure, shouldPersistCheckpoint } from "./logic_utils";
+import { buildCheckpointMeta, buildTraceIndex, extractFailureEvidence, recordNodeFailure, recoverWorkspaceFromWriteIntents, shouldPersistCheckpoint } from "./logic_utils";
+import { AuditLogger } from "../utils/audit";
 
 // 导入重构后的节点函数
 import { pmNode } from "./nodes/pm_node";
@@ -30,6 +31,12 @@ function logPrefix(agentName: string = "System"): string {
   return `[${getBeijingTime()}] [${agentName}]`;
 }
 
+function shouldRequireApproval(state: JimClawState, stage: "requirements" | "solution" | "deploy", onEvent?: Function) {
+  if (!onEvent) return false;
+  const checkpoint = state.customerApprovalState?.checkpoints?.find((item) => item.stage === stage);
+  return Boolean(checkpoint?.required) && !checkpoint?.approved;
+}
+
 export async function createJimClawGraph(agents: {
   pm: BaseAgent;
   architect: BaseAgent;
@@ -51,10 +58,22 @@ export async function createJimClawGraph(agents: {
   const spanStartTimes: Record<string, number> = {};
 
   const emit = (type: string, sender: string, content: string, metadata?: any) => {
+    const timestamp = getBeijingTime();
+    const traceMetadata = {
+      ...metadata,
+      traceId,
+      spanId: currentSpanId,
+      timestamp,
+      durationMs: currentSpanId && spanStartTimes[currentSpanId] ? (Date.now() - spanStartTimes[currentSpanId]) : undefined
+    };
+    void AuditLogger.recordStructuredEvent(WORKSPACE, {
+      type,
+      sender,
+      content,
+      timestamp,
+      metadata: traceMetadata,
+    });
     if (onEvent) {
-      const timestamp = getBeijingTime();
-      const traceMetadata = { ...metadata, traceId, spanId: currentSpanId, timestamp, 
-        durationMs: currentSpanId && spanStartTimes[currentSpanId] ? (Date.now() - spanStartTimes[currentSpanId]) : undefined };
       onEvent({ type, sender, content: `[${timestamp}] ${content}`, metadata: traceMetadata });
     }
   };
@@ -84,7 +103,8 @@ export async function createJimClawGraph(agents: {
         checkpoints = [...checkpoints.filter((item: any) => item.id !== checkpoint.id), checkpoint];
       }
 
-      const traceIndex = buildTraceIndex(snapshotState, nodeName, traceId, timestamp, checkpoints);
+      const tokenUsage = await AuditLogger.loadTokenUsageSummary(WORKSPACE);
+      const traceIndex = buildTraceIndex(snapshotState, nodeName, traceId, timestamp, checkpoints, tokenUsage);
       await fs.writeFile(path.join(WORKSPACE, "trace-index.json"), JSON.stringify(traceIndex, null, 2));
       console.log(`${logPrefix()} [Persistence] ✓ 状态已保存至 boulder.json (${nodeName})`);
     } catch (e) { console.warn(`${logPrefix()} [Persistence] ⚠ 状态保存失败: ${e}`); }
@@ -114,6 +134,28 @@ export async function createJimClawGraph(agents: {
   };
 
   await fs.mkdir(WORKSPACE, { recursive: true });
+  await recoverWorkspaceFromWriteIntents(WORKSPACE);
+
+  const registerSignalRecovery = (signal: NodeJS.Signals) => {
+    process.once(signal, () => {
+      void (async () => {
+        try {
+          const recovered = await recoverWorkspaceFromWriteIntents(WORKSPACE);
+          if (recovered.recovered > 0) {
+            console.warn(`${logPrefix()} [Recovery] ${signal} 前已回放 ${recovered.recovered} 个中断写入`);
+          }
+        } catch (error) {
+          console.warn(`${logPrefix()} [Recovery] ${signal} 回放中断写入失败: ${error}`);
+        } finally {
+          process.exit(1);
+        }
+      })();
+    });
+  };
+
+  registerSignalRecovery("SIGINT");
+  registerSignalRecovery("SIGTERM");
+
   emit("workspace-ready", "System", WORKSPACE, { workspacePath: WORKSPACE });
 
   const workflow = new StateGraph(JimClawState)
@@ -156,21 +198,36 @@ export async function createJimClawGraph(agents: {
     architect_mediation: "architect_mediation",
     fix_plan: "fix_plan",
   });
-  workflow.addEdge("pm", "architect");
-  workflow.addEdge("architect", "contract_sync");
-  workflow.addConditionalEdges("contract_sync", () => onEvent ? "approval" : "orchestrator", { approval: "approval", orchestrator: "orchestrator" });
-  workflow.addEdge("approval", "orchestrator");
-  workflow.addEdge("orchestrator", "coder");
-  // coder 有 pending 任务时继续循环自身，全部完成后进入环境闸门
-  // 避免 MAX_TASKS_PER_RUN 分批写文件期间反复触发 Docker 构建
+  workflow.addConditionalEdges("pm", (s) => {
+    if (shouldRequireApproval(s, "requirements", onEvent)) return "approval";
+    return "architect";
+  }, { approval: "approval", architect: "architect" });
+  workflow.addConditionalEdges("architect", (s) => {
+    if (shouldRequireApproval(s, "solution", onEvent)) return "approval";
+    return "contract_sync";
+  }, { approval: "approval", contract_sync: "contract_sync" });
+  workflow.addEdge("contract_sync", "orchestrator");
+  workflow.addConditionalEdges("approval", (s) => s.approvalNextNode || "orchestrator", {
+    architect: "architect",
+    contract_sync: "contract_sync",
+    orchestrator: "orchestrator",
+    deploy: "deploy",
+  });
+  workflow.addEdge("orchestrator", "env_guard");
+  // coder 有 pending 任务时继续循环自身，全部完成后进入 infra。
+  // 若环境尚未准备好，则先回到 env_guard。
   workflow.addConditionalEdges("coder", (s) => {
+    if (s.blockedReason) return "qa";
     const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
-    return hasPending ? "coder" : "env_guard";
-  }, { coder: "coder", env_guard: "env_guard" });
+    if (hasPending) return "coder";
+    return s.envReady === false ? "env_guard" : "infra_setup";
+  }, { coder: "coder", env_guard: "env_guard", infra_setup: "infra_setup", qa: "qa" });
 
   workflow.addConditionalEdges("env_guard", (s) => {
-    return s.envReady === false ? "qa" : "infra_setup";
-  }, { qa: "qa", infra_setup: "infra_setup" });
+    if (s.envReady === false) return "qa";
+    const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
+    return hasPending ? "coder" : "infra_setup";
+  }, { qa: "qa", coder: "coder", infra_setup: "infra_setup" });
   workflow.addEdge("infra_setup", "terminal");
   workflow.addEdge("terminal", "verifier");
 
@@ -186,7 +243,17 @@ export async function createJimClawGraph(agents: {
   }, { coder: "coder", qa: "qa" });
 
   workflow.addConditionalEdges("qa", (s) => {
-    if (s.isDone) return "deploy";
+    const openIssues = (s.issueTracker || []).filter((issue: any) => issue.status === "open");
+    const blockingProtocolFailures = (s.protocolFailures || []).filter((failure: any) => failure?.blocking);
+    const failureEvidence = extractFailureEvidence(s.testResults || "", s.deploymentStatus, s.blockedReason);
+    const failureType = s.validationReport?.failureType;
+    if (s.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
+      if (shouldRequireApproval(s, "deploy", onEvent)) return "approval";
+      return "deploy";
+    }
+    if (failureType === "planning_gap") return "architect";
+    if (failureType === "environment_gap") return "env_guard";
+    if (failureType === "runtime_gap") return "infra_setup";
     if (s.recoveredEnvironment) return "infra_setup";
     if ((s.sameFailureCount || 0) >= 2) return "post_mortem";
     if (s.retryCount >= maxRetries) return "post_mortem";
@@ -200,7 +267,10 @@ export async function createJimClawGraph(agents: {
     // 其他情况：先走 QA-Coder 协商，确认修复方向后再实现
     return "fix_plan";
   }, {
+    approval: "approval",
     deploy: "deploy",
+    architect: "architect",
+    env_guard: "env_guard",
     infra_setup: "infra_setup",
     post_mortem: "post_mortem",
     architect_mediation: "architect_mediation",
@@ -209,8 +279,18 @@ export async function createJimClawGraph(agents: {
 
   // 仲裁完直接去 coder（仲裁指令已够精确）
   workflow.addEdge("architect_mediation", "coder");
-  // fix_plan 协商完去 coder 实现
-  workflow.addEdge("fix_plan", "coder");
+  workflow.addConditionalEdges("fix_plan", (s) => {
+    const repairType = s.repairPlan?.repairType;
+    if (repairType === "planning") return "architect";
+    if (repairType === "environment") return "env_guard";
+    if (repairType === "runtime") return "infra_setup";
+    return "coder";
+  }, {
+    architect: "architect",
+    env_guard: "env_guard",
+    infra_setup: "infra_setup",
+    coder: "coder",
+  });
   workflow.addEdge("deploy", "post_mortem");
   workflow.addEdge("post_mortem", "persistence");
   workflow.addEdge("persistence", END);

@@ -7,6 +7,7 @@ import { buildReplayStateFromSnapshot, loadCheckpointSnapshot, loadTraceIndex, p
 import { ModelManager } from "./utils/models";
 import path from "path";
 import * as fs from "fs/promises";
+import { AuditLogger } from "./utils/audit";
 
 const app = express();
 const httpServer = createServer(app);
@@ -16,7 +17,46 @@ const io = new Server(httpServer, {
   },
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3111;
+
+function createEmptyTokenUsage() {
+  return {
+    calls: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    totalTokens: 0,
+    byAgent: {},
+  };
+}
+
+function createEmptyProtocolMetrics() {
+  return {
+    failureCount: 0,
+    patchCount: 0,
+    blockingCount: 0,
+  };
+}
+
+function buildProgressMetrics(subTasks: any[] = []) {
+  const total = subTasks.length;
+  const completed = subTasks.filter((task) => task.status === "completed").length;
+  const failed = subTasks.filter((task) => task.status === "failed").length;
+  const pending = Math.max(0, total - completed - failed);
+  const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
+  return { total, completed, failed, pending, percent };
+}
+
+async function loadWorkspaceMetrics(workspacePath?: string | null, subTasks: any[] = []) {
+  const tokenUsage = workspacePath
+    ? await AuditLogger.loadTokenUsageSummary(workspacePath)
+    : createEmptyTokenUsage();
+
+  return {
+    tokenUsage,
+    progress: buildProgressMetrics(subTasks),
+    protocol: createEmptyProtocolMetrics(),
+  };
+}
 
 function getModelName(model: any): string {
   try {
@@ -95,6 +135,8 @@ let currentSession: any = {
   currentPhase: "idle",
   phaseData: {}, // { requirement: { startTime, duration, status } }
   currentNode: "-",
+  containerId: "",
+  allocatedHostPort: null,
   retryCount: 0,
   maxRetries: ModelManager.getGlobalConfig()?.maxRetries ?? 5, // 初始即使用配置
   logs: [],
@@ -109,6 +151,17 @@ let currentSession: any = {
   meetingNotes: [],
   lastFailedNode: "",
   lastFailureSummary: "",
+  executionProtocol: null,
+  protocolFailures: [],
+  protocolPatches: [],
+  customerApprovalState: null,
+  pendingApprovalStage: null,
+  approvalNextNode: "",
+  metrics: {
+    tokenUsage: createEmptyTokenUsage(),
+    progress: buildProgressMetrics([]),
+    protocol: createEmptyProtocolMetrics(),
+  },
   team: [], // 初始为空，由下方初始化
 };
 
@@ -146,6 +199,12 @@ io.on("connection", (socket) => {
     projectBrief: [],
     codeLog: [],
     packageJsonHash: "",
+    executionProtocol: null,
+    protocolFailures: [],
+    protocolPatches: [],
+    customerApprovalState: null,
+    pendingApprovalStage: null,
+    approvalNextNode: "",
   });
 
   const runGraphSession = async (
@@ -157,10 +216,15 @@ io.on("connection", (socket) => {
     let trackedContainerId: string | null = null;
     try {
       currentSession = initialSession;
+      currentSession.metrics = await loadWorkspaceMetrics(currentSession.workspacePath, currentSession.subTasks);
 
       const appGraph = await createJimClawGraph(Team, (event) => {
         if (event.type === "workspace-ready") {
           currentSession.workspacePath = event.metadata?.workspacePath || null;
+          void loadWorkspaceMetrics(currentSession.workspacePath, currentSession.subTasks).then((metrics) => {
+            currentSession.metrics = metrics;
+            io.emit("state-update", currentSession);
+          });
           io.emit("workspace-ready", { path: currentSession.workspacePath });
         }
         if (event.type === "phase-change") {
@@ -191,7 +255,11 @@ io.on("connection", (socket) => {
         const nodeName = Object.keys(chunk)[0];
         const stateUpdate = (chunk as any)[nodeName];
 
-        if (stateUpdate.containerId) trackedContainerId = stateUpdate.containerId;
+        if (stateUpdate.containerId) {
+          trackedContainerId = stateUpdate.containerId;
+          currentSession.containerId = stateUpdate.containerId;
+        }
+        if (stateUpdate.allocatedHostPort !== undefined) currentSession.allocatedHostPort = stateUpdate.allocatedHostPort;
 
         currentSession.currentNode = nodeName;
         if (stateUpdate.teamChatLog) currentSession.logs.push(...stateUpdate.teamChatLog);
@@ -231,6 +299,37 @@ io.on("connection", (socket) => {
         }
         if (stateUpdate.lastFailedNode !== undefined) currentSession.lastFailedNode = stateUpdate.lastFailedNode;
         if (stateUpdate.lastFailureSummary !== undefined) currentSession.lastFailureSummary = stateUpdate.lastFailureSummary;
+        if (stateUpdate.executionProtocol !== undefined) currentSession.executionProtocol = stateUpdate.executionProtocol;
+        if (stateUpdate.protocolFailures !== undefined) currentSession.protocolFailures = stateUpdate.protocolFailures;
+        if (stateUpdate.protocolPatches !== undefined) currentSession.protocolPatches = stateUpdate.protocolPatches;
+        if (stateUpdate.customerApprovalState !== undefined) currentSession.customerApprovalState = stateUpdate.customerApprovalState;
+        if (stateUpdate.pendingApprovalStage !== undefined) currentSession.pendingApprovalStage = stateUpdate.pendingApprovalStage;
+        if (stateUpdate.approvalNextNode !== undefined) currentSession.approvalNextNode = stateUpdate.approvalNextNode;
+        currentSession.metrics = await loadWorkspaceMetrics(currentSession.workspacePath, currentSession.subTasks);
+        currentSession.metrics.protocol = {
+          failureCount: Array.isArray(currentSession.protocolFailures) ? currentSession.protocolFailures.length : 0,
+          patchCount: Array.isArray(currentSession.protocolPatches) ? currentSession.protocolPatches.length : 0,
+          blockingCount: Array.isArray(currentSession.protocolFailures)
+            ? currentSession.protocolFailures.filter((item: any) => item?.blocking).length
+            : 0,
+        };
+        await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+          type: "state-update",
+          sender: "System",
+          content: `node=${nodeName}`,
+          timestamp: new Date().toLocaleString("zh-CN"),
+          metadata: {
+            currentNode: nodeName,
+            retryCount: currentSession.retryCount,
+            status: currentSession.status,
+            deploymentStatus: currentSession.deployment?.status,
+            subTaskCounts: currentSession.metrics.progress,
+            protocolFailureCount: currentSession.metrics.protocol.failureCount,
+            protocolPatchCount: currentSession.metrics.protocol.patchCount,
+            lastFailedNode: currentSession.lastFailedNode || undefined,
+            lastFailureSummary: currentSession.lastFailureSummary || undefined,
+          },
+        });
 
         if (!currentSession.team || currentSession.team.length === 0) {
           currentSession.team = latestTeam;
@@ -260,6 +359,17 @@ io.on("connection", (socket) => {
       }
 
       currentSession.status = "Finished";
+      await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+        type: "task-finished",
+        sender: "System",
+        content: "任务执行完成",
+        timestamp: new Date().toLocaleString("zh-CN"),
+        metadata: {
+          currentNode: currentSession.currentNode,
+          retryCount: currentSession.retryCount,
+          deploymentStatus: currentSession.deployment?.status,
+        },
+      });
       io.emit("task-finished", { success: true });
     } catch (error: any) {
       console.error("[Server] 任务执行失败:", error);
@@ -279,6 +389,16 @@ io.on("connection", (socket) => {
         }
       }
       currentSession.status = "Error";
+      await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+        type: "task-error",
+        sender: "System",
+        content: error.message || "未知错误",
+        timestamp: new Date().toLocaleString("zh-CN"),
+        metadata: {
+          node: currentSession.lastFailedNode || undefined,
+          summary: currentSession.lastFailureSummary || undefined,
+        },
+      });
       io.emit("state-update", currentSession);
       io.emit("task-error", {
         message: error.message,
@@ -325,7 +445,18 @@ io.on("connection", (socket) => {
         meetingNotes: [],
         lastFailedNode: "",
         lastFailureSummary: "",
+        executionProtocol: null,
+        protocolFailures: [],
+        protocolPatches: [],
+        customerApprovalState: null,
+        pendingApprovalStage: null,
+        approvalNextNode: "",
         workspacePath: null,
+        metrics: {
+          tokenUsage: createEmptyTokenUsage(),
+          progress: buildProgressMetrics([]),
+          protocol: createEmptyProtocolMetrics(),
+        },
         team: latestTeam,
       },
       createBaseGraphState(userGoal, globalMaxRetries)
@@ -378,7 +509,14 @@ io.on("connection", (socket) => {
           meetingNotes: replayState.meetingNotes || [],
           lastFailedNode: "",
           lastFailureSummary: "",
+          executionProtocol: replayState.executionProtocol || null,
+          protocolFailures: replayState.protocolFailures || [],
+          protocolPatches: replayState.protocolPatches || [],
+          customerApprovalState: replayState.customerApprovalState || null,
+          pendingApprovalStage: replayState.pendingApprovalStage || null,
+          approvalNextNode: replayState.approvalNextNode || "",
           workspacePath: wsPath,
+          metrics: await loadWorkspaceMetrics(wsPath, replayState.subTasks || []),
           replaySourceCheckpoint: checkpointId,
           team: latestTeam,
         },
@@ -523,6 +661,20 @@ app.get("/api/workspace/checkpoint", async (req, res) => {
   } catch (error: any) {
     res.status(404).json({ error: error.message || String(error) });
   }
+});
+
+app.get("/api/workspace/metrics", async (_req, res) => {
+  const wsPath = currentSession.workspacePath;
+  const metrics = await loadWorkspaceMetrics(wsPath, currentSession.subTasks || []);
+  currentSession.metrics = metrics;
+  res.json({
+    workspacePath: wsPath || null,
+    currentNode: currentSession.currentNode || null,
+    retryCount: currentSession.retryCount || 0,
+    lastFailedNode: currentSession.lastFailedNode || null,
+    lastFailureSummary: currentSession.lastFailureSummary || null,
+    ...metrics,
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────────────

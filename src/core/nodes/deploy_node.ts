@@ -1,8 +1,54 @@
 import { JimClawState } from "../graph_types";
-import { execInContainer } from "../logic_utils";
+import { execInContainer, writeMeetingNote } from "../logic_utils";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
+
+export function buildDeploymentUrls(ip: string, hostPort: string) {
+  return {
+    publicUrl: `http://${ip}:${hostPort}`,
+    healthCheckUrl: `http://127.0.0.1:${hostPort}`,
+  };
+}
+
+export function getHealthCheckPath(state: JimClawState): string {
+  const protocolPath = state.executionProtocol?.runtime?.healthCheckPath;
+  if (protocolPath) return protocolPath;
+  const apiHealthPath = state.apiContract?.endpoints?.find(
+    (item) => item.method?.toUpperCase() === "GET" && /^\/api\/health\/?$/i.test(String(item.path || ""))
+  )?.path;
+  if (apiHealthPath) return apiHealthPath;
+  const healthPath = state.apiContract?.endpoints?.find(
+    (item) => item.method?.toUpperCase() === "GET" && /^\/health\/?$/i.test(String(item.path || ""))
+  )?.path;
+  if (healthPath) return healthPath;
+  return "/";
+}
+
+export function getDeployPreconditionFailure(state: JimClawState): string | null {
+  const currentFailureNode = String(state.lastFailedNode || "");
+  const currentFailureSummary = String(state.lastFailureSummary || "");
+  if (currentFailureNode === "infra_setup") {
+    if (/docker api|docker 守护进程|failed to connect to the docker api/i.test(currentFailureSummary)) {
+      return "Docker 守护进程不可用，禁止继续进入部署验证。";
+    }
+    return currentFailureSummary || "基础设施构建尚未成功，禁止继续进入部署验证。";
+  }
+  if (!state.containerId) {
+    return "未获得可用容器，禁止继续进入部署验证。";
+  }
+  return null;
+}
+
+export function buildDeployLaunchCommand(runCmd: string) {
+  const escapedRunCmd = runCmd.replace(/"/g, '\\"');
+  return [
+    "mkdir -p /tmp/jimclaw",
+    "if [ -f /tmp/jimclaw/server.pid ]; then kill $(cat /tmp/jimclaw/server.pid) 2>/dev/null || true; fi",
+    ": > /tmp/jimclaw/server.log",
+    `nohup sh -c "${escapedRunCmd}" >/tmp/jimclaw/server.log 2>&1 & echo $! >/tmp/jimclaw/server.pid`,
+  ].join("; ");
+}
 
 /**
  * Deploy 节点：负责将应用程序部署到运行环境并验证连通性
@@ -17,6 +63,7 @@ export async function deployNode(
 ) {
   startSpan("deploy");
   emit("phase-change", "System", "deployment");
+  const round = state.retryCount || 0;
   
   // 1. 获取宿主机真实 IP 和端口映射
   const ip = await GetServerIPSkill.config.run({});
@@ -42,16 +89,47 @@ export async function deployNode(
     hostPort = String(targetInternalPort);
   }
   
-  const dynamicUrl = `http://${ip}:${hostPort}`;
+  const { publicUrl, healthCheckUrl } = buildDeploymentUrls(ip, hostPort);
+  const healthCheckPath = getHealthCheckPath(state);
+  const healthCheckTarget = `${healthCheckUrl}${healthCheckPath === "/" ? "" : healthCheckPath}`;
   const runCmd = state.spec?.runCommand || "npm start";
+  const preconditionFailure = getDeployPreconditionFailure(state);
+
+  if (preconditionFailure) {
+    const errorMsg = `[部署前置校验失败] ${preconditionFailure}`;
+    await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Skipped\n${errorMsg}`);
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-deploy-r${round}`,
+      "deploy",
+      round,
+      `Deploy 第${round}轮：前置校验失败`,
+      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：跳过\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
+    );
+    const result = {
+      deploymentStatus: { url: publicUrl, status: "failed" as const },
+      testResults: `${state.testResults || ""}\n${errorMsg}`.trim(),
+      isDone: false,
+      meetingNotes: [note],
+      lastFailedNode: "deploy",
+      lastFailureSummary: errorMsg,
+    };
+    await saveBoulder({ ...state, ...result }, "deploy");
+    return result;
+  }
   
-  await AuditLogger.log(WORKSPACE, "Infrastructure", `### [Deployment Start]\n**URL:** ${dynamicUrl}\n**Command:** ${runCmd}`);
+  await AuditLogger.log(
+    WORKSPACE,
+    "Infrastructure",
+    `### [Deployment Start]\n**Public URL:** ${publicUrl}\n**Health Check URL:** ${healthCheckTarget}\n**Command:** ${runCmd}`
+  );
 
   // 2. 启动服务
-  await execInContainer(state.containerId, runCmd, { background: true });
+  const launchCommand = buildDeployLaunchCommand(runCmd);
+  await execInContainer(state.containerId, launchCommand, { background: true });
 
   // 3. 核心改进：真实连通性校验 (Health Check)
-  emit("thinking", "System", `正在验证服务连通性: ${dynamicUrl} ...`);
+  emit("thinking", "System", `正在验证服务连通性: ${healthCheckTarget} ...`);
   let isAccessible = false;
   let lastError = "";
 
@@ -59,10 +137,11 @@ export async function deployNode(
     try {
       // 在宿主机执行 curl 探测
       const curlOut = await ShellExecuteSkill.config.run({ 
-        command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${dynamicUrl}`,
+        command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${healthCheckTarget}`,
         timeout: 5000
       });
-      if (curlOut.trim() === "200" || curlOut.trim() === "301" || curlOut.trim() === "302" || curlOut.trim() === "404") {
+      const codeMatch = curlOut.match(/\b(200|201|204|301|302|404)\b/);
+      if (codeMatch) {
         isAccessible = true;
         break;
       }
@@ -74,20 +153,40 @@ export async function deployNode(
   }
 
   if (isAccessible) {
-    const msg = `🚀 服务部署成功并已通过连通性校验！访问地址: ${dynamicUrl}`;
+    const msg = `🚀 服务部署成功并已通过连通性校验！访问地址: ${publicUrl}`;
     console.log(`[System] ${msg}`);
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Verified Success`);
-    return { deploymentStatus: { url: dynamicUrl, status: "running" as const } };
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-deploy-r${round}`,
+      "deploy",
+      round,
+      `Deploy 第${round}轮：部署成功`,
+      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：成功\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n`
+    );
+    const result = {
+      deploymentStatus: { url: publicUrl, status: "running" as const },
+      meetingNotes: [note],
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    };
+    await saveBoulder({ ...state, ...result }, "deploy");
+    return result;
   } else {
     // 【终极审计逻辑】：如果不通，深挖容器内部监听状态
     const internalAudit = await ShellExecuteSkill.config.run({ 
       command: `docker exec ${state.containerId} sh -c "netstat -tlnp || ss -tlnp || lsof -i -P -n" 2>/dev/null || echo "无法获取容器内监听状态"` 
     });
     
-    // 抓取容器日志
-    const logs = await ShellExecuteSkill.config.run({ command: `docker logs ${state.containerId} --tail 50` });
+    const processLog = await ShellExecuteSkill.config.run({
+      command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.log 2>/dev/null || true"`,
+    });
+    const pidInfo = await ShellExecuteSkill.config.run({
+      command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.pid 2>/dev/null || true"`,
+    });
+    const logs = await ShellExecuteSkill.config.run({ command: `docker logs ${state.containerId} --tail 200` });
     
-    let diagnosis = `[部署验证失败] 无法访问 ${dynamicUrl}。`;
+    let diagnosis = `[部署验证失败] 无法访问 ${healthCheckTarget}（对外地址 ${publicUrl}）。`;
     if (internalAudit.includes(String(targetInternalPort))) {
       diagnosis += `\n[审计结果]: 容器内部确实在监听端口 ${targetInternalPort}，但外部无法访问。可能是宿主机防火墙、Docker 映射延迟或网络隔离问题。`;
     } else {
@@ -97,14 +196,27 @@ export async function deployNode(
       diagnosis += `\n[决策建议]: Coder 必须检查源码中的 listen() 调用，确保其严格使用了端口 ${targetInternalPort}。`;
     }
 
-    const errorMsg = `${diagnosis}\n[错误信息]: ${lastError}\n[容器运行日志]:\n${logs}`;
+    const errorMsg = `${diagnosis}\n[错误信息]: ${lastError}\n[服务进程PID]:\n${pidInfo}\n[服务启动日志]:\n${processLog}\n[容器运行日志]:\n${logs}`;
     console.error(`[System] ${errorMsg}`);
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Failed Verification\n${errorMsg}`);
-    
-    return { 
-      deploymentStatus: { url: dynamicUrl, status: "failed" as const },
+
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-deploy-r${round}`,
+      "deploy",
+      round,
+      `Deploy 第${round}轮：部署验证失败`,
+      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：失败\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
+    );
+    const result = {
+      deploymentStatus: { url: publicUrl, status: "failed" as const },
       testResults: (state.testResults || "") + "\n" + errorMsg,
-      isDone: false
+      isDone: false,
+      meetingNotes: [note],
+      lastFailedNode: "deploy",
+      lastFailureSummary: diagnosis,
     };
+    await saveBoulder({ ...state, ...result }, "deploy");
+    return result;
   }
 }

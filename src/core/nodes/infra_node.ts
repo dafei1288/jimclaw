@@ -3,7 +3,7 @@ import * as path from "path";
 import { JimClawState } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
-import { execInContainer } from "../logic_utils";
+import { execInContainer, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
 
 /**
@@ -14,6 +14,51 @@ import { AuditLogger } from "../../utils/audit";
 function parseSkillOutput(raw: string): string {
   const match = raw.match(/^(?:Command failed[^\n]*\n)?Output:\n([\s\S]*?)(?:\nErrors:|$)/);
   return match ? match[1].trim() : raw.trim();
+}
+
+export function rewriteComposePortBindings(composeContent: string, hostPort: number, containerPort: number): string {
+  const portRegex = /(\s+-\s*["']?)(\d+):(\d+)(["']?)/g;
+  return composeContent.replace(portRegex, (_match, prefix, _host, _container, suffix) => {
+    return `${prefix}${hostPort}:${containerPort}${suffix}`;
+  });
+}
+
+export function extractComposePrimaryServiceName(composeContent: string): string | null {
+  const lines = composeContent.split(/\r?\n/);
+  let inServices = false;
+
+  for (const line of lines) {
+    if (!inServices) {
+      if (/^\s*services:\s*$/.test(line)) {
+        inServices = true;
+      }
+      continue;
+    }
+
+    if (/^\S/.test(line) && !/^\s/.test(line)) {
+      break;
+    }
+
+    const match = line.match(/^\s{2}([A-Za-z0-9_-]+):\s*$/);
+    if (match) {
+      return match[1];
+    }
+  }
+
+  return null;
+}
+
+export function hasBuildScript(packageJsonContent: string): boolean {
+  try {
+    const parsed = JSON.parse(packageJsonContent);
+    return Boolean(parsed?.scripts?.build);
+  } catch {
+    return false;
+  }
+}
+
+function isDockerPortConflict(raw: string): boolean {
+  return /port is already allocated|bind .* failed/i.test(raw);
 }
 
 /**
@@ -28,6 +73,7 @@ export async function infraNode(
   saveBoulder: any
 ) {
   startSpan("infra_setup");
+  const round = state.retryCount || 0;
   const lang = state.spec?.language?.toLowerCase() ?? "javascript";
   const image = lang.includes("python") ? "python:3.11-slim" : "node:20-alpine";
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
@@ -59,23 +105,40 @@ export async function infraNode(
   if (hasCompose) {
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Using Docker Compose`);
     
-    // 关键修正：确保 docker-compose.yml 暴露的端口与 manifest 中锁定的端口一致
+    // 关键修正：确保 docker-compose.yml 的宿主机/容器端口映射与运行时口径一致
+    let composeContent = "";
+    let serviceName = "";
     try {
-      let composeContent = await fs.readFile(composePath, "utf-8");
-      const portRegex = /(\s+ports:\s+\n\s+- ["']?)(\d+):(\d+)(["']?)/g;
-      const updatedCompose = composeContent.replace(portRegex, (match, p1, p2, p3, p4) => {
-        // p2 是宿主机端口，p3 是容器内部端口
-        // 强制 p3 为 containerPort
-        return `${p1}${p2}:${containerPort}${p4}`;
-      });
+      composeContent = await fs.readFile(composePath, "utf-8");
+      const updatedCompose = rewriteComposePortBindings(composeContent, hostPort, containerPort);
       if (updatedCompose !== composeContent) {
         await fs.writeFile(composePath, updatedCompose);
-        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Hotfix:** Corrected container port in docker-compose.yml to ${containerPort}`);
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Hotfix:** Corrected docker-compose port mapping to ${hostPort}:${containerPort}`);
+        composeContent = updatedCompose;
       }
+      serviceName = extractComposePrimaryServiceName(composeContent) || "";
     } catch (err) {}
 
+    if (!serviceName) {
+      const errMsg = `[基础设施构建失败] 无法从 docker-compose.yml 解析服务名，无法启动测试容器。`;
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：docker-compose 服务名解析失败`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${errMsg}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
+    }
+
     await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose down 2>/dev/null || true` });
-    const composeOut = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose up -d` });
+    await ShellExecuteSkill.config.run({
+      command: `for /f %i in ('docker ps -aq --filter "status=exited" --filter "name=run_" --filter "name=-${serviceName}-run-"') do @docker rm -f %i`,
+      timeout: 30000,
+    }).catch(() => {});
+    await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose rm -f -s -v 2>nul || exit /b 0` }).catch(() => {});
+    const composeOut = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose build ${serviceName}` });
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Compose Output:**\n${composeOut}`);
 
     // 构建失败（exit code != 0）立即返回，错误写入 testResults 供 QA 分析
@@ -83,19 +146,62 @@ export async function infraNode(
       const errMsg = `[基础设施构建失败] docker-compose 构建错误，请检查 Dockerfile 和 docker-compose.yml：\n${parseSkillOutput(composeOut)}`;
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Failed:** ${errMsg}`);
       console.error(`[System] ${errMsg}`);
-      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort };
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：docker-compose 构建失败`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${errMsg}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
-    
-    // 核心修正：对于 Compose，我们不能盲目使用预设名字。
-    // 因为应用容器必定绑定了我们分配的 hostPort，所以通过 publish 过滤器精准捕获容器 ID
-    await new Promise(r => setTimeout(r, 2000)); // 等待容器就绪
-    const psOut = await ShellExecuteSkill.config.run({ command: `docker ps -q --filter "publish=${hostPort}"` });
-    // ShellExecuteSkill 返回格式为 "Output:\n<内容>" — 必须跳过该前缀行提取真实 ID
-    containerId = parseSkillOutput(psOut).split('\n')[0].trim();
+
+    await AuditLogger.log(
+      WORKSPACE,
+      "Infrastructure",
+      `**Action:** Starting compose test container for service ${serviceName} with idle command`
+    );
+    let runOut = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      runOut = await ShellExecuteSkill.config.run({
+        command: `cd ${WORKSPACE} && docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`,
+        timeout: 60000,
+      });
+
+      if (!isDockerPortConflict(runOut)) {
+        break;
+      }
+
+      hostPort += 1;
+      const updatedCompose = rewriteComposePortBindings(composeContent, hostPort, containerPort);
+      composeContent = updatedCompose;
+      await fs.writeFile(composePath, updatedCompose);
+      await AuditLogger.log(
+        WORKSPACE,
+        "Infrastructure",
+        `**Retry:** 检测到宿主机端口冲突，改用 ${hostPort}:${containerPort} 后重试 compose run`
+      );
+    }
+
+    if (isDockerPortConflict(runOut)) {
+      const errMsg = `[基础设施构建失败] docker-compose run 遇到宿主机端口冲突，连续重试后仍无法绑定端口 ${hostPort}:${containerPort}。`;
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：compose 端口冲突`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${runOut}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
+    }
+
+    containerId = parseSkillOutput(runOut).split("\n")[0].trim();
 
     if (!containerId) {
-      console.warn(`[System] 无法通过端口 ${hostPort} 找到容器，尝试回退到 Compose 默认服务...`);
-      const fallbackPs = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose ps -q | head -n 1` });
+      console.warn(`[System] 无法直接获取 compose run 产生的容器 ID，尝试回退查询服务容器...`);
+      const fallbackPs = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose ps -q ${serviceName}` });
       containerId = parseSkillOutput(fallbackPs).split('\n')[0].trim();
     }
 
@@ -104,35 +210,106 @@ export async function infraNode(
       const errMsg = `[基础设施致命错误] docker-compose 启动后未能找到运行中的容器（端口 ${hostPort}）。\n容器日志：\n${parseSkillOutput(composeLog)}`;
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fatal:** ${errMsg}`);
       console.error(`[System] ${errMsg}`);
-      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort };
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：容器未成功启动`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${errMsg}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
   } else {
     // 3. 安全清理并启动单容器 (带端口映射)
     await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` });
-    const startOut = await ShellExecuteSkill.config.run({
-      command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" -w /app ${image} tail -f /dev/null`,
-      timeout: 60000,
-    });
+    let startOut = "";
+    for (let attempt = 0; attempt < 5; attempt++) {
+      startOut = await ShellExecuteSkill.config.run({
+        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" -w /app ${image} tail -f /dev/null`,
+        timeout: 60000,
+      });
+      if (!isDockerPortConflict(startOut)) {
+        break;
+      }
+      hostPort += 1;
+      await AuditLogger.log(
+        WORKSPACE,
+        "Infrastructure",
+        `**Retry:** 检测到 docker run 宿主机端口冲突，改用 ${hostPort}:${containerPort} 后重试`
+      );
+    }
+    if (isDockerPortConflict(startOut)) {
+      const errMsg = `[基础设施构建失败] docker run 遇到宿主机端口冲突，连续重试后仍无法绑定端口 ${hostPort}:${containerPort}。`;
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：docker 端口冲突`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${startOut}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
+    }
     containerId = startOut.trim().split('\n').pop() || "";
   }
 
   let hasPackageJson = false;
+  let packageJsonContent = "";
   try {
-    await fs.access(path.join(WORKSPACE, "package.json"));
+    packageJsonContent = await fs.readFile(path.join(WORKSPACE, "package.json"), "utf-8");
     hasPackageJson = true;
   } catch {}
 
   try {
     if (hasPackageJson) {
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (npm install)`);
-      const installOut = await execInContainer(containerId, "npm install --silent", { timeout: 300000 });
+      const installOut = hasCompose
+        ? await execInContainer(
+            containerId,
+            "NODE_ENV=development npm install --include=dev --silent",
+            { timeout: 300000 }
+          )
+        : await execInContainer(containerId, "npm install --silent", { timeout: 300000 });
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${installOut}`);
+
+      if (hasBuildScript(packageJsonContent)) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace (npm run build)`);
+        const buildOut = await execInContainer(containerId, "npm run build", { timeout: 300000 });
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Output:**\n${buildOut}`);
+      }
     }
   } catch (e: any) {
     const errorMsg = `[基础设施异常] npm install 失败: ${e.message || e}`;
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Critical Error:** ${errorMsg}`);
-    return { containerId, testResults: errorMsg, retryCount: (state.retryCount || 0) + 1, allocatedHostPort: hostPort };
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-infra_setup-r${round}`,
+      "infra_setup",
+      round,
+      `Infra 第${round}轮：依赖安装失败`,
+      `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n- 容器：${containerId || "未获取"}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
+    );
+    return { containerId, testResults: errorMsg, retryCount: (state.retryCount || 0) + 1, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errorMsg.slice(0, 120) };
   }
 
-  return { containerId, allocatedHostPort: hostPort };
+  const note = await writeMeetingNote(
+    WORKSPACE,
+    `note-infra_setup-r${round}`,
+    "infra_setup",
+    round,
+    `Infra 第${round}轮：容器与依赖已就绪`,
+    `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：成功\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n- 容器：${containerId}\n- 镜像：${image}\n`
+  );
+
+  return {
+    containerId,
+    allocatedHostPort: hostPort,
+    meetingNotes: [note],
+    testResults: "",
+    blockedReason: "",
+    protocolFailures: [],
+    lastFailedNode: "",
+    lastFailureSummary: "",
+  };
 }

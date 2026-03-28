@@ -147,7 +147,18 @@
 
         <!-- Dashboard -->
         <div id="view-dashboard" class="hidden absolute inset-0 overflow-y-auto scrollbar p-3 md:p-6">
-          <div class="max-w-6xl mx-auto space-y-3 md:space-y-6">
+          <div class="max-w-7xl mx-auto space-y-4 md:space-y-6">
+
+            <div class="rounded-2xl border border-slate-700 bg-gradient-to-br from-slate-900 via-slate-900 to-slate-800 p-4 md:p-6 shadow-xl">
+              <div class="space-y-4">
+                <div class="flex items-center gap-2 text-[11px] uppercase tracking-[0.28em] text-cyan-400 font-bold">
+                  <i data-lucide="radar" class="w-4 h-4"></i> 指挥台
+                </div>
+                <div id="monitorContent" class="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-3 md:gap-4">
+                  <div class="bg-slate-900/40 border border-slate-700 rounded-lg p-3 text-xs text-slate-400 italic">等待运行数据...</div>
+                </div>
+              </div>
+            </div>
 
             <!-- Deployment -->
             <div id="deployBlock" class="hidden bg-emerald-900/20 border border-emerald-500/30 rounded-xl p-3 md:p-6 shadow-sm">
@@ -160,46 +171,52 @@
               </div>
             </div>
 
-            <div class="grid grid-cols-1 lg:grid-cols-2 gap-3 md:gap-6">
-              <!-- Brief -->
-              <div class="bg-surface border border-slate-700 rounded-xl p-3 md:p-5 shadow-sm flex flex-col">
-                <h3 class="text-indigo-400 font-bold mb-2 md:mb-4 flex items-center gap-2 shrink-0 text-sm md:text-base"><i data-lucide="book-open" class="w-4 h-4"></i> 项目共识</h3>
-                <div id="briefContent" class="space-y-2 md:space-y-3 text-xs md:text-sm text-slate-300 flex-1 overflow-y-auto scrollbar max-h-[300px] md:max-h-[400px]">
-                  <span class="text-slate-500 italic">暂无记录</span>
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 md:gap-6">
+              <div class="xl:col-span-2 bg-surface border border-slate-700 rounded-2xl p-4 md:p-5 shadow-sm flex flex-col">
+                <div class="flex items-center justify-between gap-3 mb-3">
+                  <h3 class="text-emerald-400 font-bold flex items-center gap-2 text-sm md:text-base"><i data-lucide="folder-kanban" class="w-4 h-4"></i> 文件产出</h3>
+                  <span id="outputSummary" class="text-[11px] text-slate-500">等待任务拆解...</span>
                 </div>
-              </div>
-
-              <!-- SubTasks -->
-              <div class="bg-surface border border-slate-700 rounded-xl p-3 md:p-5 shadow-sm flex flex-col">
-                <h3 class="text-indigo-400 font-bold mb-2 md:mb-4 flex items-center gap-2 shrink-0 text-sm md:text-base"><i data-lucide="list-todo" class="w-4 h-4"></i> 行动清单</h3>
-                <div id="tasksContent" class="space-y-2 text-xs md:text-sm flex-1 overflow-y-auto scrollbar max-h-[300px] md:max-h-[400px]">
+                <div id="tasksContent" class="space-y-2 text-xs md:text-sm flex-1 overflow-y-auto scrollbar max-h-[420px]">
                   <span class="text-slate-500 italic">暂无任务</span>
                 </div>
               </div>
+
+              <div class="bg-surface border border-slate-700 rounded-2xl p-4 md:p-5 shadow-sm flex flex-col">
+                <h3 class="text-indigo-400 font-bold mb-3 flex items-center gap-2 text-sm md:text-base"><i data-lucide="book-open" class="w-4 h-4"></i> 项目共识</h3>
+                <div id="briefContent" class="space-y-2 md:space-y-3 text-xs md:text-sm text-slate-300 flex-1 overflow-y-auto scrollbar max-h-[420px]">
+                  <span class="text-slate-500 italic">暂无记录</span>
+                </div>
+              </div>
             </div>
 
-            <!-- Issues -->
-            <div id="issueBlock" class="hidden space-y-4">
-              <h3 class="text-rose-400 font-bold flex items-center gap-2 text-sm md:text-base"><i data-lucide="bug" class="w-4 h-4"></i> 缺陷追踪看板 (Issue Tracker)</h3>
-              <div id="issueContent" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-4 md:gap-6">
+              <div id="issueBlock" class="hidden xl:col-span-2 space-y-3 bg-rose-900/10 border border-rose-500/30 rounded-2xl p-4 md:p-5 shadow-sm">
+                <h3 class="text-rose-400 font-bold flex items-center gap-2 text-sm md:text-base"><i data-lucide="bug" class="w-4 h-4"></i> 当前问题</h3>
+                <div id="issueContent" class="grid grid-cols-1 md:grid-cols-2 gap-4"></div>
+              </div>
+
+              <div id="qaBlock" class="hidden bg-rose-900/10 border border-rose-500/30 rounded-2xl p-4 md:p-5 shadow-sm">
+                <h3 class="text-rose-400 font-bold mb-3 flex items-center gap-2 text-sm md:text-base"><i data-lucide="alert-circle" class="w-4 h-4"></i> 阻塞详情</h3>
+                <div id="qaContent" class="space-y-2 md:space-y-3 max-h-[360px] overflow-y-auto scrollbar"></div>
+              </div>
             </div>
 
-            <!-- QA -->
-            <div id="qaBlock" class="hidden bg-rose-900/10 border border-rose-500/30 rounded-xl p-3 md:p-5 shadow-sm">
-              <h3 class="text-rose-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="alert-circle" class="w-4 h-4"></i> 质量异常分析</h3>
-              <div id="qaContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
+            <div class="grid grid-cols-1 xl:grid-cols-2 gap-4 md:gap-6">
+              <div id="fixPlanBlock" class="hidden bg-sky-900/10 border border-sky-500/30 rounded-2xl p-4 md:p-5 shadow-sm">
+                <h3 class="text-sky-400 font-bold mb-3 flex items-center gap-2 text-sm md:text-base"><i data-lucide="handshake" class="w-4 h-4"></i> 修复方案</h3>
+                <div id="fixPlanContent" class="space-y-2 md:space-y-3 max-h-[320px] overflow-y-auto scrollbar"></div>
+              </div>
+
+              <div id="medBlock" class="hidden bg-amber-900/10 border border-amber-500/30 rounded-2xl p-4 md:p-5 shadow-sm">
+                <h3 class="text-amber-400 font-bold mb-3 flex items-center gap-2 text-sm md:text-base"><i data-lucide="git-merge" class="w-4 h-4"></i> 架构仲裁</h3>
+                <div id="medContent" class="space-y-2 md:space-y-3 max-h-[320px] overflow-y-auto scrollbar"></div>
+              </div>
             </div>
 
-            <!-- Mediation -->
-            <div id="medBlock" class="hidden bg-amber-900/10 border border-amber-500/30 rounded-xl p-3 md:p-5 shadow-sm">
-              <h3 class="text-amber-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="git-merge" class="w-4 h-4"></i> 架构干预指令</h3>
-              <div id="medContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
-            </div>
-
-            <!-- Fix Plan -->
-            <div id="fixPlanBlock" class="hidden bg-sky-900/10 border border-sky-500/30 rounded-xl p-3 md:p-5 shadow-sm">
-              <h3 class="text-sky-400 font-bold mb-2 md:mb-4 flex items-center gap-2 text-sm md:text-base"><i data-lucide="handshake" class="w-4 h-4"></i> QA-Coder 修复协商</h3>
-              <div id="fixPlanContent" class="space-y-2 md:space-y-3 max-h-[300px] md:max-h-[400px] overflow-y-auto scrollbar"></div>
+            <div id="protocolBlock" class="hidden bg-violet-900/10 border border-violet-500/30 rounded-2xl p-4 md:p-5 shadow-sm">
+              <h3 class="text-violet-400 font-bold mb-3 flex items-center gap-2 text-sm md:text-base"><i data-lucide="shield-check" class="w-4 h-4"></i> 执行协议</h3>
+              <div id="protocolContent" class="space-y-3 md:space-y-4"></div>
             </div>
 
           </div>
@@ -460,6 +477,13 @@
       // Approval Modal
       const modal = document.getElementById('approvalModal');
       if (session.requiresApproval && session.status === 'Running') {
+        const pendingCheckpoint = Array.isArray(session.customerApprovalState?.checkpoints)
+          ? session.customerApprovalState.checkpoints.find(item => !item.approved)
+          : null;
+        const title = modal.querySelector ? modal.querySelector('h2') : null;
+        const body = modal.querySelector ? modal.querySelector('p') : null;
+        if (title) title.textContent = `等待客户确认：${pendingCheckpoint?.stage || session.pendingApprovalStage || 'approval'}`;
+        if (body) body.textContent = pendingCheckpoint?.summary || '方案设计已就绪，请审阅。';
         modal.classList.remove('hidden');
       } else {
         modal.classList.add('hidden');
@@ -468,12 +492,14 @@
       renderTeam(session.team);
       renderPipeline();
       renderConsensus(session);
-      renderTasks(session.subTasks);
-      renderIssues(session.issueTracker);
+      renderMonitoring(session);
+      renderTasks(session);
+      renderIssues(session);
       renderQA(session.qaFailures);
       renderFixPlan(session.fixPlan);
       renderMediation(session.mediationDirectives);
-      renderDeploy(session.deployment);
+      renderProtocol(session);
+      renderDeploy(session);
       
       lucide.createIcons();
     }
@@ -645,20 +671,98 @@
       lucide.createIcons({ portal: div });
     }
 
+    function summarizeCurrentFile(tasks = []) {
+      if (!Array.isArray(tasks) || tasks.length === 0) return '未进入文件执行';
+      const failedTask = tasks.find(task => task.status === 'failed');
+      if (failedTask?.fileTarget) return failedTask.fileTarget;
+      const activeTask = tasks.find(task => task.status !== 'completed');
+      return activeTask?.fileTarget || tasks[tasks.length - 1]?.fileTarget || '未进入文件执行';
+    }
+
+    function getTopTokenAgent(byAgent = {}) {
+      const entries = Object.entries(byAgent || {});
+      if (entries.length === 0) return null;
+      entries.sort((a, b) => (b[1]?.totalTokens || 0) - (a[1]?.totalTokens || 0));
+      return entries[0];
+    }
+
+    function noteMatchesStage(noteId, stage) {
+      if (!noteId || !stage) return false;
+      const raw = String(noteId).toLowerCase();
+      const aliases = {
+        requirement: ['note-pm'],
+        design: ['note-architect', 'note-mediation'],
+        sync: ['note-contract_sync'],
+        planning: ['note-orchestrator'],
+        coding: ['note-coder'],
+        fix_planning: ['note-fixplan'],
+        verification: ['note-infra_setup', 'note-terminal', 'note-verifier', 'note-qa'],
+        deployment: ['note-deploy'],
+        review: ['note-post_mortem', 'note-persistence'],
+      };
+      return (aliases[stage.key] || []).some(prefix => raw.startsWith(prefix));
+    }
+
+    function getStageKeyFromNode(nodeName) {
+      if (!nodeName) return null;
+      const normalizedNode = String(nodeName).toLowerCase();
+      const matched = PIPELINE_STAGES.find(stage =>
+        (stage.nodes || []).some(node => normalizedNode.includes(node))
+      );
+      return matched?.key || null;
+    }
+
+    function getCompletedStageKeys(session) {
+      const keys = new Set();
+      const notes = Array.isArray(session?.meetingNotes) ? session.meetingNotes : [];
+      notes.forEach(note => {
+        PIPELINE_STAGES.forEach(stage => {
+          if (noteMatchesStage(note.id, stage)) keys.add(stage.key);
+        });
+      });
+      const activeIdx = PIPELINE_STAGES.findIndex(stage => stage.key === getStageKeyFromNode(session?.currentNode));
+      if (activeIdx > 0) {
+        PIPELINE_STAGES.slice(0, activeIdx).forEach(stage => keys.add(stage.key));
+      }
+      return keys;
+    }
+
+    function getStageState(stage, session) {
+      const activeKey = getStageKeyFromNode(session?.currentNode);
+      const completed = getCompletedStageKeys(session);
+      const activeIdx = PIPELINE_STAGES.findIndex(item => item.key === activeKey);
+      const currentIdx = PIPELINE_STAGES.findIndex(item => item.key === stage.key);
+      const isFailed = Boolean(session?.lastFailedNode) && activeKey === stage.key && session?.status === 'Error';
+      if (isFailed) return 'failed';
+      if (activeKey === stage.key && session?.status === 'Running') return 'active';
+      if (completed.has(stage.key)) return 'done';
+      if (activeIdx > currentIdx && activeIdx !== -1) return 'done';
+      if ((session?.status === 'Success' || session?.status === 'Completed') && currentIdx <= activeIdx) return 'done';
+      return 'pending';
+    }
+
+    function getStageSummary(stage, session) {
+      const notes = Array.isArray(session?.meetingNotes) ? session.meetingNotes : [];
+      const matched = [...notes].reverse().find(note => noteMatchesStage(note.id, stage));
+      if (matched?.summary) return matched.summary;
+      if (getStageKeyFromNode(session?.currentNode) === stage.key) {
+        return session?.lastFailureSummary || `当前节点：${formatNodeName(session?.currentNode || '')}`;
+      }
+      return '等待进入';
+    }
+
     function renderConsensus(session) {
       const container = document.getElementById('briefContent');
       const core = session.consensusCore;
-      const progress = session.consensusProgress;
       const notes = session.meetingNotes || [];
 
-      if (!core && notes.length === 0 && !progress) {
+      if (!core && notes.length === 0) {
         container.innerHTML = '<span class="text-slate-500 italic flex h-full items-center justify-center">暂无记录</span>';
         return;
       }
 
       let html = '';
 
-      // 第一层：项目核心
       if (core) {
         html += `<div class="mb-3">
           <div class="text-xs font-bold text-indigo-400 uppercase tracking-wider mb-1 flex items-center gap-1">
@@ -689,38 +793,6 @@
         html += `</div></div>`;
       }
 
-      // 第二层：当前进度
-      if (progress) {
-        const total = (progress.completedFiles.length + progress.pendingFiles.length) || 1;
-        const pct = Math.round(progress.completedFiles.length / total * 100);
-        html += `<div class="mb-3">
-          <div class="text-xs font-bold text-emerald-400 uppercase tracking-wider mb-1 flex items-center gap-1">
-            <i data-lucide="activity" class="w-3 h-3"></i> 当前进度（第 ${progress.currentRound} 轮）
-          </div>
-          <div class="p-2 border-l-2 border-emerald-500 bg-emerald-500/10 rounded-r text-xs space-y-1">
-            <div class="flex items-center gap-2">
-              <span class="text-slate-400">完成 ${progress.completedFiles.length}/${total}</span>
-              <div class="flex-1 bg-slate-700 rounded-full h-1">
-                <div class="bg-emerald-500 h-1 rounded-full transition-all" style="width:${pct}%"></div>
-              </div>
-              <span class="text-emerald-400 font-mono">${pct}%</span>
-            </div>`;
-        if (progress.completedFiles.length > 0) {
-          html += `<div class="text-slate-400">已完成：<span class="text-emerald-300 font-mono">${progress.completedFiles.map(f => escapeHtml(f)).join(', ')}</span></div>`;
-        }
-        if (progress.pendingFiles.length > 0) {
-          html += `<div class="text-slate-400">待完成：<span class="text-slate-300 font-mono">${progress.pendingFiles.map(f => escapeHtml(f)).join(', ')}</span></div>`;
-        }
-        if (progress.openIssues && progress.openIssues.length > 0) {
-          html += `<div class="text-slate-400 mt-1">未解决问题：
-            <ul class="mt-0.5 space-y-0.5 pl-3">
-              ${progress.openIssues.map(i => `<li class="text-rose-300 list-disc list-inside">${escapeHtml(i)}</li>`).join('')}
-            </ul></div>`;
-        }
-        html += `</div></div>`;
-      }
-
-      // 第三层：会议纪要
       if (notes.length > 0) {
         html += `<div class="mb-2">
           <div class="text-xs font-bold text-amber-400 uppercase tracking-wider mb-1 flex items-center gap-1">
@@ -740,46 +812,92 @@
       lucide.createIcons({ portal: container });
     }
 
-    function renderTasks(tasks) {
+    function renderTasks(session) {
       const container = document.getElementById('tasksContent');
+      const summaryEl = document.getElementById('outputSummary');
+      const tasks = Array.isArray(session?.subTasks) ? session.subTasks : [];
+      const progress = session?.metrics?.progress || { total: 0, completed: 0, failed: 0, pending: 0, percent: 0 };
       if (!tasks || !Array.isArray(tasks) || tasks.length === 0) {
+        summaryEl.textContent = '等待任务拆解...';
         container.innerHTML = '<span class="text-slate-500 italic flex h-full items-center justify-center">等待任务拆解...</span>';
         return;
       }
-      const done = tasks.filter(t => t.status === 'completed').length;
+
+      summaryEl.textContent = `共 ${progress.total} 个文件任务，完成 ${progress.completed}，失败 ${progress.failed}，待处理 ${progress.pending}`;
+
+      const groups = [
+        { key: 'failed', title: '当前失败', empty: '暂无失败文件', items: tasks.filter(t => t.status === 'failed').slice(0, 4), iconColor: 'text-rose-400', icon: 'alert-triangle' },
+        { key: 'active', title: '待执行 / 处理中', empty: '当前没有待执行文件', items: tasks.filter(t => t.status !== 'completed' && t.status !== 'failed').slice(0, 6), iconColor: 'text-amber-400', icon: 'clock-3' },
+        { key: 'done', title: '最近完成', empty: '尚未有完成文件', items: [...tasks].filter(t => t.status === 'completed').slice(-6).reverse(), iconColor: 'text-emerald-400', icon: 'check-circle-2' },
+      ];
+
       container.innerHTML = `
-        <div class="text-xs text-slate-500 mb-2 flex items-center gap-2">
-          <span class="text-emerald-400 font-bold">${done}</span> / ${tasks.length} 完成
-          <div class="flex-1 bg-slate-700 rounded-full h-1">
-            <div class="bg-emerald-500 h-1 rounded-full transition-all" style="width:${Math.round(done/tasks.length*100)}%"></div>
+        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+          <div class="rounded-xl border border-emerald-500/20 bg-emerald-950/20 p-3">
+            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-2">已完成</div>
+            <div class="text-3xl font-semibold text-emerald-300">${formatNumber(progress.completed)}</div>
+          </div>
+          <div class="rounded-xl border border-amber-500/20 bg-amber-950/20 p-3">
+            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-2">待处理</div>
+            <div class="text-3xl font-semibold text-amber-300">${formatNumber(progress.pending)}</div>
+          </div>
+          <div class="rounded-xl border border-rose-500/20 bg-rose-950/20 p-3">
+            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-2">失败</div>
+            <div class="text-3xl font-semibold text-rose-300">${formatNumber(progress.failed)}</div>
           </div>
         </div>
-        ${tasks.map(t => {
-          const isDone = t.status === 'completed';
-          const isFailed = t.status === 'failed';
-          const bgClass = isDone ? 'bg-emerald-900/10 border-emerald-900/30' : isFailed ? 'bg-rose-900/10 border-rose-900/30' : 'bg-slate-800/50 border-slate-700/50';
-          const iconName = isDone ? 'check-circle' : isFailed ? 'x-circle' : 'circle';
-          const iconColor = isDone ? 'text-emerald-400' : isFailed ? 'text-rose-400' : 'text-slate-500';
-          const statusColor = isDone ? 'text-emerald-400 bg-emerald-900/30 border-emerald-800' : isFailed ? 'text-rose-400 bg-rose-900/30 border-rose-800' : 'text-slate-400 bg-slate-900/50 border-slate-700/50';
-          return `
-            <div class="flex items-start gap-3 p-3 border rounded shadow-sm ${bgClass}">
-              <i data-lucide="${iconName}" class="w-4 h-4 ${iconColor} shrink-0 mt-0.5"></i>
-              <div class="flex-1 min-w-0">
-                <div class="text-xs font-mono text-slate-300 truncate font-bold" title="${escapeHtml(t.fileTarget)}">${escapeHtml(t.fileTarget)}</div>
-                ${t.description ? `<div class="text-[11px] text-slate-500 mt-0.5 line-clamp-2">${escapeHtml(t.description)}</div>` : ''}
-                ${isFailed && t.lastError ? `<div class="text-[10px] text-rose-400 mt-1 font-mono line-clamp-2">${escapeHtml(t.lastError.slice(0, 120))}</div>` : ''}
+        <div class="space-y-4">
+          ${groups.map(group => `
+            <section class="rounded-xl border border-slate-700 bg-slate-900/40 p-3">
+              <div class="flex items-center gap-2 mb-3 text-sm font-bold text-slate-200">
+                <i data-lucide="${group.icon}" class="w-4 h-4 ${group.iconColor}"></i>
+                ${group.title}
               </div>
-              <span class="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded border shrink-0 ${statusColor}">${escapeHtml(t.status)}</span>
-            </div>
-          `;
-        }).join('')}
+              <div class="space-y-2">
+                ${group.items.length > 0 ? group.items.map(task => {
+                  const isFailed = task.status === 'failed';
+                  return `
+                    <div class="rounded-lg border border-slate-700 bg-slate-950/40 p-3">
+                      <div class="flex items-start justify-between gap-3">
+                        <div class="min-w-0">
+                          <div class="text-xs font-mono text-slate-200 font-bold truncate" title="${escapeHtml(task.fileTarget)}">${escapeHtml(task.fileTarget)}</div>
+                          ${task.description ? `<div class="mt-1 text-[11px] text-slate-400 line-clamp-2">${escapeHtml(task.description)}</div>` : ''}
+                          ${task.lastError && isFailed ? `<div class="mt-2 text-[10px] text-rose-300 font-mono line-clamp-3">${escapeHtml(task.lastError.slice(0, 180))}</div>` : ''}
+                        </div>
+                        <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] uppercase font-bold ${isFailed ? 'border-rose-500/30 bg-rose-500/10 text-rose-300' : task.status === 'completed' ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300' : 'border-amber-500/30 bg-amber-500/10 text-amber-300'}">
+                          ${escapeHtml(task.status)}
+                        </span>
+                      </div>
+                    </div>
+                  `;
+                }).join('') : `<div class="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500 italic">${group.empty}</div>`}
+              </div>
+            </section>
+          `).join('')}
+        </div>
       `;
+      lucide.createIcons({ portal: container });
     }
 
-    function renderIssues(issues) {
+    function renderIssues(session) {
       const el = document.getElementById('issueBlock');
       const content = document.getElementById('issueContent');
-      if (!issues || !Array.isArray(issues) || issues.length === 0) {
+      const protocolFailures = Array.isArray(session?.protocolFailures) ? session.protocolFailures : [];
+      const issues = Array.isArray(session?.issueTracker) ? session.issueTracker : [];
+      const cards = protocolFailures.length > 0
+        ? protocolFailures.map((failure, index) => ({
+            id: `PROTOCOL-${index + 1}`,
+            title: failure.summary || `${failure.file || failure.node} 协议未通过`,
+            description: (failure.evidence || []).join('；') || failure.summary || '',
+            severity: failure.blocking ? 'major' : 'minor',
+            status: failure.blocking ? 'open' : 'resolved',
+            relatedFiles: failure.file ? [failure.file] : [],
+            isProtocol: true,
+            type: failure.type || 'unknown',
+          }))
+        : issues;
+
+      if (!cards || !Array.isArray(cards) || cards.length === 0) {
         el.classList.add('hidden');
         return;
       }
@@ -791,7 +909,7 @@
         minor: { color: 'text-blue-500', bg: 'bg-blue-500/10', border: 'border-blue-500/30', icon: 'info' }
       };
 
-      content.innerHTML = issues.map(i => {
+      content.innerHTML = cards.map(i => {
         const isResolved = i.status === 'resolved';
         const s = severityMap[i.severity] || severityMap.minor;
         const opacity = isResolved ? 'opacity-50 grayscale' : '';
@@ -803,6 +921,7 @@
                 <i data-lucide="${isResolved ? 'check-square' : s.icon}" class="w-4 h-4 ${isResolved ? 'text-emerald-400' : s.color}"></i>
                 <span class="text-xs font-bold font-mono ${isResolved ? 'text-emerald-400' : s.color}">${escapeHtml(i.id)}</span>
                 <span class="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-slate-900/50 text-slate-400 border border-slate-700">${escapeHtml(i.severity)}</span>
+                ${i.isProtocol ? `<span class="text-[10px] uppercase font-bold px-1.5 py-0.5 rounded bg-violet-500/10 text-violet-300 border border-violet-500/30">${escapeHtml(i.type)}</span>` : ''}
               </div>
               <span class="text-[10px] font-bold px-2 py-0.5 rounded ${isResolved ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30' : 'bg-rose-500/20 text-rose-400 border border-rose-500/30'}">
                 ${isResolved ? '已解决' : '待处理'}
@@ -834,35 +953,24 @@
     function renderPipeline() {
       const container = document.getElementById('pipelineStages');
       if (!container || !session) return;
-
-      const currentPhase = session.currentPhase || 'idle';
-      const phaseData = session.phaseData || {};
-      const isRunning = session.status === 'Running';
-
-      // 找到当前活跃阶段的索引
-      const activeStageIdx = PIPELINE_STAGES.findIndex(s => s.key === currentPhase);
+      const activeKey = getStageKeyFromNode(session.currentNode);
+      const activeStageIdx = PIPELINE_STAGES.findIndex(stage => stage.key === activeKey);
 
       container.innerHTML = PIPELINE_STAGES.map((stage, i) => {
-        const data = phaseData[stage.key] || {};
-        
-        // 逻辑判定：
-        // 1. 是否正在进行：Key 匹配且正在运行
-        const isActive = stage.key === currentPhase && isRunning;
-        // 2. 是否已完成：索引小于当前活跃阶段，或者后端明确标记完成
-        const isDone = (activeStageIdx > i) || (data.status === 'completed');
-        // 3. 是否等待中
-        const isPending = !isActive && !isDone;
+        const state = getStageState(stage, session);
+        const isActive = state === 'active';
+        const isDone = state === 'done';
+        const isFailed = state === 'failed';
 
-        const duration = data.totalDuration
-          ? `${(data.totalDuration / 1000).toFixed(0)}s`
-          : isActive ? '进行中' : '';
-
-        // 颜色映射
         let dotColor = 'bg-slate-600';
         let labelColor = 'text-slate-500';
         let lineColor = 'bg-slate-700';
 
-        if (isActive) {
+        if (isFailed) {
+          dotColor = 'bg-rose-500 shadow-[0_0_10px_rgba(244,63,94,0.55)]';
+          labelColor = 'text-rose-300 font-bold';
+          lineColor = 'bg-rose-500/40';
+        } else if (isActive) {
           dotColor = 'bg-indigo-500 shadow-[0_0_10px_#6366f1]';
           labelColor = 'text-indigo-300 font-bold';
         } else if (isDone) {
@@ -885,6 +993,34 @@
       // 给容器增加一点底部间距，因为文字是绝对定位的
       container.style.paddingBottom = '20px';
       lucide.createIcons({ portal: container });
+    }
+
+    function renderTimeline(session) {
+      const container = document.getElementById('timelineContent');
+      if (!container) return;
+      const stateMeta = {
+        pending: { label: '待开始', color: 'text-slate-500', chip: 'border-slate-700 bg-slate-900/40 text-slate-400', dot: 'bg-slate-600' },
+        active: { label: '执行中', color: 'text-cyan-300', chip: 'border-cyan-500/30 bg-cyan-500/10 text-cyan-300', dot: 'bg-cyan-400' },
+        done: { label: '已完成', color: 'text-emerald-300', chip: 'border-emerald-500/30 bg-emerald-500/10 text-emerald-300', dot: 'bg-emerald-400' },
+        failed: { label: '阻塞', color: 'text-rose-300', chip: 'border-rose-500/30 bg-rose-500/10 text-rose-300', dot: 'bg-rose-400' },
+      };
+
+      container.innerHTML = PIPELINE_STAGES.map(stage => {
+        const state = getStageState(stage, session);
+        const meta = stateMeta[state] || stateMeta.pending;
+        return `
+          <div class="rounded-xl border border-slate-700 bg-slate-900/40 p-3">
+            <div class="flex items-center justify-between gap-3 mb-2">
+              <div class="flex items-center gap-2 min-w-0">
+                <span class="w-2.5 h-2.5 rounded-full ${meta.dot} ${state === 'active' ? 'animate-pulse' : ''}"></span>
+                <span class="text-sm font-semibold text-slate-200 truncate">${stage.label}</span>
+              </div>
+              <span class="shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase ${meta.chip}">${meta.label}</span>
+            </div>
+            <div class="text-[11px] ${meta.color} leading-relaxed">${escapeHtml(getStageSummary(stage, session))}</div>
+          </div>
+        `;
+      }).join('');
     }
 
     function renderQA(qa) {
@@ -960,14 +1096,136 @@
       lucide.createIcons();
     }
 
-    function renderDeploy(dep) {
+    function renderProtocol(session) {
+      const el = document.getElementById('protocolBlock');
+      const content = document.getElementById('protocolContent');
+      const protocol = session.executionProtocol;
+      const failures = Array.isArray(session.protocolFailures) ? session.protocolFailures : [];
+      const patches = Array.isArray(session.protocolPatches) ? session.protocolPatches : [];
+      const approvalState = session.customerApprovalState || null;
+      const checkpoints = Array.isArray(approvalState?.checkpoints) ? approvalState.checkpoints : [];
+      const pendingCheckpoint = checkpoints.find(item => !item.approved) || null;
+
+      if (!protocol && failures.length === 0 && patches.length === 0 && checkpoints.length === 0) {
+        el.classList.add('hidden');
+        return;
+      }
+
+      const project = protocol?.project || {};
+      const layout = project.workspaceLayout || {};
+      const runtime = protocol?.runtime || {};
+      const blockingFailures = failures.filter(item => item && item.blocking);
+
+      el.classList.remove('hidden');
+      content.innerHTML = `
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-3">
+          <div class="rounded-xl border border-violet-500/20 bg-violet-950/20 p-3">
+            <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-2">协议摘要</div>
+            <div class="space-y-2 text-xs">
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-slate-500">版本</span>
+                <span class="text-violet-300 font-mono">${escapeHtml(protocol?.version || 'v1')}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-slate-500">运行时</span>
+                <span class="text-slate-200 text-right">${escapeHtml(project.runtime || '未知')}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-slate-500">测试目录</span>
+                <span class="text-slate-200 font-mono text-right break-all">${escapeHtml((layout.testRoots || []).join(', ') || '无')}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-slate-500">入口文件</span>
+                <span class="text-slate-200 font-mono text-right break-all">${escapeHtml((layout.entryFiles || []).join(', ') || '无')}</span>
+              </div>
+              <div class="flex items-center justify-between gap-3">
+                <span class="text-slate-500">健康检查</span>
+                <span class="text-slate-200 font-mono text-right break-all">${escapeHtml(runtime.healthCheckPath || '无')}</span>
+              </div>
+            </div>
+          </div>
+
+          <div class="rounded-xl border border-rose-500/20 bg-rose-950/20 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500">协议失败</div>
+              <span class="text-xs font-mono text-rose-300">${formatNumber(failures.length)}</span>
+            </div>
+            <div class="space-y-2">
+              ${failures.length > 0 ? failures.slice(0, 4).map(item => `
+                <div class="rounded-lg border border-rose-500/20 bg-slate-950/40 p-2.5">
+                  <div class="flex items-center justify-between gap-3 mb-1">
+                    <span class="text-[11px] font-bold text-rose-300">${escapeHtml(item.type || 'unknown')}</span>
+                    <span class="text-[10px] font-mono ${item.blocking ? 'text-rose-300' : 'text-slate-400'}">${item.blocking ? 'blocking' : 'non-blocking'}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-200 leading-relaxed">${escapeHtml(item.summary || '')}</div>
+                  ${item.file ? `<div class="mt-1 text-[10px] font-mono text-slate-400">${escapeHtml(item.file)}</div>` : ''}
+                </div>
+              `).join('') : `<div class="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500 italic">当前没有协议失败</div>`}
+            </div>
+            <div class="mt-2 text-[11px] text-slate-500">阻塞项 ${formatNumber(blockingFailures.length)} 条</div>
+          </div>
+
+          <div class="rounded-xl border border-amber-500/20 bg-amber-950/20 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500">客户确认</div>
+              <span class="text-xs font-mono text-amber-300">${formatNumber(checkpoints.length)}</span>
+            </div>
+            <div class="space-y-2">
+              ${checkpoints.length > 0 ? checkpoints.map(item => `
+                <div class="rounded-lg border ${item.approved ? 'border-emerald-500/20' : 'border-amber-500/20'} bg-slate-950/40 p-2.5">
+                  <div class="flex items-center justify-between gap-3 mb-1">
+                    <span class="text-[11px] font-bold ${item.approved ? 'text-emerald-300' : 'text-amber-300'}">${escapeHtml(item.stage)}</span>
+                    <span class="text-[10px] font-mono ${item.approved ? 'text-emerald-300' : 'text-amber-300'}">${item.approved ? 'approved' : 'pending'}</span>
+                  </div>
+                  <div class="text-[11px] text-slate-300 leading-relaxed">${escapeHtml(item.summary || '（无摘要）')}</div>
+                  <div class="mt-1 text-[10px] text-slate-500">${escapeHtml(item.approvedBy || (item.required ? '需要客户确认' : '无需确认'))}</div>
+                </div>
+              `).join('') : `<div class="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500 italic">当前没有客户确认点</div>`}
+            </div>
+            ${pendingCheckpoint ? `<div class="mt-2 text-[11px] text-amber-300">当前待确认：${escapeHtml(pendingCheckpoint.stage)} → ${escapeHtml(session.approvalNextNode || '-')}</div>` : ''}
+          </div>
+
+          <div class="rounded-xl border border-sky-500/20 bg-sky-950/20 p-3">
+            <div class="flex items-center justify-between mb-2">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500">协议补丁</div>
+              <span class="text-xs font-mono text-sky-300">${formatNumber(patches.length)}</span>
+            </div>
+            <div class="space-y-2">
+              ${patches.length > 0 ? patches.slice(0, 4).map(item => `
+                <div class="rounded-lg border border-sky-500/20 bg-slate-950/40 p-2.5">
+                  <div class="flex items-center justify-between gap-3 mb-1">
+                    <span class="text-[11px] font-bold text-sky-300">${escapeHtml(item.action || 'replace')}</span>
+                    <span class="text-[10px] font-mono text-slate-400">${escapeHtml(item.target || 'contracts')}</span>
+                  </div>
+                  <div class="text-[10px] font-mono text-slate-200 break-all">${escapeHtml(item.path || '')}</div>
+                  <div class="mt-1 text-[11px] text-slate-400 leading-relaxed">${escapeHtml(item.reason || '')}</div>
+                </div>
+              `).join('') : `<div class="rounded-lg border border-dashed border-slate-700 p-3 text-xs text-slate-500 italic">当前没有协议补丁</div>`}
+            </div>
+          </div>
+        </div>
+      `;
+      lucide.createIcons({ portal: content });
+    }
+
+    function renderDeploy(session) {
+      const dep = session?.deployment;
       const el = document.getElementById('deployBlock');
-      if (!dep || (dep.status !== 'success' && dep.status !== 'deployed')) {
+      if (!dep || !['success', 'deployed', 'running'].includes(dep.status)) {
         el.classList.add('hidden');
         return;
       }
       el.classList.remove('hidden');
-      document.getElementById('deployInfo').textContent = dep.url || 'None';
+      const hostPort = session?.allocatedHostPort ? String(session.allocatedHostPort) : '-';
+      const containerId = session?.containerId || '-';
+      document.getElementById('deployInfo').innerHTML = `
+        <div class="space-y-1">
+          <div><span class="text-slate-400">URL:</span> <span class="text-slate-200 font-mono break-all">${escapeHtml(dep.url || 'None')}</span></div>
+          <div><span class="text-slate-400">容器:</span> <span class="text-slate-200 font-mono break-all">${escapeHtml(containerId)}</span></div>
+          <div><span class="text-slate-400">宿主端口:</span> <span class="text-slate-200 font-mono">${escapeHtml(hostPort)}</span></div>
+          <div><span class="text-slate-400">状态:</span> <span class="text-emerald-300 font-mono">${escapeHtml(dep.status || '-')}</span></div>
+        </div>
+      `;
       const btn = document.getElementById('deployUrl');
       if (dep.url) {
         btn.href = dep.url;
@@ -995,6 +1253,117 @@
         refreshFileTree();
         refreshCheckpoints();
       }
+    }
+
+    function formatNumber(n) {
+      return Number(n || 0).toLocaleString('zh-CN');
+    }
+
+    function getStageLabelFromNode(nodeName) {
+      const stageKey = getStageKeyFromNode(nodeName);
+      const stage = PIPELINE_STAGES.find(item => item.key === stageKey);
+      return stage?.label || formatNodeName(nodeName || '-');
+    }
+
+    function renderMonitoring(session) {
+      const container = document.getElementById('monitorContent');
+      const metrics = session.metrics || {};
+      const tokenUsage = metrics.tokenUsage || { calls: 0, inputTokens: 0, outputTokens: 0, totalTokens: 0, byAgent: {} };
+      const progress = metrics.progress || { total: 0, completed: 0, failed: 0, pending: 0, percent: 0 };
+      const byAgent = tokenUsage.byAgent || {};
+      const protocolFailures = Array.isArray(session.protocolFailures) ? session.protocolFailures : [];
+      const primaryProtocolFailure = protocolFailures.find(item => item && item.blocking) || protocolFailures[0] || null;
+      const currentStage = getStageLabelFromNode(session.currentNode || '-');
+      const currentNode = formatNodeName(session.currentNode || '-');
+      const activeFile = summarizeCurrentFile(session.subTasks);
+      const blockedFile = primaryProtocolFailure?.file || session.qaFailures?.failedFiles?.[0] || session.issueTracker?.[0]?.relatedFiles?.[0] || '无';
+      const blocker = primaryProtocolFailure?.summary || session.blockedReason || session.lastFailureSummary || session.qaFailures?.testErrors?.[0] || '当前没有阻塞说明';
+      const topAgent = getTopTokenAgent(byAgent);
+      const topAgentName = topAgent ? topAgent[0] : '暂无';
+      const topAgentUsage = topAgent ? topAgent[1] : { totalTokens: 0, calls: 0 };
+
+      container.innerHTML = `
+        <div class="rounded-2xl border border-cyan-500/20 bg-cyan-950/20 p-4 md:p-5">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-bold text-cyan-300">当前阶段</span>
+            <span class="text-xs font-mono text-cyan-200">${escapeHtml(session.status || 'Idle')}</span>
+          </div>
+          <div class="text-2xl md:text-3xl font-semibold text-white mb-1">${escapeHtml(currentStage)}</div>
+          <div class="text-xs text-slate-400 mb-3">节点：<span class="text-slate-200 font-mono">${escapeHtml(currentNode)}</span></div>
+          <div class="space-y-2 text-xs">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-500">当前文件</span>
+              <span class="text-slate-200 font-mono text-right break-all">${escapeHtml(activeFile)}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-500">重试轮次</span>
+              <span class="text-cyan-300 font-mono">${formatNumber(session.retryCount || 0)} / ${formatNumber(session.maxRetries || 0)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rounded-2xl border border-rose-500/20 bg-rose-950/20 p-4 md:p-5">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-bold text-rose-300">当前阻塞</span>
+            <span class="text-xs font-mono text-rose-200">${escapeHtml(session.lastFailedNode ? formatNodeName(session.lastFailedNode) : '无')}</span>
+          </div>
+          <div class="rounded-xl border border-rose-500/20 bg-slate-950/40 p-3 mb-3 text-xs text-rose-100 leading-relaxed min-h-[104px]">
+            ${escapeHtml(String(blocker).slice(0, 240))}
+          </div>
+          <div class="space-y-2 text-xs">
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-500">阻塞文件</span>
+              <span class="text-slate-200 font-mono text-right break-all">${escapeHtml(blockedFile)}</span>
+            </div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="text-slate-500">失败节点</span>
+              <span class="text-slate-200 text-right">${escapeHtml(session.lastFailedNode ? formatNodeName(session.lastFailedNode) : '无')}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rounded-2xl border border-indigo-500/20 bg-indigo-950/20 p-4 md:p-5">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-bold text-indigo-300">执行进度</span>
+            <span class="text-xs font-mono text-indigo-200">${formatNumber(progress.percent)}%</span>
+          </div>
+          <div class="grid grid-cols-3 gap-3 mb-4">
+            <div class="rounded-xl border border-emerald-500/20 bg-emerald-950/20 p-3">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-1">完成</div>
+              <div class="text-2xl font-semibold text-emerald-300">${formatNumber(progress.completed)}</div>
+            </div>
+            <div class="rounded-xl border border-amber-500/20 bg-amber-950/20 p-3">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-1">待处理</div>
+              <div class="text-2xl font-semibold text-amber-300">${formatNumber(progress.pending)}</div>
+            </div>
+            <div class="rounded-xl border border-rose-500/20 bg-rose-950/20 p-3">
+              <div class="text-[11px] uppercase tracking-[0.22em] text-slate-500 mb-1">失败</div>
+              <div class="text-2xl font-semibold text-rose-300">${formatNumber(progress.failed)}</div>
+            </div>
+          </div>
+          <div class="text-xs text-slate-400">总文件 <span class="font-mono text-slate-200">${formatNumber(progress.total)}</span></div>
+        </div>
+
+        <div class="rounded-2xl border border-emerald-500/20 bg-emerald-950/20 p-4 md:p-5">
+          <div class="flex items-center justify-between mb-3">
+            <span class="text-sm font-bold text-emerald-300">成本摘要</span>
+            <span class="text-xs font-mono text-emerald-200">calls ${formatNumber(tokenUsage.calls)}</span>
+          </div>
+          <div class="grid grid-cols-3 gap-3 text-xs mb-4">
+            <div><div class="text-slate-500">Input</div><div class="text-slate-200 font-mono">${formatNumber(tokenUsage.inputTokens)}</div></div>
+            <div><div class="text-slate-500">Output</div><div class="text-slate-200 font-mono">${formatNumber(tokenUsage.outputTokens)}</div></div>
+            <div><div class="text-slate-500">Total</div><div class="text-emerald-300 font-mono">${formatNumber(tokenUsage.totalTokens)}</div></div>
+          </div>
+          <div class="rounded-xl border border-emerald-500/20 bg-slate-950/40 p-3 text-xs">
+            <div class="text-slate-500 mb-1">最高消耗 Agent</div>
+            <div class="flex items-center justify-between gap-3">
+              <span class="font-bold ${topAgent && getAgentColorClasses(topAgentName).text || 'text-slate-200'}">${escapeHtml(topAgentName)}</span>
+              <span class="font-mono text-emerald-300">${formatNumber(topAgentUsage.totalTokens)} tokens</span>
+            </div>
+            <div class="mt-2 text-slate-400">调用 ${formatNumber(topAgentUsage.calls)} 次</div>
+          </div>
+        </div>
+      `;
     }
 
     async function refreshFileTree() {

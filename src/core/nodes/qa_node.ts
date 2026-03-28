@@ -1,9 +1,12 @@
-import { JimClawState, Issue, ConsensusProgress, RepairLedgerEntry } from "../graph_types";
+import { JimClawState, Issue, ConsensusProgress, ProtocolFailure, RepairLedgerEntry } from "../graph_types";
 import { BaseAgent } from "../agent";
 import {
   analyzeTestProblem,
   buildFailureFingerprint,
+  buildRepairPlan,
+  buildValidationReport,
   buildSystemContext,
+  extractFailureEvidence,
   tryFixEnvironmentProblem,
   writeMeetingNote
 } from "../logic_utils";
@@ -20,13 +23,75 @@ export async function qaNode(
   startSpan: any,
   saveBoulder: any
 ) {
+  function buildIssuesFromProtocolFailures(protocolFailures: ProtocolFailure[], detectedRound: number): Issue[] {
+    return protocolFailures.map((failure, index) => ({
+      id: `BUG-PROTOCOL-${index + 1}`,
+      title: `${failure.file || failure.node} 协议未通过`,
+      description: failure.summary,
+      severity: failure.blocking ? "major" as const : "minor" as const,
+      status: "open" as const,
+      relatedFiles: failure.file ? [failure.file] : [],
+      rawErrorSnippet: failure.evidence?.join(" | ") || failure.summary,
+      detectedRound,
+    }));
+  }
+
+  function buildVerifierFallbackIssues(output: string, detectedRound: number): Issue[] {
+    const verifierLines = output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter((line) => line && !line.startsWith("[Verifier 预检失败]"));
+
+    return verifierLines.map((line, index) => {
+      const fileMatch = line.match(/(?:文件|服务文件|测试文件)\s+([^\s:，,]+)/);
+      const relatedFile = fileMatch?.[1] || "Verifier";
+      return {
+        id: `BUG-VERIFIER-${index + 1}`,
+        title: `${relatedFile} 预检未通过`,
+        description: line,
+        severity: "major" as const,
+        status: "open" as const,
+        relatedFiles: fileMatch?.[1] ? [fileMatch[1]] : [],
+        rawErrorSnippet: line,
+        detectedRound,
+      };
+    });
+  }
+
+  function mapProtocolFailureType(
+    failures: ProtocolFailure[]
+  ): "planning_gap" | "implementation_bug" | "environment_gap" | "runtime_gap" {
+    if (failures.some((failure) => failure.type === "tooling_unavailable")) return "environment_gap";
+    if (failures.some((failure) => failure.type === "runtime_mismatch")) return "runtime_gap";
+    if (failures.some((failure) => failure.type === "contract_drift")) return "implementation_bug";
+    return "planning_gap";
+  }
+
+  function inferQaFailureType(
+    issues: Issue[],
+    opts: {
+      verifierFailed: boolean;
+      deploymentFail: boolean;
+      environmentProblem: boolean;
+    }
+  ): "planning_gap" | "implementation_bug" | "environment_gap" | "runtime_gap" {
+    if (opts.environmentProblem) return "environment_gap";
+    if (opts.deploymentFail) return "runtime_gap";
+    if (issues.some((issue) => /契约漂移|导出|语法|类型|阻塞/.test(`${issue.title} ${issue.description}`))) {
+      return "implementation_bug";
+    }
+    if (opts.verifierFailed) return "planning_gap";
+    return "implementation_bug";
+  }
+
   startSpan("qa");
   emit("phase-change", "System", "verification");
 
   const round = state.retryCount || 0;
   const rawUnitOutput = state.testResults || "";
-  const unitTestFail = /fail|error|✖/i.test(rawUnitOutput);
-  const deploymentFail = state.deploymentStatus?.status === 'failed';
+  const failureEvidence = extractFailureEvidence(rawUnitOutput, state.deploymentStatus, state.blockedReason);
+  const unitTestFail = failureEvidence.hasBlockingFailure && !failureEvidence.deploymentFailed;
+  const deploymentFail = failureEvidence.deploymentFailed;
   const failureFingerprint = buildFailureFingerprint(rawUnitOutput);
   const sameFailureCount = failureFingerprint && state.failureFingerprint === failureFingerprint
     ? (state.sameFailureCount || 0) + 1
@@ -40,13 +105,74 @@ export async function qaNode(
 
   // 1. 如果完全没有错误，且之前的 Issue 都已解决，则直接通过
   const openIssues = (state.issueTracker || []).filter(i => i.status === 'open');
-  if (!unitTestFail && !deploymentFail && openIssues.length === 0) {
+  if (!failureEvidence.hasBlockingFailure && openIssues.length === 0) {
+    const validationReport = buildValidationReport([], { status: "pass", blocking: false });
     return {
       isDone: true,
+      qaFailures: null,
       recoveredEnvironment: false,
       failureFingerprint: "",
       sameFailureCount: 0,
+      validationReport,
+      repairPlan: null,
     };
+  }
+
+  // 1.0 如果当前没有任何失败证据，但还残留历史 open issues，
+  // 说明这些工单已经失去现时性，不能再阻塞流程。
+  if (!failureEvidence.hasBlockingFailure && openIssues.length > 0) {
+    const resolvedIssues = (state.issueTracker || []).map((issue) =>
+      issue.status === "open"
+        ? {
+            ...issue,
+            status: "resolved" as const,
+          }
+        : issue
+    );
+    const consensusProgress: ConsensusProgress = {
+      completedFiles: state.consensusProgress?.completedFiles || [],
+      pendingFiles: state.consensusProgress?.pendingFiles || [],
+      currentRound: round,
+      openIssues: [],
+    };
+    const noteId = `note-qa-r${round}`;
+    const summary = `QA 第${round}轮：放行，自动关闭 ${openIssues.length} 个历史工单`;
+    const fullContent = `# QA 第${round}轮审计纪要
+
+## 判定结论
+- 结论：放行
+- 是否存在失败证据：否
+- 自动关闭的历史工单数：${openIssues.length}
+
+## 说明
+当前 terminal/verifier/deploy/coder 均未提供新的失败证据，因此历史遗留工单不再阻塞流程，已统一标记为 resolved。
+
+## 已关闭工单
+\`\`\`json
+${JSON.stringify(resolvedIssues.filter((issue) => issue.status === "resolved"), null, 2)}
+\`\`\`
+`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
+    const validationReport = buildValidationReport([], { status: "pass", blocking: false });
+    const result = {
+      issueTracker: resolvedIssues,
+      isDone: true,
+      retryCount: state.retryCount || 0,
+      recoveredEnvironment: false,
+      failureFingerprint: "",
+      sameFailureCount: 0,
+      qaFailures: null,
+      protocolFailures: [],
+      blockedReason: "",
+      consensusProgress,
+      meetingNotes: [meetingNote],
+      validationReport,
+      repairPlan: null,
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    };
+    await saveBoulder({ ...state, ...result }, "qa");
+    return result;
   }
 
   // 1.1 环境问题优先自动修复，避免把依赖缺失误判为代码缺陷反复返工
@@ -62,6 +188,13 @@ export async function qaNode(
         result: "success",
         fingerprint: failureFingerprint || undefined,
       }];
+      const validationReport = buildValidationReport(
+        [{
+          summary: fixed.action || "环境问题已自动修复",
+          evidence: [problem.reason || fixed.action || "environment repaired"],
+        }],
+        { failureType: "environment_gap", blocking: true }
+      );
       const result = {
         isDone: false,
         // 环境修复成功后不消耗重试次数，直接进入下一轮验证链路
@@ -72,6 +205,8 @@ export async function qaNode(
         qaFailures: { failedFiles: [], testErrors: [fixed.action || "环境修复成功"], failedTestNames: [] },
         testResults: `${rawUnitOutput}\n[环境自动修复] ${fixed.action || "已完成"}`,
         repairLedger: ledger,
+        validationReport,
+        repairPlan: buildRepairPlan(validationReport),
       };
       await saveBoulder({ ...state, ...result }, "qa_env_fix");
       return result;
@@ -84,6 +219,130 @@ export async function qaNode(
   let m;
   while ((m = failPattern.exec(rawUnitOutput)) !== null) {
     failingTestFiles.push(m[1]);
+  }
+
+  const isCoderBlockedFailure = failureEvidence.coderBlocked;
+  if (isCoderBlockedFailure) {
+    const blockedFiles = Array.from(new Set(state.qaFailures?.failedFiles || []));
+    const blockedErrors = state.qaFailures?.testErrors?.length
+      ? state.qaFailures.testErrors
+      : [state.blockedReason].filter(Boolean) as string[];
+    const issues: Issue[] = blockedFiles.map((file, index) => ({
+      id: `BUG-CODER-BLOCK-${index + 1}`,
+      title: `${file} 阻塞了本轮生成`,
+      description: `Coder 在生成 ${file} 时遇到阻塞错误，必须先修复该文件后才能继续后续文件生成。请优先处理这一个阻塞点，暂不要扩散到仍处于 pending 的文件。`,
+      severity: "major",
+      status: "open",
+      relatedFiles: [file],
+      rawErrorSnippet: blockedErrors[index] || blockedErrors[0] || state.blockedReason,
+      detectedRound: round,
+    }));
+
+    const consensusProgress: ConsensusProgress = {
+      completedFiles: state.consensusProgress?.completedFiles || [],
+      pendingFiles: state.consensusProgress?.pendingFiles || [],
+      currentRound: round,
+      openIssues: issues.map((i) => `${i.id} ${i.title}`),
+    };
+
+    const noteId = `note-qa-r${round}`;
+    const summary = `QA 第${round}轮：聚焦 Coder 阻塞文件 ${blockedFiles.join(", ")}`;
+    const fullContent = `# QA 第${round}轮阻塞审计纪要\n\n## 阻塞原因\n${state.blockedReason}\n\n## 聚焦工单\n\`\`\`json\n${JSON.stringify(issues, null, 2)}\n\`\`\`\n`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
+    const validationReport = buildValidationReport(
+      blockedErrors.map((error, index) => ({
+        summary: error,
+        file: blockedFiles[index] || blockedFiles[0],
+        evidence: [error],
+      })),
+      { failureType: "implementation_bug", blocking: true }
+    );
+
+    const result = {
+      issueTracker: issues,
+      isDone: false,
+      retryCount: (state.retryCount || 0) + 1,
+      recoveredEnvironment: false,
+      failureFingerprint,
+      sameFailureCount,
+      qaFailures: {
+        failedFiles: blockedFiles,
+        testErrors: blockedErrors,
+        failedTestNames: []
+      },
+      validationReport,
+      repairPlan: buildRepairPlan(validationReport),
+      consensusProgress,
+      meetingNotes: [meetingNote],
+      lastFailedNode: "coder",
+      lastFailureSummary: state.blockedReason || blockedErrors[0] || "Coder 阻塞失败",
+    };
+
+    await saveBoulder({ ...state, ...result }, "qa");
+    return result;
+  }
+
+  const blockingProtocolFailures = (state.protocolFailures || []).filter((item) => item?.blocking);
+  if (blockingProtocolFailures.length > 0) {
+    const issues = buildIssuesFromProtocolFailures(blockingProtocolFailures, round);
+    const consensusProgress: ConsensusProgress = {
+      completedFiles: state.consensusProgress?.completedFiles || [],
+      pendingFiles: state.consensusProgress?.pendingFiles || [],
+      currentRound: round,
+      openIssues: issues.map((issue) => `${issue.id} ${issue.title}`),
+    };
+    const primaryFailure = blockingProtocolFailures[0];
+    const failureType = mapProtocolFailureType(blockingProtocolFailures);
+    const noteId = `note-qa-r${round}`;
+    const summary = `QA 第${round}轮：协议阻塞 ${blockingProtocolFailures.length} 项`;
+    const fullContent = `# QA 第${round}轮协议审计纪要
+
+## 判定结论
+- 结论：阻塞
+- QA 是否调用 LLM：否
+- 协议阻塞项数：${blockingProtocolFailures.length}
+
+## 协议失败
+\`\`\`json
+${JSON.stringify(blockingProtocolFailures, null, 2)}
+\`\`\`
+
+## 生成工单
+\`\`\`json
+${JSON.stringify(issues, null, 2)}
+\`\`\`
+`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
+    const validationReport = buildValidationReport(
+      blockingProtocolFailures.map((failure) => ({
+        summary: failure.summary,
+        file: failure.file,
+        evidence: failure.evidence || [failure.summary],
+      })),
+      { failureType, blocking: true }
+    );
+    const result = {
+      issueTracker: issues,
+      isDone: false,
+      retryCount: (state.retryCount || 0) + 1,
+      recoveredEnvironment: false,
+      failureFingerprint,
+      sameFailureCount,
+      qaFailures: {
+        failedFiles: Array.from(new Set(issues.flatMap((issue) => issue.relatedFiles))),
+        testErrors: issues.map((issue) => `${issue.title}: ${issue.description}`),
+        failedTestNames: [],
+      },
+      validationReport,
+      repairPlan: buildRepairPlan(validationReport),
+      consensusProgress,
+      meetingNotes: [meetingNote],
+      lastFailedNode: primaryFailure.node || "qa",
+      lastFailureSummary: primaryFailure.summary || "执行协议未通过",
+    };
+
+    await saveBoulder({ ...state, ...result }, "qa");
+    return result;
   }
 
   // 2. 唤醒 QA (清扬) 进行深度分析
@@ -121,6 +380,7 @@ ${JSON.stringify(state.issueTracker || [])}
 请确保内容使用中文。`;
 
   const response = await agents.qa.chat([{ role: "user", content: prompt }], (ev) => emit(ev.type, ev.sender, "正在深度审计质量问题", ev), {
+    mode: "coding",
     workspaceDir: WORKSPACE,
     brief: buildSystemContext(state)
   });
@@ -128,13 +388,12 @@ ${JSON.stringify(state.issueTracker || [])}
   const parsed = parseJsonFromResponse(extractText(response.content), { issues: [] });
   let issues: Issue[] = parsed.issues || [];
 
-  // 安全网：如果 LLM 解析失败返回空数组，但测试仍在失败，保留上轮存量工单（防止 failedFiles 为空导致死循环）
-  if (issues.length === 0 && (unitTestFail || deploymentFail)) {
+  // 安全网：如果 LLM 解析失败返回空数组，但验证仍未通过，必须生成兜底工单，禁止 QA 歧义放行
+  if (issues.length === 0 && failureEvidence.hasBlockingFailure) {
     const existingOpen = (state.issueTracker || []).filter(i => i.status === 'open');
     if (existingOpen.length > 0) {
       issues = existingOpen;
     } else if (failingTestFiles.length > 0) {
-      // 最后兜底：从静态检测到的失败测试文件生成工单
       issues = failingTestFiles.map((f, idx) => ({
         id: `BUG-AUTO-${idx + 1}`,
         title: `${f} 测试失败`,
@@ -145,12 +404,36 @@ ${JSON.stringify(state.issueTracker || [])}
         rawErrorSnippet: '',
         detectedRound: round,
       }));
+    } else if (failureEvidence.verifierFailed) {
+      issues = buildVerifierFallbackIssues(rawUnitOutput, round);
+    } else if (deploymentFail) {
+      issues = [{
+        id: "BUG-DEPLOY-001",
+        title: "部署连通性验证失败",
+        description: deployErrorSection || "部署健康检查失败，请检查启动日志、监听端口和容器映射。",
+        severity: "critical",
+        status: "open",
+        relatedFiles: [],
+        rawErrorSnippet: rawUnitOutput.slice(0, 400),
+        detectedRound: round,
+      }];
+    } else {
+      issues = [{
+        id: "BUG-QA-FALLBACK-001",
+        title: "测试验证未通过",
+        description: "测试输出中存在明确失败证据，但未能自动归因到具体工单，请优先检查最新失败日志。",
+        severity: "major",
+        status: "open",
+        relatedFiles: [],
+        rawErrorSnippet: rawUnitOutput.slice(0, 400),
+        detectedRound: round,
+      }];
     }
   }
 
   // 3. 决策路由逻辑
-  const activeCriticalIssues = issues.filter(i => i.status === 'open' && (i.severity === 'critical' || i.severity === 'major'));
-  const isDone = activeCriticalIssues.length === 0 && !unitTestFail && !deploymentFail;
+  const activeOpenIssues = issues.filter(i => i.status === 'open');
+  const isDone = activeOpenIssues.length === 0 && !failureEvidence.hasBlockingFailure;
 
   // 更新 consensusProgress.openIssues
   const stillOpenIssues = issues.filter(i => i.status === 'open');
@@ -164,10 +447,44 @@ ${JSON.stringify(state.issueTracker || [])}
 
   const critical = issues.filter(i => i.status === 'open' && i.severity === 'critical').length;
   const major = issues.filter(i => i.status === 'open' && i.severity === 'major').length;
+  const failureType = isDone
+    ? undefined
+    : inferQaFailureType(issues, {
+        verifierFailed: failureEvidence.verifierFailed,
+        deploymentFail,
+        environmentProblem: problem.type === "environment_problem",
+      });
   const noteId = `note-qa-r${round}`;
-  const summary = `QA 第${round}轮：${critical}个严重，${major}个主要问题`;
-  const fullContent = `# QA 第${round}轮审计纪要\n\n## 缺陷工单\n\`\`\`json\n${JSON.stringify(issues, null, 2)}\n\`\`\`\n`;
+  const decisionLabel = isDone ? "放行" : "阻塞";
+  const summary = `QA 第${round}轮：${decisionLabel}，${critical}个严重，${major}个主要问题`;
+  const fullContent = `# QA 第${round}轮审计纪要
+
+## 判定结论
+- 结论：${decisionLabel}
+- 是否存在失败证据：${failureEvidence.hasBlockingFailure ? "是" : "否"}
+- Verifier 预检失败：${failureEvidence.verifierFailed ? "是" : "否"}
+- 单元/编译失败：${unitTestFail ? "是" : "否"}
+- 部署失败：${deploymentFail ? "是" : "否"}
+- 当前未关闭工单数：${activeOpenIssues.length}
+
+## 缺陷工单
+\`\`\`json
+${JSON.stringify(issues, null, 2)}
+\`\`\`
+  `;
   const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
+  const validationReport = isDone
+    ? buildValidationReport([], { status: "pass", blocking: false })
+    : buildValidationReport(
+        issues
+          .filter((issue) => issue.status === "open")
+          .map((issue) => ({
+            summary: issue.title,
+            file: issue.relatedFiles?.[0],
+            evidence: [issue.description || issue.rawErrorSnippet || issue.title].filter(Boolean),
+          })),
+        { failureType, blocking: true }
+      );
 
   // P1-B：QA 决策重试时统一增加 retryCount（语义：已完成 QA 判断并决定重试的次数）
   const result = {
@@ -177,7 +494,7 @@ ${JSON.stringify(state.issueTracker || [])}
     recoveredEnvironment: false,
     failureFingerprint: isDone ? "" : failureFingerprint,
     sameFailureCount: isDone ? 0 : sameFailureCount,
-    qaFailures: {
+    qaFailures: isDone ? null : {
       // 合并 LLM 识别的文件 + 静态从测试输出提取的失败测试文件（双保险）
       failedFiles: Array.from(new Set([
         ...issues.filter(i => i.status === 'open').flatMap(i => i.relatedFiles),
@@ -186,8 +503,14 @@ ${JSON.stringify(state.issueTracker || [])}
       testErrors: issues.filter(i => i.status === 'open').map(i => `${i.title}: ${i.description}`),
       failedTestNames: []
     },
+    validationReport,
+    repairPlan: isDone ? null : buildRepairPlan(validationReport),
     consensusProgress,
     meetingNotes: [meetingNote],
+    lastFailedNode: isDone ? "" : (deploymentFail ? "deploy" : failureEvidence.verifierFailed ? "verifier" : "qa"),
+    lastFailureSummary: isDone
+      ? ""
+      : (issues[0]?.title ? `${decisionLabel}：${issues[0].title}` : `${decisionLabel}：测试验证未通过`),
   };
 
   await saveBoulder({ ...state, ...result }, "qa");

@@ -5,6 +5,8 @@ import { BaseAgent } from "../agent";
 import {
   logPrefix,
   buildSystemContext,
+  buildCustomerApprovalState,
+  buildRequirementProtocol,
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
@@ -47,6 +49,15 @@ export async function pmNode(
   const contract = parseJsonFromResponse(extractText(response.content), { title: "待办任务", requirements: [], acceptanceCriteria: [] });
   const validation = TaskContractSchema.safeParse(contract);
   if (!validation.success) console.warn("[PM] TaskContract 校验失败:", validation.error.message);
+  const requirementProtocol = buildRequirementProtocol(contract);
+  const customerApprovalState = buildCustomerApprovalState({
+    autoApprove: state.customerApprovalState?.autoApprove,
+    summaries: {
+      requirements: `${contract.title}：${(contract.requirements || []).slice(0, 3).join("；")}`,
+      solution: state.customerApprovalState?.checkpoints?.find((item) => item.stage === "solution")?.summary || "",
+      deploy: state.customerApprovalState?.checkpoints?.find((item) => item.stage === "deploy")?.summary || "",
+    },
+  });
 
   await fs.mkdir(WORKSPACE, { recursive: true });
   await fs.writeFile(path.join(WORKSPACE, "contract.json"), JSON.stringify(contract, null, 2));
@@ -72,6 +83,8 @@ export async function pmNode(
 
   const result = {
     contract,
+    requirementProtocol,
+    customerApprovalState,
     consensusCore,
     meetingNotes: [meetingNote],
     teamChatLog: [{ sender: agents.pm.getPersona().name, content: `我已经定义好了任务契约。` }],

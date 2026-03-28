@@ -7,6 +7,7 @@ import { SystemMessage, HumanMessage, AIMessage, ToolMessage, BaseMessage } from
 import * as fs from "fs/promises";
 import * as path from "path";
 import { AuditLogger } from "../utils/audit";
+import { getBeijingTime } from "../utils/common";
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 
@@ -18,6 +19,44 @@ function isRetryableError(err: any): boolean {
   const message = (err.message || "").toLowerCase();
   if (message.includes("timeout") || message.includes("econnreset") || message.includes("network error")) return true;
   return false;
+}
+
+function formatErrorMessage(err: any): string {
+  return err?.message || String(err);
+}
+
+function extractTokenUsage(response: any): { inputTokens: number; outputTokens: number; totalTokens: number; model?: string } | null {
+  const usage = response?.usage_metadata || response?.response_metadata?.usage || response?.response_metadata?.tokenUsage;
+  const inputTokens = Number(
+    usage?.input_tokens ??
+    usage?.prompt_tokens ??
+    usage?.promptTokens ??
+    usage?.inputTokens ??
+    0
+  );
+  const outputTokens = Number(
+    usage?.output_tokens ??
+    usage?.completion_tokens ??
+    usage?.completionTokens ??
+    usage?.outputTokens ??
+    0
+  );
+  const totalTokens = Number(
+    usage?.total_tokens ??
+    usage?.totalTokens ??
+    inputTokens + outputTokens
+  );
+
+  if (inputTokens <= 0 && outputTokens <= 0 && totalTokens <= 0) {
+    return null;
+  }
+
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    model: response?.response_metadata?.model_name || response?.response_metadata?.model || response?.lc_kwargs?.model,
+  };
 }
 
 export interface AgentPersona {
@@ -57,6 +96,84 @@ export class BaseAgent {
       return this.models.get(mode)!;
     }
     return this.models.get("default")!;
+  }
+
+  private buildFallbackChain(mode?: string): string[] {
+    const preferred = mode && this.models.has(mode) ? mode : "default";
+    const ordered = [preferred];
+
+    if (preferred !== "default" && this.models.has("default")) {
+      ordered.push("default");
+    }
+    if (!ordered.includes("coding") && this.models.has("coding")) {
+      ordered.push("coding");
+    }
+    if (!ordered.includes("reasoning") && this.models.has("reasoning")) {
+      ordered.push("reasoning");
+    }
+
+    for (const key of this.models.keys()) {
+      if (!ordered.includes(key)) {
+        ordered.push(key);
+      }
+    }
+
+    return ordered;
+  }
+
+  private async invokeWithRetry(model: any, messages: BaseMessage[], workspaceDir?: string) {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await model.invoke(messages);
+      } catch (error: any) {
+        if (attempt < 2 && isRetryableError(error)) {
+          const delay = 1000 * Math.pow(2, attempt);
+          console.warn(`[Agent] ${this.persona.name} 第 ${attempt + 1} 次调用失败，${delay}ms 后重试...`);
+          await sleep(delay);
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
+  private async invokeWithFallback(messages: BaseMessage[], mode: string | undefined, workspaceDir?: string) {
+    const chain = this.buildFallbackChain(mode);
+    let lastError: any;
+
+    for (let idx = 0; idx < chain.length; idx++) {
+      const candidateMode = chain[idx];
+      const selectedModel = this.selectModel(candidateMode);
+      const shouldBindTools = this.tools.length > 0 && candidateMode !== "reasoning";
+      const modelWithTools = shouldBindTools
+        ? (selectedModel as any).bindTools(this.tools)
+        : selectedModel;
+
+      try {
+        const response = await this.invokeWithRetry(modelWithTools, messages, workspaceDir);
+        return { response, usedMode: candidateMode };
+      } catch (error: any) {
+        lastError = error;
+        const hasMoreCandidates = idx < chain.length - 1;
+        if (!hasMoreCandidates || !isRetryableError(error)) {
+          console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
+          if (error.response?.data) {
+            console.error("Raw API Response Data:", JSON.stringify(error.response.data, null, 2));
+            await AuditLogger.log(workspaceDir, this.persona.name, `### [Critical Error]\n\nRaw API Response Data:\n\`\`\`json\n${JSON.stringify(error.response.data, null, 2)}\n\`\`\``);
+          } else {
+            console.error("Error Detail:", error);
+            await AuditLogger.log(workspaceDir, this.persona.name, `### [Critical Error]\n\nError Detail:\n${formatErrorMessage(error)}`);
+          }
+          throw error;
+        }
+        const nextMode = chain[idx + 1];
+        const fallbackMessage = `模型 ${candidateMode} 调用失败（${formatErrorMessage(error)}），切换到 ${nextMode} 继续。`;
+        console.warn(`[Agent] ${this.persona.name} ${fallbackMessage}`);
+        await AuditLogger.log(workspaceDir, this.persona.name, `### [Model Fallback]\n\n${fallbackMessage}`);
+      }
+    }
+
+    throw lastError;
   }
 
   /**
@@ -130,49 +247,35 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
       });
     }
 
-    // 按 mode 选模型，绑定工具（如果有）
-    // reasoning 模式不绑工具：DeepSeek Reasoner 多轮对话需要 reasoning_content 字段，
-    // LangChain 序列化时会丢失该字段导致 400 错误；且推理节点只需分析不需工具调用
-    const selectedModel = this.selectModel(options?.mode);
-    const shouldBindTools = this.tools.length > 0 && options?.mode !== "reasoning";
-    const modelWithTools = shouldBindTools
-      ? (selectedModel as any).bindTools(this.tools)
-      : selectedModel;
-
     let response: any;
     let currentMessages = [...formattedMessages];
     const MAX_TOOL_ITERATIONS = 10;
+    let activeMode = options?.mode;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      // 带指数退避的调用重试（最多 3 次）
-      for (let attempt = 0; attempt < 3; attempt++) {
-        try {
-          response = await modelWithTools.invoke(currentMessages);
-          break;
-        } catch (error: any) {
-          if (attempt < 2 && isRetryableError(error)) {
-            const delay = 1000 * Math.pow(2, attempt);
-            console.warn(`[Agent] ${this.persona.name} 第 ${attempt + 1} 次调用失败，${delay}ms 后重试...`);
-            await sleep(delay);
-            continue;
-          }
-          console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
-          if (error.response?.data) {
-            console.error("Raw API Response Data:", JSON.stringify(error.response.data, null, 2));
-            await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Critical Error]\n\nRaw API Response Data:\n\`\`\`json\n${JSON.stringify(error.response.data, null, 2)}\n\`\`\``);
-          } else {
-            console.error("Error Detail:", error);
-            await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Critical Error]\n\nError Detail:\n${error.message || error}`);
-          }
-          throw error;
-        }
-      }
+      const invoked = await this.invokeWithFallback(currentMessages, activeMode, options?.workspaceDir);
+      response = invoked.response;
+      activeMode = invoked.usedMode;
 
       const toolCalls = response.tool_calls ?? [];
       
       // 审计记录：模型输出内容
       if (response.content) {
         await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Response Content]\n\n${response.content}`);
+      }
+
+      const tokenUsage = extractTokenUsage(response);
+      if (tokenUsage) {
+        await AuditLogger.recordTokenUsage(options?.workspaceDir, {
+          timestamp: getBeijingTime(),
+          agent: this.persona.name,
+          mode: activeMode || "default",
+          model: tokenUsage.model,
+          calls: 1,
+          inputTokens: tokenUsage.inputTokens,
+          outputTokens: tokenUsage.outputTokens,
+          totalTokens: tokenUsage.totalTokens,
+        });
       }
 
       if (toolCalls.length === 0) break;

@@ -17,6 +17,9 @@ const {
   buildReplayStateFromSnapshot,
   getResumeNodeFromCheckpoint,
   prepareReplayStateFromCheckpoint,
+  persistWriteRecoveryIntent,
+  recoverWorkspaceFromWriteIntents,
+  extractFailureEvidence,
   validateWorkspaceArtifacts,
 } = require("../../src/core/logic_utils");
 
@@ -58,10 +61,38 @@ test("trace index summarizes nodes, notes, file changes and failure state", asyn
     ],
     lastFailedNode: "verifier",
     lastFailureSummary: "verifier 节点异常：contract drift",
+    protocolFailures: [
+      {
+        type: "contract_drift",
+        node: "verifier",
+        file: "src/routes/userRoutes.ts",
+        summary: "路由导出契约不一致",
+        evidence: ["缺少导出 createUser"],
+        blocking: true,
+      },
+    ],
+    protocolPatches: [
+      {
+        target: "contracts",
+        action: "replace",
+        path: "files.src/routes/userRoutes.ts.requiredExports",
+        value: ["router"],
+        reason: "统一路由导出",
+      },
+    ],
   });
 
   const checkpoints = [buildCheckpointMeta("orchestrator", 0, "2026-03-23 19:58:00")];
-  const index = buildTraceIndex(state, "verifier", "trace_123", "2026-03-23 20:00:00", checkpoints);
+  const index = buildTraceIndex(state, "verifier", "trace_123", "2026-03-23 20:00:00", checkpoints, {
+    calls: 2,
+    inputTokens: 100,
+    outputTokens: 40,
+    totalTokens: 140,
+    byAgent: {
+      星河: { calls: 1, inputTokens: 60, outputTokens: 20, totalTokens: 80 },
+      清扬: { calls: 1, inputTokens: 40, outputTokens: 20, totalTokens: 60 },
+    },
+  });
 
   assert.equal(index.traceId, "trace_123");
   assert.equal(index.lastNode, "verifier");
@@ -75,6 +106,12 @@ test("trace index summarizes nodes, notes, file changes and failure state", asyn
   assert.equal(index.checkpoints.length, 1);
   assert.equal(index.checkpoints[0].node, "orchestrator");
   assert.equal(index.timeline[index.timeline.length - 1].node, "verifier");
+  assert.equal(index.tokenUsage.totalTokens, 140);
+  assert.equal(index.tokenUsage.byAgent["星河"].totalTokens, 80);
+  assert.equal(index.protocolFailures.length, 1);
+  assert.equal(index.protocolFailures[0].type, "contract_drift");
+  assert.equal(index.protocolPatches.length, 1);
+  assert.equal(index.protocolPatches[0].path, "files.src/routes/userRoutes.ts.requiredExports");
 });
 
 test("checkpoint rules only keep stable success anchors", () => {
@@ -166,6 +203,20 @@ test("checkpoint replay state includes resume target", () => {
   assert.equal(replayState.subTasks[0].status, "completed");
 });
 
+test("failure evidence detection catches verifier, deploy and coder-block markers", () => {
+  const verifier = extractFailureEvidence("[Verifier 预检失败]\n测试文件 tests/setup.test.ts 未找到断言", null, "");
+  assert.equal(verifier.hasBlockingFailure, true);
+  assert.equal(verifier.verifierFailed, true);
+
+  const deploy = extractFailureEvidence("some output\n[部署验证失败] 无法访问", { status: "failed" }, "");
+  assert.equal(deploy.hasBlockingFailure, true);
+  assert.equal(deploy.deploymentFailed, true);
+
+  const coder = extractFailureEvidence("[Coder 阻塞失败]\nCoder 阻塞失败: src/index.ts -> syntax", null, "syntax");
+  assert.equal(coder.hasBlockingFailure, true);
+  assert.equal(coder.coderBlocked, true);
+});
+
 test("replay graph reuses provided workspace and trace context", async () => {
   const workspace = await createTempWorkspace();
 
@@ -191,13 +242,20 @@ test("workspace artifact validator accepts consistent replay artifacts", async (
 
   try {
     const checkpoint = buildCheckpointMeta("verifier", 2, "2026-03-23 21:00:00");
+    await fs.mkdir(`${workspace}/nodes`, { recursive: true });
+    await fs.mkdir(`${workspace}/audit`, { recursive: true });
     const state = createBaseState({
       retryCount: 2,
+      lastFailedNode: "verifier",
+      lastFailureSummary: "文件缺失: src/index.ts",
       subTasks: [
         { id: "t1", description: "entry", fileTarget: "src/index.ts", dependencies: [], contextRequirement: "", status: "completed" },
       ],
       codeLog: [
         { round: 2, file: "src/index.ts", taskTitle: "entry", status: "written" },
+      ],
+      meetingNotes: [
+        { id: "note-verifier-r2", phase: "verifier", round: 2, summary: "Verifier 第2轮：发现 1 个预检问题", contentFile: "nodes/note-verifier-r2.md" },
       ],
     });
     const snapshot = {
@@ -209,6 +267,8 @@ test("workspace artifact validator accepts consistent replay artifacts", async (
     const traceIndex = buildTraceIndex(state, "verifier", "trace_consistent", "2026-03-23 21:00:00", [checkpoint]);
 
     await fs.mkdir(`${workspace}/checkpoints`, { recursive: true });
+    await fs.writeFile(`${workspace}/nodes/note-verifier-r2.md`, "# Verifier\n\n文件缺失: src/index.ts\n");
+    await fs.writeFile(`${workspace}/audit/Terminal.md`, "[Verifier 预检失败]\n文件缺失: src/index.ts\n");
     await fs.writeFile(`${workspace}/boulder.json`, JSON.stringify(snapshot, null, 2));
     await fs.writeFile(`${workspace}/trace-index.json`, JSON.stringify(traceIndex, null, 2));
     await fs.writeFile(`${workspace}/${checkpoint.file}`, JSON.stringify(snapshot, null, 2));
@@ -247,6 +307,39 @@ test("workspace artifact validator detects checkpoint trace drift", async () => 
     assert.equal(result.ok, false);
     assert.match(result.errors.join("\n"), /trace/i);
     assert.match(result.errors.join("\n"), /checkpoint/i);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("workspace artifact validator detects missing failure note and audit evidence", async () => {
+  const workspace = await createTempWorkspace();
+
+  try {
+    const checkpoint = buildCheckpointMeta("deploy", 1, "2026-03-24 01:00:00");
+    const state = createBaseState({
+      retryCount: 1,
+      lastFailedNode: "deploy",
+      lastFailureSummary: "部署验证失败：无法访问 http://127.0.0.1:4000",
+      meetingNotes: [],
+    });
+    const snapshot = {
+      node: "deploy",
+      timestamp: "2026-03-24 01:00:00",
+      traceId: "trace_missing_failure_evidence",
+      state,
+    };
+    const traceIndex = buildTraceIndex(state, "deploy", "trace_missing_failure_evidence", "2026-03-24 01:00:00", [checkpoint]);
+
+    await fs.mkdir(`${workspace}/checkpoints`, { recursive: true });
+    await fs.writeFile(`${workspace}/boulder.json`, JSON.stringify(snapshot, null, 2));
+    await fs.writeFile(`${workspace}/trace-index.json`, JSON.stringify(traceIndex, null, 2));
+    await fs.writeFile(`${workspace}/${checkpoint.file}`, JSON.stringify(snapshot, null, 2));
+
+    const result = await validateWorkspaceArtifacts(workspace);
+    assert.equal(result.ok, false);
+    assert.match(result.errors.join("\n"), /meetingNote|纪要/i);
+    assert.match(result.errors.join("\n"), /Infrastructure\.md|audit/i);
   } finally {
     await removeTempWorkspace(workspace);
   }
@@ -318,6 +411,76 @@ test("workspace artifact validator detects failed subtask that still looks writt
     assert.match(result.errors.join("\n"), /src\/index\.ts/);
     assert.match(result.errors.join("\n"), /failed/i);
     assert.match(result.errors.join("\n"), /written/i);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("write recovery intent reconciles interrupted coder write into workspace state", async () => {
+  const workspace = await createTempWorkspace();
+
+  try {
+    const state = createBaseState({
+      retryCount: 0,
+      subTasks: [
+        { id: "task-001", description: "package", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" },
+        { id: "task-002", description: "tsconfig", fileTarget: "tsconfig.json", dependencies: [], contextRequirement: "", status: "pending" },
+      ],
+      code: JSON.stringify({
+        "package.json": "{\"name\":\"demo\"}",
+      }),
+      codeLog: [
+        { round: 0, file: "package.json", taskTitle: "package", status: "written" },
+      ],
+    });
+    const snapshot = {
+      node: "coder_task_task-001",
+      timestamp: "2026-03-24 10:00:00",
+      traceId: "trace_interrupt_fix",
+      state,
+    };
+    const traceIndex = buildTraceIndex(state, "coder_task_task-001", "trace_interrupt_fix", "2026-03-24 10:00:00", []);
+
+    await fs.mkdir(`${workspace}/src`, { recursive: true });
+    await fs.writeFile(`${workspace}/boulder.json`, JSON.stringify(snapshot, null, 2));
+    await fs.writeFile(`${workspace}/trace-index.json`, JSON.stringify(traceIndex, null, 2));
+    await fs.writeFile(`${workspace}/tsconfig.json`, JSON.stringify({ compilerOptions: { strict: true } }, null, 2));
+
+    const recoveredState = {
+      ...state,
+      code: JSON.stringify({
+        "package.json": "{\"name\":\"demo\"}",
+        "tsconfig.json": JSON.stringify({ compilerOptions: { strict: true } }, null, 2),
+      }),
+      subTasks: [
+        { id: "task-001", description: "package", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" },
+        { id: "task-002", description: "tsconfig", fileTarget: "tsconfig.json", dependencies: [], contextRequirement: "", status: "completed" },
+      ],
+      codeLog: [
+        { round: 0, file: "package.json", taskTitle: "package", status: "written" },
+        { round: 0, file: "tsconfig.json", taskTitle: "tsconfig", status: "written" },
+      ],
+    };
+
+    await persistWriteRecoveryIntent(workspace, {
+      taskId: "task-002",
+      fileTarget: "tsconfig.json",
+      expectedContent: JSON.stringify({ compilerOptions: { strict: true } }, null, 2),
+      nodeName: "coder_task_task-002",
+      traceId: "trace_interrupt_fix",
+      snapshotState: recoveredState,
+    });
+
+    const recovered = await recoverWorkspaceFromWriteIntents(workspace);
+    assert.equal(recovered.recovered, 1);
+    assert.equal(recovered.recoveredFiles[0], "tsconfig.json");
+
+    const nextBoulder = JSON.parse(await fs.readFile(`${workspace}/boulder.json`, "utf-8"));
+    assert.equal(nextBoulder.node, "coder_task_task-002");
+    assert.equal(nextBoulder.state.subTasks[1].status, "completed");
+
+    const nextTraceIndex = JSON.parse(await fs.readFile(`${workspace}/trace-index.json`, "utf-8"));
+    assert.equal(nextTraceIndex.files["tsconfig.json"].lastStatus, "written");
   } finally {
     await removeTempWorkspace(workspace);
   }

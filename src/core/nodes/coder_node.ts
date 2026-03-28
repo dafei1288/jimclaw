@@ -5,10 +5,33 @@ import { JimClawState, FileChangeEntry, ConsensusProgress } from "../graph_types
 import { BaseAgent } from "../agent";
 import {
   buildSystemContext,
+  getProtocolFileContract,
+  getDeterministicTemplateScaffold,
   logPrefix,
-  writeMeetingNote
+  writeMeetingNote,
+  persistWriteRecoveryIntent,
+  clearWriteRecoveryIntent
 } from "../logic_utils";
 import { extractText, extractCodeFromResponse } from "../../utils/common";
+
+function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: readonly ts.Diagnostic[]): string {
+  return diagnostics
+    .map((diag) => {
+      const message = ts.flattenDiagnosticMessageText(diag.messageText, "\n");
+      if (typeof diag.start !== "number") {
+        return `语法错误: ${message}`;
+      }
+
+      const sourceFile = ts.createSourceFile(fileTarget, content, ts.ScriptTarget.ES2020, true);
+      const position = sourceFile.getLineAndCharacterOfPosition(diag.start);
+      const lineNumber = position.line + 1;
+      const columnNumber = position.character + 1;
+      const lineText = sourceFile.text.split(/\r?\n/)[position.line] || "";
+      const snippet = lineText.trim().slice(0, 160);
+      return `语法错误(L${lineNumber}:C${columnNumber}): ${message}${snippet ? ` | ${snippet}` : ""}`;
+    })
+    .join("; ");
+}
 
 function validateGeneratedFileContent(fileTarget: string, content: string): string | null {
   const trimmed = content.trim();
@@ -37,9 +60,7 @@ function validateGeneratedFileContent(fileTarget: string, content: string): stri
       },
     }).diagnostics || [];
     if (diagnostics.length > 0) {
-      return diagnostics
-        .map((diag) => `语法错误: ${ts.flattenDiagnosticMessageText(diag.messageText, "\n")}`)
-        .join("; ");
+      return formatTsDiagnostics(fileTarget, content, diagnostics);
     }
 
     const looksLikeObjectFragment =
@@ -52,6 +73,102 @@ function validateGeneratedFileContent(fileTarget: string, content: string): stri
   }
 
   return null;
+}
+
+function normalizeTaskFileTarget(fileTarget: string): string {
+  return String(fileTarget || "").replace(/\\/g, "/");
+}
+
+function isControllerFile(fileTarget: string): boolean {
+  return normalizeTaskFileTarget(fileTarget).toLowerCase().includes("/controllers/");
+}
+
+function isMiddlewareFile(fileTarget: string): boolean {
+  return normalizeTaskFileTarget(fileTarget).toLowerCase().includes("/middleware/");
+}
+
+function isModelFile(fileTarget: string): boolean {
+  return normalizeTaskFileTarget(fileTarget).toLowerCase().includes("/models/");
+}
+
+function isServiceFile(fileTarget: string): boolean {
+  return normalizeTaskFileTarget(fileTarget).toLowerCase().includes("/services/");
+}
+
+function normalizeStructuralDependencies(
+  subTasks: Array<{ fileTarget: string; dependencies?: string[] }>
+): void {
+  const controllerTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isControllerFile);
+  const middlewareTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isMiddlewareFile);
+  const modelTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isModelFile);
+  const serviceTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isServiceFile);
+
+  for (const task of subTasks) {
+    const fileTarget = normalizeTaskFileTarget(task.fileTarget);
+    const nextDependencies = new Set((task.dependencies || []).map((dependency) => normalizeTaskFileTarget(dependency)));
+
+    if (isControllerFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (isRouteFile(dependency)) {
+          nextDependencies.delete(dependency);
+        }
+      }
+      for (const dependency of [...modelTargets, ...serviceTargets, ...middlewareTargets]) {
+        if (dependency !== fileTarget) {
+          nextDependencies.add(dependency);
+        }
+      }
+    }
+
+    if (isMiddlewareFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (isControllerFile(dependency) || isRouteFile(dependency)) {
+          nextDependencies.delete(dependency);
+        }
+      }
+      for (const dependency of [...modelTargets, ...serviceTargets]) {
+        if (dependency !== fileTarget) {
+          nextDependencies.add(dependency);
+        }
+      }
+    }
+
+    if (isModelFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (isControllerFile(dependency) || isRouteFile(dependency) || isMiddlewareFile(dependency)) {
+          nextDependencies.delete(dependency);
+        }
+      }
+    }
+
+    if (isServiceFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (isControllerFile(dependency) || isRouteFile(dependency)) {
+          nextDependencies.delete(dependency);
+        }
+      }
+      for (const dependency of modelTargets) {
+        if (dependency !== fileTarget) {
+          nextDependencies.add(dependency);
+        }
+      }
+    }
+
+    if (isRouteFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (dependency.endsWith("src/index.ts") || dependency.endsWith("/index.ts") || dependency.endsWith("/index.js")) {
+          nextDependencies.delete(dependency);
+        }
+      }
+      for (const dependency of [...controllerTargets, ...middlewareTargets]) {
+        if (dependency !== fileTarget) {
+          nextDependencies.add(dependency);
+        }
+      }
+    }
+
+    task.dependencies = Array.from(nextDependencies);
+  }
 }
 
 function areTaskDependenciesSatisfied(
@@ -67,6 +184,301 @@ function areTaskDependenciesSatisfied(
     const dependencyTask = subTasks.find((item) => item.fileTarget === dependency || item.id === dependency);
     return dependencyTask?.status === "completed";
   });
+}
+
+function isTestFile(fileTarget: string): boolean {
+  const normalized = fileTarget.replace(/\\/g, "/").toLowerCase();
+  return (
+    normalized.includes("/tests/") ||
+    normalized.includes("/__tests__/") ||
+    /\.test\.[^.]+$/.test(normalized) ||
+    /\.spec\.[^.]+$/.test(normalized)
+  );
+}
+
+function isRouteFile(fileTarget: string): boolean {
+  const normalized = fileTarget.replace(/\\/g, "/").toLowerCase();
+  return normalized.includes("/routes/") && !isTestFile(normalized);
+}
+
+function shouldUseFocusedContext(task: { fileTarget: string; dependencies?: string[] }): boolean {
+  return isTestFile(task.fileTarget) || isRouteFile(task.fileTarget) || (task.dependencies || []).length > 0;
+}
+
+function getFocusedContextFiles(
+  task: { fileTarget: string; dependencies?: string[] },
+  filesContent: Record<string, string>
+): string[] {
+  const availableFiles = Object.keys(filesContent);
+  const focused = new Set<string>();
+
+  for (const dependency of task.dependencies || []) {
+    const normalizedDependency = dependency.replace(/\\/g, "/");
+    if (filesContent[normalizedDependency] !== undefined) {
+      focused.add(normalizedDependency);
+    }
+  }
+
+  if (!isTestFile(task.fileTarget)) {
+    return Array.from(focused);
+  }
+
+  const normalizedTarget = task.fileTarget.replace(/\\/g, "/");
+  const fileName = path.basename(normalizedTarget).replace(/(\.test|\.spec)\.[^.]+$/i, "");
+  const domainStem = fileName.replace(/(controller|service|route|routes|middleware)$/i, "");
+
+  for (const candidate of availableFiles) {
+    const normalizedCandidate = candidate.replace(/\\/g, "/");
+    const candidateBaseName = path.basename(normalizedCandidate, path.extname(normalizedCandidate));
+    if (candidateBaseName === fileName) {
+      focused.add(normalizedCandidate);
+      continue;
+    }
+
+    if (domainStem && candidateBaseName === domainStem) {
+      focused.add(normalizedCandidate);
+    }
+  }
+
+  return Array.from(focused);
+}
+
+function extractExportContract(code: string): { hasDefaultExport: boolean; namedExports: string[] } {
+  const namedExports = new Set<string>();
+  const hasDefaultExport = /\bexport\s+default\b/.test(code) || /\bmodule\.exports\s*=/.test(code);
+  const patterns = [
+    /\bexport\s+(?:async\s+)?function\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+class\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+interface\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+type\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+enum\s+([A-Za-z_$][\w$]*)/g,
+    /\bexport\s+(?:const|let|var)\s+([A-Za-z_$][\w$]*)/g,
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(code))) {
+      namedExports.add(match[1]);
+    }
+  }
+
+  const groupedExportPattern = /\bexport\s*\{([^}]+)\}/g;
+  let groupedMatch: RegExpExecArray | null;
+  while ((groupedMatch = groupedExportPattern.exec(code))) {
+    const items = groupedMatch[1]
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    for (const item of items) {
+      const aliasMatch = item.match(/^(?:type\s+)?([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?$/);
+      if (aliasMatch) {
+        namedExports.add(aliasMatch[2] || aliasMatch[1]);
+      }
+    }
+  }
+
+  return { hasDefaultExport, namedExports: Array.from(namedExports).sort() };
+}
+
+function buildDependencyContractText(
+  filePaths: string[],
+  filesContent: Record<string, string>
+): string {
+  return filePaths
+    .map((filePath) => {
+      const contract = extractExportContract(filesContent[filePath] || "");
+      return [
+        `### ${filePath}`,
+        `- default export: ${contract.hasDefaultExport ? "有" : "无"}`,
+        `- named exports: ${contract.namedExports.length > 0 ? contract.namedExports.join(", ") : "(无)"}`,
+      ].join("\n");
+    })
+    .join("\n\n");
+}
+
+function resolveRelativeImportTarget(fromFile: string, importPath: string): string | null {
+  if (!importPath.startsWith(".")) return null;
+
+  const normalizedFrom = fromFile.replace(/\\/g, "/");
+  const baseDir = path.posix.dirname(normalizedFrom);
+  return path.posix.normalize(path.posix.join(baseDir, importPath));
+}
+
+function validateImportContracts(
+  fileTarget: string,
+  content: string,
+  filesContent: Record<string, string>
+): string[] {
+  const errors: string[] = [];
+  const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = importPattern.exec(content))) {
+    const specifier = match[1].trim();
+    const importPath = match[2].trim();
+    const targetBase = resolveRelativeImportTarget(fileTarget, importPath);
+    if (!targetBase) continue;
+
+    const targetFile = [
+      targetBase,
+      `${targetBase}.ts`,
+      `${targetBase}.tsx`,
+      `${targetBase}.js`,
+      `${targetBase}.jsx`,
+      `${targetBase}/index.ts`,
+      `${targetBase}/index.js`,
+    ]
+      .map((candidate) => candidate.replace(/\\/g, "/"))
+      .find((candidate) => filesContent[candidate] !== undefined);
+
+    if (!targetFile) continue;
+
+    const contract = extractExportContract(filesContent[targetFile]);
+    const sanitized = specifier.replace(/\s+/g, " ").trim();
+    const namedMatch = sanitized.match(/\{([^}]+)\}/);
+    const defaultPart = sanitized.replace(/\{[^}]+\}/, "").replace(/,$/, "").trim();
+
+    if (defaultPart && !defaultPart.startsWith("* as") && !contract.hasDefaultExport) {
+      errors.push(`${targetFile} 未导出 default，但当前文件尝试默认导入 ${defaultPart}`);
+    }
+
+    if (namedMatch) {
+      const imports = namedMatch[1]
+        .split(",")
+        .map((item) => item.trim())
+        .filter(Boolean);
+
+      for (const item of imports) {
+        const importName = item.replace(/^type\s+/, "").split(/\s+as\s+/i)[0].trim();
+        if (importName && !contract.namedExports.includes(importName)) {
+          errors.push(`${targetFile} 未导出 ${importName}`);
+        }
+      }
+    }
+  }
+
+  return errors;
+}
+
+function validateProtocolDependencyRoles(
+  protocol: JimClawState["executionProtocol"],
+  fileTarget: string,
+  content: string,
+  filesContent: Record<string, string>
+): string[] {
+  const currentContract = getProtocolFileContract(protocol, fileTarget);
+  if (!currentContract || !currentContract.allowedDependencyRoles?.length) return [];
+
+  const errors: string[] = [];
+  const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
+  let match: RegExpExecArray | null;
+
+  while ((match = importPattern.exec(content))) {
+    const importPath = match[2].trim();
+    const targetBase = resolveRelativeImportTarget(fileTarget, importPath);
+    if (!targetBase) continue;
+
+    const targetFile = [
+      targetBase,
+      `${targetBase}.ts`,
+      `${targetBase}.tsx`,
+      `${targetBase}.js`,
+      `${targetBase}.jsx`,
+      `${targetBase}/index.ts`,
+      `${targetBase}/index.js`,
+    ]
+      .map((candidate) => candidate.replace(/\\/g, "/"))
+      .find((candidate) => filesContent[candidate] !== undefined);
+
+    if (!targetFile) continue;
+
+    const dependencyContract = getProtocolFileContract(protocol, targetFile);
+    if (!dependencyContract) continue;
+    if (!currentContract.allowedDependencyRoles.includes(dependencyContract.role)) {
+      errors.push(`${fileTarget}(${currentContract.role}) 不允许依赖 ${targetFile}(${dependencyContract.role})`);
+    }
+  }
+
+  return errors;
+}
+
+function isBlockingToolError(message: string): boolean {
+  const text = String(message || "");
+  if (!text) return false;
+  if (/\[WARNING\]/i.test(text)) return false;
+  if (/No files matching the pattern were found/i.test(text)) return false;
+  return /Error executing|Command failed|越权写文件/i.test(text);
+}
+
+function isMissingTargetFileDiagnostic(message: string, fileTarget: string): boolean {
+  const text = String(message || "");
+  if (!text) return false;
+  const normalizedTarget = normalizeTaskFileTarget(fileTarget);
+  const escapedTarget = normalizedTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return (
+    /file not found/i.test(text) &&
+    (new RegExp(escapedTarget, "i").test(text) ||
+      new RegExp(path.basename(normalizedTarget).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(text))
+  );
+}
+
+async function tryLoadValidatedDiskOutput(
+  workspace: string,
+  fileTarget: string,
+  filesContent: Record<string, string>,
+  protocol: JimClawState["executionProtocol"]
+): Promise<{ ok: boolean; code?: string; error?: string }> {
+  try {
+    const filePath = path.join(workspace, fileTarget);
+    const diskCode = await fs.readFile(filePath, "utf-8");
+    const diskValidationError = validateGeneratedFileContent(fileTarget, diskCode);
+    if (diskValidationError) {
+      return { ok: false, error: diskValidationError };
+    }
+    const importContractErrors = validateImportContracts(fileTarget, diskCode, filesContent);
+    if (importContractErrors.length > 0) {
+      return { ok: false, error: `依赖导出契约校验失败: ${importContractErrors.join("; ")}` };
+    }
+    const protocolDependencyErrors = validateProtocolDependencyRoles(protocol, fileTarget, diskCode, filesContent);
+    if (protocolDependencyErrors.length > 0) {
+      return { ok: false, error: `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}` };
+    }
+    return { ok: true, code: diskCode };
+  } catch (error: any) {
+    return { ok: false, error: `尝试读取已由工具写入的文件失败: ${error.message || error}` };
+  }
+}
+
+async function reconcileCompletedFilesFromDisk(
+  workspace: string,
+  subTasks: Array<{ id: string; description: string; fileTarget: string; status: string; lastError?: string }>,
+  filesContent: Record<string, string>,
+  codeLogEntries: FileChangeEntry[],
+  currentRetry: number,
+  protocol: JimClawState["executionProtocol"]
+): Promise<void> {
+  for (const task of subTasks) {
+    if (task.status === "completed") continue;
+
+    const recovered = await tryLoadValidatedDiskOutput(workspace, task.fileTarget, filesContent, protocol);
+    if (!recovered.ok) continue;
+
+    filesContent[task.fileTarget] = recovered.code || "";
+    task.status = "completed";
+    delete task.lastError;
+
+    const alreadyLogged = codeLogEntries.some(
+      (entry) => entry.file === task.fileTarget && entry.status === "written"
+    );
+    if (!alreadyLogged) {
+      codeLogEntries.push({
+        round: currentRetry,
+        file: task.fileTarget,
+        taskTitle: task.description.slice(0, 80),
+        status: "written",
+      });
+    }
+  }
 }
 
 /**
@@ -87,6 +499,8 @@ export async function coderNode(
   const subTasks = state.subTasks || [];
   const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
   const codeLogEntries: FileChangeEntry[] = [];
+  let blockedReason = "";
+  let blockedFailedFiles: string[] = [];
 
   // 1. 根据 QA 反馈，精准重置需要修复的任务状态
   if (state.qaFailures && state.qaFailures.failedFiles.length > 0) {
@@ -101,7 +515,11 @@ export async function coderNode(
     }
   }
 
-  for (const task of subTasks) {
+  normalizeStructuralDependencies(subTasks as any);
+  let progressMade = true;
+  while (progressMade && !blockedReason) {
+    progressMade = false;
+    for (const task of subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
       if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) {
@@ -124,9 +542,26 @@ export async function coderNode(
       if (state.apiContract?.endpoints?.length) {
         prompt += `\n\n[API 接口契约]：\n${JSON.stringify(state.apiContract, null, 2)}`;
       }
+      const protocolFileContract = getProtocolFileContract(state.executionProtocol, task.fileTarget);
+      if (state.executionProtocol && protocolFileContract) {
+        prompt += `\n\n[ExecutionProtocol - 当前文件约束]\n${JSON.stringify({
+          file: task.fileTarget,
+          role: protocolFileContract.role,
+          allowedDependencyRoles: protocolFileContract.allowedDependencyRoles,
+          requiredExports: protocolFileContract.requiredExports || [],
+          ownedEndpoints: protocolFileContract.ownedEndpoints || [],
+        }, null, 2)}`;
+      }
 
       // P0-A：注入已完成文件列表，让 Coder 知道哪些文件已就绪、可以 import
       const completedFiles = Object.keys(filesContent);
+      const focusedContextFiles = getFocusedContextFiles(task, filesContent);
+      if (shouldUseFocusedContext(task) && focusedContextFiles.length > 0) {
+        prompt += `\n\n[测试文件直连上下文 - 只允许优先使用这些已完成文件，不要反复读取其他已完成文件]\n${focusedContextFiles.map(f => `- ${f}`).join("\n")}`;
+        prompt += `\n\n[测试文件直连上下文内容]\n${focusedContextFiles.map(f => `### ${f}\n\`\`\`\n${filesContent[f]}\n\`\`\``).join("\n\n")}`;
+        prompt += `\n\n[依赖文件导出契约 - import 只能使用这里真正存在的导出]\n${buildDependencyContractText(focusedContextFiles, filesContent)}`;
+        completedFiles.length = 0;
+      }
       if (completedFiles.length > 0) {
         prompt += `\n\n[已完成的文件列表 - 可安全 import]：\n${completedFiles.map(f => `- ${f}`).join("\n")}`;
       }
@@ -216,32 +651,93 @@ CMD ["node", "dist/index.js"]`;
 
       let toolError: string | null = null;
       let fileWrittenByTool = false;
+      let diagnosticsPassed = false;
+      let lintPassed = false;
+      let missingTargetDiagnostic = false;
+      const unauthorizedWriteTargets = new Set<string>();
 
-      const response = await agents.coder.chat(
-        [{ role: "user", content: prompt }],
-        (ev) => {
-          emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
-          // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
-          if (ev.type === "tool_use" && ev.content) {
-            const contentStr = String(ev.content);
-            if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
-              toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
-            } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
-              fileWrittenByTool = true;
-            }
-          }
-        },
-        { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-      );
+      const normalizeWriteTarget = (rawTarget: string) => {
+        const trimmed = rawTarget.trim().replace(/^["']|["']$/g, "");
+        if (!trimmed) return "";
+        const absolute = path.isAbsolute(trimmed) ? trimmed : path.join(WORKSPACE, trimmed);
+        const relative = path.relative(WORKSPACE, absolute).replace(/\\/g, "/");
+        return relative.startsWith("..") ? trimmed.replace(/\\/g, "/") : relative;
+      };
 
-      const extractResult = extractCodeFromResponse(extractText(response.content));
+      const deterministicScaffold = getDeterministicTemplateScaffold(state, task.fileTarget);
+      const extractResult = deterministicScaffold
+        ? { isValid: true, code: deterministicScaffold, error: "" }
+        : extractCodeFromResponse(
+            extractText(
+              (
+                await agents.coder.chat(
+                  [{ role: "user", content: prompt }],
+                  (ev) => {
+                    emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
+                    // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
+                    if (ev.type === "tool_use" && ev.content) {
+                      const contentStr = String(ev.content);
+                      if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
+                        toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
+                      } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
+                        const targetMatch = contentStr.match(/Successfully wrote to\s+(.+)$/);
+                        const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
+                        if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
+                          fileWrittenByTool = true;
+                        } else if (writtenTarget) {
+                          unauthorizedWriteTargets.add(writtenTarget);
+                          toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
+                        }
+                      } else if (ev.tool === "diagnose_code") {
+                        if (/\[SUCCESS\]/i.test(contentStr)) {
+                          diagnosticsPassed = true;
+                        } else if (isMissingTargetFileDiagnostic(contentStr, task.fileTarget)) {
+                          missingTargetDiagnostic = true;
+                        }
+                      } else if (ev.tool === "lint_fix") {
+                        if (/\[WARNING\]/i.test(contentStr) || /已完成格式化|已完成格式化和规范修复|已使用 prettier 完成格式化/i.test(contentStr)) {
+                          lintPassed = true;
+                        }
+                      }
+                    }
+                  },
+                  { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+                )
+              ).content
+            )
+          );
+
+      if (deterministicScaffold) {
+        emit("thinking", "System", `[Coder] 使用模板骨架直接生成 ${task.fileTarget}`, { task });
+      }
 
       // 额外的质量校验：防止废话污染
       let formatError: string | null = null;
       let finalCode = "";
       let isSuccess = false;
+      const shouldTrustDiskOutput =
+        fileWrittenByTool &&
+        unauthorizedWriteTargets.size === 0 &&
+        (diagnosticsPassed || lintPassed || missingTargetDiagnostic);
 
-      if (extractResult.isValid) {
+      if (shouldTrustDiskOutput) {
+        const diskResult = await tryLoadValidatedDiskOutput(WORKSPACE, task.fileTarget, filesContent, state.executionProtocol);
+        if (diskResult.ok) {
+          finalCode = diskResult.code || "";
+          isSuccess = true;
+          toolError = null;
+          formatError = null;
+        } else {
+          const diskError = diskResult.error || "尝试读取已由工具写入的文件失败";
+          if (missingTargetDiagnostic && /读取已由工具写入的文件失败/.test(diskError)) {
+            toolError = null;
+          } else {
+            formatError = diskError;
+          }
+        }
+      }
+
+      if (!isSuccess && extractResult.isValid) {
         finalCode = extractResult.code;
         // 1. JSON 强校验
         if (task.fileTarget.endsWith(".json")) {
@@ -263,19 +759,57 @@ CMD ["node", "dist/index.js"]`;
           }
         }
 
-        if (!formatError && !toolError) isSuccess = true;
+        if (!formatError) {
+          const importContractErrors = validateImportContracts(task.fileTarget, finalCode, filesContent);
+          if (importContractErrors.length > 0) {
+            formatError = `依赖导出契约校验失败: ${importContractErrors.join("; ")}`;
+          }
+        }
+
+        if (!formatError) {
+          const protocolDependencyErrors = validateProtocolDependencyRoles(state.executionProtocol, task.fileTarget, finalCode, filesContent);
+          if (protocolDependencyErrors.length > 0) {
+            formatError = `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}`;
+          }
+        }
+
+        if (!formatError) isSuccess = true;
       }
 
       // 核心修复：如果纯文本提取失败，但 Agent 成功调用了 write_file 工具，则从磁盘读取结果作为最终代码
-      if (!isSuccess && fileWrittenByTool && !toolError && !formatError) {
-         try {
-            const filePath = path.join(WORKSPACE, task.fileTarget);
-            finalCode = await fs.readFile(filePath, "utf-8");
+      if (!isSuccess && fileWrittenByTool && !formatError) {
+         const diskResult = await tryLoadValidatedDiskOutput(WORKSPACE, task.fileTarget, filesContent, state.executionProtocol);
+         if (diskResult.ok) {
+            finalCode = diskResult.code || "";
             isSuccess = true;
-            formatError = null; // 清除由提取器产生的假错误
-         } catch (e: any) {
-            toolError = `尝试读取已由工具写入的文件失败: ${e.message}`;
+            toolError = null;
+            formatError = null;
+         } else {
+            const diskError = diskResult.error || "尝试读取已由工具写入的文件失败";
+            toolError = diskError;
          }
+      }
+
+      if (isSuccess && fileWrittenByTool && unauthorizedWriteTargets.size === 0) {
+        toolError = null;
+      }
+
+      if (unauthorizedWriteTargets.size > 0) {
+        for (const target of unauthorizedWriteTargets) {
+          const targetPath = path.join(WORKSPACE, target);
+          const previousContent = filesContent[target];
+          if (previousContent === undefined) {
+            await fs.rm(targetPath, { force: true }).catch(() => undefined);
+          } else {
+            await fs.mkdir(path.dirname(targetPath), { recursive: true });
+            await fs.writeFile(targetPath, previousContent);
+          }
+        }
+        toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具还修改了 ${Array.from(unauthorizedWriteTargets).join(", ")}`;
+      }
+
+      if (toolError && !isBlockingToolError(toolError)) {
+        toolError = null;
       }
 
       if (isSuccess && !toolError && !formatError) {
@@ -296,8 +830,19 @@ CMD ["node", "dist/index.js"]`;
           subTasks: [...subTasks],
           codeLog: [...(state.codeLog || []), ...codeLogEntries]
         };
+        await persistWriteRecoveryIntent(WORKSPACE, {
+          taskId: task.id,
+          fileTarget: task.fileTarget,
+          expectedContent: finalCode,
+          nodeName: `coder_task_${task.id}`,
+          traceId: (state as any).traceId,
+          snapshotState: { ...state, ...incrementalResult } as any,
+        });
         await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
+        await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        progressMade = true;
         } catch (e: any) {
+          await clearWriteRecoveryIntent(WORKSPACE, task.id);
           if (previousCode === undefined) {
             delete filesContent[task.fileTarget];
             await fs.rm(filePath, { force: true }).catch(() => undefined);
@@ -320,9 +865,29 @@ CMD ["node", "dist/index.js"]`;
         task.lastError = toolError || formatError || extractResult.error || "代码提取失败或工具执行异常";
         console.error(`${logPrefix("System")} [Coder] 任务失败 (${task.fileTarget}): ${task.lastError}`);
         codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "error", error: task.lastError });
+        blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${task.lastError}`;
+        blockedFailedFiles = [task.fileTarget];
+        emit("thinking", "System", `[Coder] 阻塞失败，停止本轮后续生成: ${blockedReason}`, { task });
+        break;
       }
 
       // 3. 写一个存一个：每完成一个文件立即持久化状态，防止截断导致全盘丢失
+  }
+
+  }
+
+  await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol);
+
+  if (!blockedReason) {
+    const pendingTasks = subTasks.filter((task) => task.status !== "completed");
+    if (pendingTasks.length > 0 && codeLogEntries.filter((entry) => entry.status === "written").length === 0) {
+      const deadlocked = pendingTasks.map((task) => {
+        const unmet = (task.dependencies || []).filter((dependency) => filesContent[dependency] === undefined);
+        return `${task.fileTarget} <- ${unmet.join(", ") || "无可满足依赖"}`;
+      });
+      blockedReason = `Coder 依赖死锁: ${deadlocked.join(" | ")}`;
+      blockedFailedFiles = pendingTasks.map((task) => task.fileTarget);
+    }
   }
 
   const completedList = subTasks.filter(t => t.status === "completed").map(t => t.fileTarget);
@@ -349,6 +914,20 @@ CMD ["node", "dist/index.js"]`;
     codeLog: codeLogEntries,
     consensusProgress,
     meetingNotes: [meetingNote],
+    blockedReason,
+    testResults: blockedReason ? `[Coder 阻塞失败]\n${blockedReason}` : "",
+    qaFailures: blockedReason
+      ? {
+          failedFiles: blockedFailedFiles,
+          testErrors: [blockedReason],
+          failedTestNames: [],
+        }
+      : null,
+    protocolFailures: blockedReason ? (state.protocolFailures || []) : [],
+    lastFailedNode: blockedReason ? "coder" : "",
+    lastFailureSummary: blockedReason ? blockedReason : "",
+    failureFingerprint: blockedReason ? state.failureFingerprint : "",
+    sameFailureCount: blockedReason ? state.sameFailureCount : 0,
   };
   try {
     await saveBoulder({ ...state, ...result }, "coder_final");

@@ -1,5 +1,5 @@
 import { JimClawState } from "../graph_types";
-import { execInContainer } from "../logic_utils";
+import { execInContainer, extractFailureEvidence, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
 
 /**
@@ -25,12 +25,38 @@ export async function terminalNode(
       ? state.testResults
       : "[Terminal] 容器 ID 为空，跳过测试执行。请检查 infra_setup 是否成功启动容器。";
     await AuditLogger.log(WORKSPACE, "Terminal", `**Skipped:** ${errMsg}`);
-    return { testResults: errMsg };
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-terminal-r${state.retryCount || 0}`,
+      "terminal",
+      state.retryCount || 0,
+      `Terminal 第${state.retryCount || 0}轮：跳过测试，容器未就绪`,
+      `# Terminal 第${state.retryCount || 0}轮\n\n## 执行结论\n- 状态：跳过\n- 原因：${errMsg}\n`
+    );
+    return { testResults: errMsg, meetingNotes: [note] };
   }
 
   const result = await execInContainer(state.containerId, `NODE_ENV=test ${testCmd}`, { timeout: 90000 });
   
   await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${result}`);
-  
-  return { testResults: result };
+  const evidence = extractFailureEvidence(result, state.deploymentStatus, state.blockedReason);
+  const summary = evidence.hasBlockingFailure
+    ? `Terminal 第${state.retryCount || 0}轮：测试失败`
+    : `Terminal 第${state.retryCount || 0}轮：测试通过`;
+  const note = await writeMeetingNote(
+    WORKSPACE,
+    `note-terminal-r${state.retryCount || 0}`,
+    "terminal",
+    state.retryCount || 0,
+    summary,
+    `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 命令：${testCmd}\n- 容器：${state.containerId}\n- 结论：${evidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${result}\n\`\`\`\n`
+  );
+
+  return {
+    testResults: result,
+    meetingNotes: [note],
+    blockedReason: "",
+    lastFailedNode: evidence.hasBlockingFailure ? state.lastFailedNode : "",
+    lastFailureSummary: evidence.hasBlockingFailure ? state.lastFailureSummary : "",
+  };
 }

@@ -283,6 +283,264 @@ export interface TraceFileSummary {
   lastError?: string;
 }
 
+export type ProtocolFileRole =
+  | "entry"
+  | "route"
+  | "controller"
+  | "service"
+  | "model"
+  | "middleware"
+  | "test"
+  | "config"
+  | "infra"
+  | "other";
+
+export interface ExecutionProtocolFileContract {
+  role: ProtocolFileRole;
+  allowedDependencyRoles: ProtocolFileRole[];
+  requiredExports?: string[];
+  ownedEndpoints?: string[];
+  notes?: string[];
+}
+
+export interface RequirementProtocol {
+  version: "v1";
+  userIntent: {
+    title: string;
+    requirements: string[];
+    acceptanceCriteria: string[];
+  };
+  capabilities: {
+    frontendRequired: boolean;
+    backendRequired: boolean;
+    authRequired: boolean;
+    auditLogRequired: boolean;
+    dockerRequired: boolean;
+    entities: string[];
+    crudEntities: string[];
+    uiCapabilities: string[];
+  };
+}
+
+export interface SolutionProtocol {
+  version: "v1";
+  coverage: {
+    frontendPlanned: boolean;
+    backendPlanned: boolean;
+    authPlanned: boolean;
+    auditLogPlanned: boolean;
+    uncoveredRequirements: string[];
+    uncoveredAcceptanceCriteria: string[];
+    coverageMatrix: Array<{
+      requirement: string;
+      coveredBy: string[];
+    }>;
+  };
+}
+
+export interface TechnologyDecision {
+  version: "v1";
+  source: "user" | "architect";
+  frontend: {
+    required: boolean;
+    framework: "vanilla" | "react" | "vue" | "none";
+    buildTool: "vite" | "none";
+    entryFiles: string[];
+  };
+  backend: {
+    required: boolean;
+    framework: "express-typescript" | "fastapi-python" | "gin-go" | "unknown";
+    entryFiles: string[];
+  };
+  database: {
+    kind: "postgres" | "sqlite" | "memory" | "none";
+  };
+  testing: {
+    unit: string;
+    api?: string;
+    e2e?: string;
+  };
+  deploy: {
+    docker: boolean;
+    compose: boolean;
+  };
+}
+
+export interface ExecutionPlanFile {
+  path: string;
+  role: ProtocolFileRole | "ui";
+  required: boolean;
+  satisfiesRequirements: string[];
+  dependsOnFiles: string[];
+}
+
+export interface ExecutionPlanTask {
+  id: string;
+  fileTarget: string;
+  role: ProtocolFileRole | "ui";
+  dependsOnTaskIds: string[];
+  verificationHooks: string[];
+}
+
+export interface ExecutionPlan {
+  version: "v1";
+  files: ExecutionPlanFile[];
+  tasks: ExecutionPlanTask[];
+  acceptanceChecks: string[];
+}
+
+export interface ExecutionProtocol {
+  version: "v1";
+  requirements: RequirementProtocol;
+  solution: SolutionProtocol;
+  project: {
+    language: string;
+    framework: string;
+    runtime: "node" | "python" | "go" | "unknown";
+    workspaceLayout: {
+      sourceRoots: string[];
+      testRoots: string[];
+      frontendRoots: string[];
+      entryFiles: string[];
+      configFiles: string[];
+      infraFiles: string[];
+    };
+  };
+  contracts: {
+    api: {
+      endpoints: Array<{
+        path: string;
+        method: string;
+        ownerFile?: string;
+      }>;
+    };
+    files: Record<string, ExecutionProtocolFileContract>;
+  };
+  runtime: {
+    startCommand?: string;
+    testCommand?: string;
+    entryPoint?: string;
+    buildOutput?: string;
+    listenPort?: number;
+    healthCheckPath?: string;
+  };
+  workflow: {
+    blockingRules: string[];
+    recoveryRules: string[];
+  };
+  validation: {
+    layoutRules: string[];
+    dependencyRules: string[];
+    runtimeRules: string[];
+    acceptanceRules: string[];
+  };
+}
+
+export interface ProtocolFailure {
+  type:
+    | "layout_mismatch"
+    | "dependency_deadlock"
+    | "contract_drift"
+    | "runtime_mismatch"
+    | "test_discovery_gap"
+    | "tooling_unavailable";
+  node: string;
+  file?: string;
+  summary: string;
+  evidence: string[];
+  blocking: boolean;
+}
+
+export interface ProtocolPatch {
+  target: "project" | "contracts" | "runtime" | "validation" | "workflow";
+  action: "replace" | "append" | "remove";
+  path: string;
+  value?: unknown;
+  reason: string;
+}
+
+export type ValidationFailureType =
+  | "planning_gap"
+  | "implementation_bug"
+  | "environment_gap"
+  | "runtime_gap";
+
+export interface ValidationFinding {
+  type: ValidationFailureType;
+  summary: string;
+  file?: string;
+  evidence: string[];
+}
+
+export interface ValidationReport {
+  version: "v1";
+  status: "pass" | "fail";
+  failureType?: ValidationFailureType;
+  blocking: boolean;
+  findings: ValidationFinding[];
+}
+
+export interface RuntimeStateSnapshot {
+  version: "v1";
+  envReady: boolean;
+  hostDepsReady: boolean;
+  testRuntimeReady: boolean;
+  deployRuntimeReady: boolean;
+  containerId?: string;
+  hostPort?: number;
+  containerPort?: number;
+  deploymentUrl?: string;
+  startupLogPath?: string;
+  tokenUsage?: TokenUsageSummary;
+}
+
+export interface RepairPlan {
+  version: "v1";
+  repairType: "planning" | "implementation" | "environment" | "runtime";
+  targets: string[];
+  allowedEdits: string[];
+  expectedEvidence: string[];
+}
+
+export interface CustomerApprovalCheckpoint {
+  stage: "requirements" | "solution" | "deploy";
+  required: boolean;
+  approved: boolean;
+  approvedBy?: "customer" | "default-authorization";
+  summary: string;
+  timestamp?: string;
+}
+
+export interface CustomerApprovalState {
+  version: "v1";
+  autoApprove: {
+    requirements: boolean;
+    solution: boolean;
+    deploy: boolean;
+  };
+  checkpoints: CustomerApprovalCheckpoint[];
+}
+
+export type ApprovalStage = "requirements" | "solution" | "deploy";
+
+export interface TokenUsageStats {
+  calls: number;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+}
+
+export interface TokenUsageEntry extends TokenUsageStats {
+  timestamp: string;
+  agent: string;
+  mode: string;
+  model?: string;
+}
+
+export interface TokenUsageSummary extends TokenUsageStats {
+  byAgent: Record<string, TokenUsageStats>;
+}
+
 export interface TraceIndex {
   traceId: string;
   lastNode: string;
@@ -293,6 +551,9 @@ export interface TraceIndex {
   files: Record<string, TraceFileSummary>;
   timeline: TraceTimelineEntry[];
   checkpoints: TraceCheckpoint[];
+  tokenUsage: TokenUsageSummary;
+  protocolFailures: ProtocolFailure[];
+  protocolPatches: ProtocolPatch[];
   lastFailure: {
     node?: string;
     summary?: string;
@@ -456,6 +717,45 @@ export const JimClawState = Annotation.Root({
   // QA 与 Coder 协商后达成的修复计划（每轮覆盖）
   fixPlan: Annotation<FixPlanItem[] | null>({
     reducer: (x, y) => y !== undefined ? y : x,
+  }),
+  requirementProtocol: Annotation<RequirementProtocol | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  technologyDecision: Annotation<TechnologyDecision | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  executionPlan: Annotation<ExecutionPlan | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  solutionProtocol: Annotation<SolutionProtocol | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  executionProtocol: Annotation<ExecutionProtocol | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  validationReport: Annotation<ValidationReport | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  runtimeStateSnapshot: Annotation<RuntimeStateSnapshot | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  repairPlan: Annotation<RepairPlan | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  customerApprovalState: Annotation<CustomerApprovalState | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  pendingApprovalStage: Annotation<ApprovalStage | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  approvalNextNode: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  protocolFailures: Annotation<ProtocolFailure[]>({
+    reducer: (x, y) => y !== undefined ? y : (x || []),
+  }),
+  protocolPatches: Annotation<ProtocolPatch[]>({
+    reducer: (x, y) => y !== undefined ? y : (x || []),
   }),
 });
 

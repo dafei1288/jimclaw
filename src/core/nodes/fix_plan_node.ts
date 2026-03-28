@@ -1,9 +1,107 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, FixPlanItem } from "../graph_types";
+import { JimClawState, FixPlanItem, ProtocolPatch } from "../graph_types";
 import { BaseAgent } from "../agent";
-import { buildSystemContext, writeMeetingNote } from "../logic_utils";
+import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
+
+function isModelResourceError(error: any): boolean {
+  const status = error?.status || error?.response?.status;
+  if (status === 429) return true;
+  const message = (error?.message || "").toLowerCase();
+  return message.includes("429")
+    || message.includes("余额不足")
+    || message.includes("rate limit")
+    || message.includes("quota")
+    || message.includes("resource");
+}
+
+function buildDeterministicFixPlan(
+  failingFiles: string[],
+  openIssues: any[],
+  state: JimClawState,
+  coderPlan?: any
+): FixPlanItem[] {
+  const plan: FixPlanItem[] = [];
+
+  for (const item of (coderPlan?.items || [])) {
+    if (!item?.file) continue;
+    plan.push({
+      fileTarget: item.file,
+      diagnosis: item.my_understanding || "模型降级后沿用开发工程师已有诊断。",
+      proposedChange: item.proposed_change || `优先修复 ${item.file} 的当前阻塞错误，确保输出为纯代码且满足现有契约。`,
+      qaApproval: "approved",
+    });
+  }
+
+  for (const file of failingFiles) {
+    if (plan.some((p) => p.fileTarget === file)) continue;
+    const issue = openIssues.find((i: any) => i.relatedFiles?.includes(file));
+    const matchingError = (state.qaFailures?.testErrors || []).find((msg: string) => msg.includes(file));
+    plan.push({
+      fileTarget: file,
+      diagnosis: issue?.description || matchingError || `${file} 当前存在阻塞错误，需要先恢复最小正确实现。`,
+      proposedChange: `聚焦修复 ${file} 的阻塞问题，保持改动最小化，输出必须为纯代码，且不要扩散到仍处于 pending 的文件。`,
+      qaApproval: "approved",
+    });
+  }
+
+  return plan;
+}
+
+function buildSyntheticOpenIssuesFromProtocolFailures(state: JimClawState) {
+  return (state.protocolFailures || [])
+    .filter((failure) => failure?.blocking)
+    .map((failure, index) => ({
+      id: `BUG-PROTOCOL-${index + 1}`,
+      title: `${failure.file || failure.node} 协议未通过`,
+      description: failure.summary,
+      severity: "major" as const,
+      status: "open" as const,
+      relatedFiles: failure.file ? [failure.file] : [],
+      rawErrorSnippet: failure.evidence?.join(" | ") || failure.summary,
+      detectedRound: state.retryCount || 0,
+    }));
+}
+
+function summarizeBlock(text: string | undefined, limit = 1200): string {
+  const normalized = String(text || "").trim();
+  if (!normalized) return "（无）";
+  if (normalized.length <= limit) return normalized;
+  const head = normalized.slice(0, Math.floor(limit * 0.65));
+  const tail = normalized.slice(-Math.floor(limit * 0.25));
+  return `${head}\n...\n[已截断 ${normalized.length - head.length - tail.length} 字符]\n...\n${tail}`;
+}
+
+function summarizeIssues(openIssues: any[], limit = 6): string {
+  if (!openIssues.length) return "（无）";
+  return openIssues.slice(0, limit).map((i) =>
+    `- [${i.id}] ${i.title} (${i.severity})\n  描述：${summarizeBlock(i.description, 180)}\n  影响文件：${(i.relatedFiles || []).slice(0, 4).join(", ")}`
+  ).join("\n\n");
+}
+
+function summarizeFailingFiles(fileContents: Record<string, string>, limit = 4): string {
+  const entries = Object.entries(fileContents).slice(0, limit);
+  if (!entries.length) return "（无）";
+  return entries.map(([f, c]) =>
+    `### ${f}\n\`\`\`\n${summarizeBlock(c, 900)}\n\`\`\``
+  ).join("\n\n");
+}
+
+function summarizeCoderPlan(coderPlan: any): string {
+  const items = Array.isArray(coderPlan?.items) ? coderPlan.items.slice(0, 6) : [];
+  const compact = {
+    overall_diagnosis: summarizeBlock(coderPlan?.overall_diagnosis || "（无）", 240),
+    items: items.map((item: any) => ({
+      file: item?.file,
+      issue_id: item?.issue_id,
+      my_understanding: summarizeBlock(item?.my_understanding || "", 180),
+      proposed_change: summarizeBlock(item?.proposed_change || "", 220),
+      confidence: item?.confidence,
+    })),
+  };
+  return JSON.stringify(compact, null, 2);
+}
 
 /**
  * FixPlan 节点：QA 与 Coder 在编写代码前进行协商
@@ -25,7 +123,9 @@ export async function fixPlanNode(
   startSpan("fix_plan");
 
   const round = state.retryCount || 0;
-  const openIssues = (state.issueTracker || []).filter(i => i.status === "open");
+  const issueOpenIssues = (state.issueTracker || []).filter(i => i.status === "open");
+  const protocolOpenIssues = buildSyntheticOpenIssuesFromProtocolFailures(state);
+  const openIssues = protocolOpenIssues.length > 0 ? protocolOpenIssues : issueOpenIssues;
   const failingFiles = Array.from(new Set([
     ...(state.qaFailures?.failedFiles || []),
     ...openIssues.flatMap(i => i.relatedFiles),
@@ -34,6 +134,19 @@ export async function fixPlanNode(
   // 若无失败工单，直接跳过
   if (openIssues.length === 0 && failingFiles.length === 0) {
     return {};
+  }
+
+  if (state.repairPlan?.repairType && state.repairPlan.repairType !== "implementation") {
+    const noteId = `note-fixplan-r${round}`;
+    const summary = `第${round}轮修复协商：跳过实现修复，转交 ${state.repairPlan.repairType}`;
+    const fullContent = `# 修复计划协商纪要 - 第${round}轮\n\n## 结论\n当前失败类型为 ${state.repairPlan.repairType}，不属于实现错误，fix_plan 不再生成代码修复计划。\n\n## RepairPlan\n\`\`\`json\n${JSON.stringify(state.repairPlan, null, 2)}\n\`\`\`\n`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "fix_plan", round, summary, fullContent);
+    const result = {
+      fixPlan: [],
+      meetingNotes: [meetingNote],
+    };
+    await saveBoulder({ ...state, ...result }, "fix_plan");
+    return result;
   }
 
   emit("phase-change", "System", "fix_planning");
@@ -49,20 +162,20 @@ export async function fixPlanNode(
   }
 
   // === Step 1：Coder 分析并提出修复计划 ===
+  const summarizedTestResults = summarizeBlock(state.testResults || "", 1800);
+  const summarizedIssues = summarizeIssues(openIssues, 6);
+  const summarizedFiles = summarizeFailingFiles(fileContents, 4);
+
   const coderPrompt = `你是星河（全栈开发工程师）。在动手写代码之前，请先仔细分析失败原因，制定修复计划。
 
 [本轮测试失败输出]：
-${(state.testResults || "").slice(-2500)}
+${summarizedTestResults}
 
 [QA 提交的缺陷工单]：
-${openIssues.map(i =>
-  `- [${i.id}] ${i.title} (${i.severity})\n  描述：${i.description}\n  影响文件：${i.relatedFiles.join(", ")}`
-).join("\n\n")}
+${summarizedIssues}
 
 [失败文件的当前内容]：
-${Object.entries(fileContents).map(([f, c]) =>
-  `### ${f}\n\`\`\`\n${c.slice(0, 2000)}\n\`\`\``
-).join("\n\n")}
+${summarizedFiles}
 
 请认真阅读以上内容，输出你的修复计划（JSON格式）：
 {
@@ -81,29 +194,44 @@ ${Object.entries(fileContents).map(([f, c]) =>
 注意：confidence=low 说明你自己也不确定，QA 会重点审查这些项。`;
 
   emit("thinking", agents.coder.getPersona().name, "正在分析失败原因，制定修复计划...", {});
-
-  const coderResponse = await agents.coder.chat(
-    [{ role: "user", content: coderPrompt }],
-    (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
-    { brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-  );
-
-  const coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
+  let coderPlan: any = {
     overall_diagnosis: "（解析失败）",
     items: [],
-  });
+  };
+  let degradedByFallback = false;
+
+  try {
+    const coderResponse = await agents.coder.chat(
+      [{ role: "user", content: coderPrompt }],
+      (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
+      { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+    );
+
+    coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
+      overall_diagnosis: "（解析失败）",
+      items: [],
+    });
+  } catch (error: any) {
+    if (!isModelResourceError(error)) throw error;
+    degradedByFallback = true;
+    emit("thinking", "System", `fix_plan 模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
+    coderPlan = {
+      overall_diagnosis: `模型资源不足，使用规则化降级计划。原始错误：${error.message || error}`,
+      items: [],
+    };
+  }
 
   // === Step 2：QA 审查计划 ===
   const qaPrompt = `你是清扬（测试工程师）。请审查开发工程师的修复计划，判断他的理解是否正确。
 
 [原始测试失败输出]：
-${(state.testResults || "").slice(-2500)}
+${summarizedTestResults}
 
 [缺陷工单列表]：
-${openIssues.map(i => `- [${i.id}] ${i.title}: ${i.description}`).join("\n")}
+${summarizedIssues}
 
 [星河的修复计划]：
-${JSON.stringify(coderPlan, null, 2)}
+${summarizeCoderPlan(coderPlan)}
 
 请逐项审查：
 1. 根因理解是否正确？（特别关注 confidence=low 的项）
@@ -129,65 +257,102 @@ ${JSON.stringify(coderPlan, null, 2)}
   ]
 }`;
 
-  emit("thinking", agents.qa.getPersona().name, "正在审查修复计划...", {});
-
-  const qaResponse = await agents.qa.chat(
-    [{ role: "user", content: qaPrompt }],
-    (ev) => emit(ev.type, ev.sender, "审查修复计划中", ev),
-    { brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-  );
-
-  const qaReview = parseJsonFromResponse(extractText(qaResponse.content), {
-    overall_assessment: "（解析失败）",
+  let qaReview: any = {
+    overall_assessment: degradedByFallback ? "模型资源不足，已转规则化修复计划。" : "（解析失败）",
     items: [],
     additional_fixes: [],
-  });
+  };
 
-  // === Step 3：合并为批准后的修复计划 ===
-  const fixPlan: FixPlanItem[] = [];
+  if (!degradedByFallback) {
+    emit("thinking", agents.qa.getPersona().name, "正在审查修复计划...", {});
+    try {
+      const qaResponse = await agents.qa.chat(
+        [{ role: "user", content: qaPrompt }],
+        (ev) => emit(ev.type, ev.sender, "审查修复计划中", ev),
+        { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+      );
 
-  for (const item of (coderPlan.items || [])) {
-    const review = (qaReview.items || []).find((r: any) => r.file === item.file);
-    if (review && review.approved === false) {
-      fixPlan.push({
-        fileTarget: item.file,
-        diagnosis: review.feedback || item.my_understanding,
-        proposedChange: review.feedback || item.proposed_change,
-        qaApproval: "corrected",
-        qaFeedback: review.feedback,
+      qaReview = parseJsonFromResponse(extractText(qaResponse.content), {
+        overall_assessment: "（解析失败）",
+        items: [],
+        additional_fixes: [],
       });
-    } else {
-      fixPlan.push({
-        fileTarget: item.file,
-        diagnosis: item.my_understanding,
-        proposedChange: item.proposed_change,
-        qaApproval: "approved",
-      });
+    } catch (error: any) {
+      if (!isModelResourceError(error)) throw error;
+      degradedByFallback = true;
+      emit("thinking", "System", `fix_plan QA 审查模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
+      qaReview = {
+        overall_assessment: `QA 模型资源不足，自动批准规则化修复计划。原始错误：${error.message || error}`,
+        items: [],
+        additional_fixes: [],
+      };
     }
   }
 
-  // 把 QA 发现的遗漏文件也加入计划
-  for (const extra of (qaReview.additional_fixes || [])) {
-    if (!fixPlan.some(p => p.fileTarget === extra.file)) {
-      fixPlan.push({
-        fileTarget: extra.file,
-        diagnosis: extra.diagnosis,
-        proposedChange: extra.proposed_change,
-        qaApproval: "approved",
-      });
+  // === Step 3：合并为批准后的修复计划 ===
+  const fixPlan: FixPlanItem[] = degradedByFallback
+    ? buildDeterministicFixPlan(failingFiles, openIssues, state, coderPlan)
+    : [];
+  let protocolPatches: ProtocolPatch[] = buildProtocolPatchesForFixPlan(
+    failingFiles,
+    state.executionProtocol,
+    state.apiContract
+  );
+
+  if (!degradedByFallback) {
+    for (const item of (coderPlan.items || [])) {
+      const review = (qaReview.items || []).find((r: any) => r.file === item.file);
+      if (review && review.approved === false) {
+        fixPlan.push({
+          fileTarget: item.file,
+          diagnosis: review.feedback || item.my_understanding,
+          proposedChange: review.feedback || item.proposed_change,
+          qaApproval: "corrected",
+          qaFeedback: review.feedback,
+        });
+      } else {
+        fixPlan.push({
+          fileTarget: item.file,
+          diagnosis: item.my_understanding,
+          proposedChange: item.proposed_change,
+          qaApproval: "approved",
+        });
+      }
     }
+
+    // 把 QA 发现的遗漏文件也加入计划
+    for (const extra of (qaReview.additional_fixes || [])) {
+      if (!fixPlan.some(p => p.fileTarget === extra.file)) {
+        fixPlan.push({
+          fileTarget: extra.file,
+          diagnosis: extra.diagnosis,
+          proposedChange: extra.proposed_change,
+          qaApproval: "approved",
+        });
+      }
+    }
+
+    protocolPatches = buildProtocolPatchesForFixPlan(
+      Array.from(new Set(fixPlan.map((item) => item.fileTarget))),
+      state.executionProtocol,
+      state.apiContract
+    );
   }
 
   // === 写入会议纪要 ===
   const approvedCount = fixPlan.filter(p => p.qaApproval === "approved").length;
   const correctedCount = fixPlan.filter(p => p.qaApproval === "corrected").length;
   const noteId = `note-fixplan-r${round}`;
-  const summary = `第${round}轮修复协商：${fixPlan.length}项，批准${approvedCount}项，纠正${correctedCount}项`;
+  const summary = degradedByFallback
+    ? `第${round}轮修复协商：模型降级，生成${fixPlan.length}项规则化修复计划`
+    : `第${round}轮修复协商：${fixPlan.length}项，批准${approvedCount}项，纠正${correctedCount}项`;
   const fullContent = [
     `# 修复计划协商纪要 - 第${round}轮\n`,
     `## 星河的整体诊断\n${coderPlan.overall_diagnosis}\n`,
     `## QA 的整体评估\n${qaReview.overall_assessment}\n`,
+    degradedByFallback ? `## 降级说明\n本轮因模型资源不足，改用规则化修复计划，避免修复链路整体中断。\n` : "",
     `## 批准后的修复计划\n\`\`\`json\n${JSON.stringify(fixPlan, null, 2)}\n\`\`\`\n`,
+    `## 协议补丁\n\`\`\`json\n${JSON.stringify(protocolPatches, null, 2)}\n\`\`\`\n`,
     correctedCount > 0
       ? `## QA 纠正的项目（${correctedCount}项）\n${fixPlan.filter(p => p.qaApproval === "corrected").map(p => `- **${p.fileTarget}**: ${p.qaFeedback}`).join("\n")}\n`
       : "",
@@ -202,11 +367,14 @@ ${JSON.stringify(coderPlan, null, 2)}
     }
     return t;
   });
+  const nextExecutionProtocol = applyProtocolPatches(state.executionProtocol, protocolPatches);
 
-  await saveBoulder({ ...state, fixPlan, subTasks: updatedSubTasks }, "fix_plan");
+  await saveBoulder({ ...state, fixPlan, protocolPatches, executionProtocol: nextExecutionProtocol, subTasks: updatedSubTasks }, "fix_plan");
 
   return {
     fixPlan,
+    protocolPatches,
+    executionProtocol: nextExecutionProtocol,
     subTasks: updatedSubTasks,
     meetingNotes: [meetingNote],
   };

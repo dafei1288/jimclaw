@@ -1,7 +1,17 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState } from "../graph_types";
-import { findContractRouteDrift } from "../logic_utils";
+import {
+  buildRepairPlan,
+  buildValidationReport,
+  findContractRouteDrift,
+  getProtocolBusinessTestFiles,
+  getProtocolTestRoots,
+  getProtocolFileContract,
+  isNodeJestProject,
+  normalizeNodeJestTestFilePath,
+  writeMeetingNote
+} from "../logic_utils";
 
 /**
  * Verifier 节点：纯静态预检，无 LLM 调用，运行极快。
@@ -16,15 +26,63 @@ export async function verifierNode(
   saveBoulder: any
 ) {
   startSpan("verifier");
+  const round = state.retryCount || 0;
   const issues: string[] = [];
-  const filesToCreate = state.spec?.filesToCreate || [];
+  const filesToCreate = (state.spec?.filesToCreate || []).map((file: string) => normalizeNodeJestTestFilePath(file));
+  const requirementProtocol = state.requirementProtocol || state.executionProtocol?.requirements || null;
   const language = (state.spec?.language || "").toLowerCase();
+  const globToRegExp = (pattern: string) => {
+    const escaped = pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "§§DOUBLESTAR§§")
+      .replace(/\*/g, "[^/]*")
+      .replace(/§§DOUBLESTAR§§/g, ".*")
+      .replace(/\?/g, ".");
+    return new RegExp(`^${escaped}$`);
+  };
 
   for (const file of filesToCreate) {
     try {
       await fs.access(path.join(WORKSPACE, file));
     } catch {
       issues.push(`文件缺失: ${file}`);
+    }
+  }
+
+  const entryFile = state.executionProtocol?.project?.workspaceLayout?.entryFiles?.[0] || state.spec?.entryPoint;
+  let entryContent = "";
+  if (entryFile) {
+    try {
+      entryContent = await fs.readFile(path.join(WORKSPACE, entryFile), "utf-8");
+    } catch {}
+  }
+
+  if (requirementProtocol?.capabilities?.frontendRequired) {
+    const frontendFiles = filesToCreate.filter((file) => /^public\/.+/i.test(file) || /\.html$/i.test(file));
+    if (frontendFiles.length === 0) {
+      issues.push("需求覆盖失败：用户要求前端，但 filesToCreate 中不存在任何前端页面文件");
+    }
+    if (entryContent) {
+      const hasFrontendMount = /express\.static\(|res\.sendFile\(|app\.get\(\s*["'`]\/["'`]/.test(entryContent);
+      if (!hasFrontendMount) {
+        issues.push(`需求覆盖失败：入口文件 ${entryFile} 未提供前端页面入口（静态目录或根路径页面）`);
+      }
+    }
+  }
+
+  if (requirementProtocol?.capabilities?.backendRequired) {
+    const routeFiles = filesToCreate.filter((file) => getProtocolFileContract(state.executionProtocol, file)?.role === "route");
+    if (routeFiles.length === 0) {
+      issues.push("需求覆盖失败：用户要求后端 API，但未规划任何 route 文件");
+    }
+    if (entryContent) {
+      for (const routeFile of routeFiles) {
+        if (/routes\/health\./i.test(routeFile)) continue;
+        const stem = path.basename(routeFile, path.extname(routeFile)).replace(/routes?$/i, "");
+        if (stem && !new RegExp(stem, "i").test(entryContent)) {
+          issues.push(`入口挂载缺失：${entryFile} 未挂载路由文件 ${routeFile}`);
+        }
+      }
     }
   }
 
@@ -40,7 +98,7 @@ export async function verifierNode(
     /app\.listen\(|server\.listen\(|uvicorn\.run\(|ListenAndServe\(/;
 
   for (const file of filesToCreate) {
-    if (serverFilePatterns.test(path.basename(file)) && !file.includes("test") && !file.includes("spec")) {
+    if (serverFilePatterns.test(path.basename(file)) && !file.includes("test") && !file.includes("spec") && !/\.html?$/i.test(file)) {
       try {
         const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
         if (!listenPattern.test(content)) {
@@ -110,6 +168,108 @@ export async function verifierNode(
     // Dockerfile 缺失已由前置检查覆盖
   }
 
-  if (issues.length === 0) return {};
-  return { isDone: false, testResults: `[Verifier 预检失败]\n${issues.join("\n")}` };
+  if (isNodeJestProject(state.spec)) {
+    const jestConfigPath = path.join(WORKSPACE, "jest.config.cjs");
+    try {
+      const jestConfigContent = await fs.readFile(jestConfigPath, "utf-8");
+      const rootsMatch = jestConfigContent.match(/roots\s*:\s*\[([\s\S]*?)\]/m);
+      const testMatchBlock = jestConfigContent.match(/testMatch\s*:\s*\[([\s\S]*?)\]/m);
+      const configuredRoots = rootsMatch
+        ? Array.from(rootsMatch[1].matchAll(/["'`](.+?)["'`]/g)).map((match) =>
+            match[1].replace(/^<rootDir>\//, "").replace(/\\/g, "/")
+          )
+        : [];
+      const configuredTestMatch = testMatchBlock
+        ? Array.from(testMatchBlock[1].matchAll(/["'`](.+?)["'`]/g)).map((match) =>
+            match[1].replace(/^<rootDir>\//, "").replace(/\\/g, "/")
+          )
+        : [];
+      const expectedRoots = getProtocolTestRoots(state.executionProtocol, state.spec);
+      const declaredBusinessTests = getProtocolBusinessTestFiles(state.executionProtocol, state.spec);
+
+      for (const expectedRoot of expectedRoots) {
+        if (!configuredRoots.includes(expectedRoot)) {
+          issues.push(`Jest roots 未覆盖声明的测试目录 ${expectedRoot}`);
+        }
+      }
+
+      for (const testFile of declaredBusinessTests) {
+        const isCovered = configuredRoots.some((root) => testFile === root || testFile.startsWith(`${root}/`));
+        if (!isCovered) {
+          issues.push(`测试文件 ${testFile} 不在 Jest roots 覆盖范围内`);
+        }
+        const matchesPattern =
+          configuredTestMatch.length === 0 ||
+          configuredTestMatch.some((pattern) => globToRegExp(pattern).test(testFile));
+        if (!matchesPattern) {
+          issues.push(`测试文件 ${testFile} 不在 Jest testMatch 覆盖范围内`);
+        }
+      }
+    } catch {
+      issues.push("缺少 jest.config.cjs：Jest 项目必须显式声明测试发现范围");
+    }
+  }
+
+  if (issues.length === 0) {
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-verifier-r${round}`,
+      "verifier",
+      round,
+      `Verifier 第${round}轮：静态预检通过`,
+      `# Verifier 第${round}轮\n\n## 预检结论\n- 状态：通过\n- 检查文件数：${filesToCreate.length}\n`
+    );
+    return {
+      meetingNotes: [note],
+      validationReport: buildValidationReport([], { status: "pass", blocking: false }),
+      repairPlan: null,
+      protocolFailures: [],
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    };
+  }
+
+  const output = `[Verifier 预检失败]\n${issues.join("\n")}`;
+  const hasContractDrift = issues.some((issue) => /契约漂移/.test(issue));
+  const hasEnvironmentGap = issues.some((issue) => /jest: not found|npm ERR|node_modules|module not found/i.test(issue));
+  const failureType = hasEnvironmentGap
+    ? "environment_gap"
+    : hasContractDrift
+      ? "implementation_bug"
+      : "planning_gap";
+  const validationReport = buildValidationReport(
+    issues.map((issue) => ({
+      summary: issue,
+      evidence: [issue],
+    })),
+    { failureType, blocking: true }
+  );
+  const note = await writeMeetingNote(
+    WORKSPACE,
+    `note-verifier-r${round}`,
+    "verifier",
+    round,
+    `Verifier 第${round}轮：发现 ${issues.length} 个预检问题`,
+    `# Verifier 第${round}轮\n\n## 预检结论\n- 状态：失败\n- 问题数：${issues.length}\n\n## 问题列表\n\`\`\`text\n${issues.join("\n")}\n\`\`\`\n`
+  );
+  return {
+    isDone: false,
+    testResults: output,
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    protocolFailures: issues.map((issue) => ({
+      type: (/Jest roots|Jest testMatch|测试文件/.test(issue)
+        ? "test_discovery_gap"
+        : /契约漂移/.test(issue)
+          ? "contract_drift"
+          : "layout_mismatch") as "test_discovery_gap" | "contract_drift" | "layout_mismatch",
+      node: "verifier",
+      summary: issue,
+      evidence: [issue],
+      blocking: true,
+    })),
+    meetingNotes: [note],
+    lastFailedNode: "verifier",
+    lastFailureSummary: issues[0] || "Verifier 预检失败",
+  };
 }
