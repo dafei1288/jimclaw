@@ -2,6 +2,10 @@ import { JimClawState } from "../graph_types";
 import { execInContainer, extractFailureEvidence, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
 
+function isRetryableTerminalExecFailure(output: string): boolean {
+  return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
+}
+
 /**
  * Terminal 节点：负责在容器中执行测试命令
  */
@@ -36,7 +40,24 @@ export async function terminalNode(
     return { testResults: errMsg, meetingNotes: [note] };
   }
 
-  const result = await execInContainer(state.containerId, `NODE_ENV=test ${testCmd}`, { timeout: 90000 });
+  let result = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      result = await execInContainer(state.containerId, `NODE_ENV=test ${testCmd}`, { timeout: 90000 });
+    } catch (error: any) {
+      result = String(error?.message || error || "");
+    }
+
+    if (attempt === 0 && isRetryableTerminalExecFailure(result)) {
+      await AuditLogger.log(
+        WORKSPACE,
+        "Terminal",
+        `**Retry:** 测试容器执行出现瞬时错误，正在重试一次\n${result}`
+      );
+      continue;
+    }
+    break;
+  }
   
   await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${result}`);
   const evidence = extractFailureEvidence(result, state.deploymentStatus, state.blockedReason);

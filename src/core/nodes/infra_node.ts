@@ -61,6 +61,24 @@ function isDockerPortConflict(raw: string): boolean {
   return /port is already allocated|bind .* failed/i.test(raw);
 }
 
+function isRetryableDockerStartupFailure(raw: string): boolean {
+  return /Conflict\. The container name|container name .* already in use|already in use by container/i.test(raw || "");
+}
+
+function extractContainerId(raw: string): string {
+  const candidates = [
+    ...parseSkillOutput(raw).split(/\r?\n/),
+    ...String(raw || "").split(/\r?\n/),
+  ];
+  for (const line of candidates) {
+    const trimmed = line.trim();
+    if (/^[a-f0-9]{12,64}$/i.test(trimmed)) {
+      return trimmed;
+    }
+  }
+  return "";
+}
+
 /**
  * Infra 节点：负责构建运行和测试所需的基础设施
  */
@@ -163,11 +181,26 @@ export async function infraNode(
       `**Action:** Starting compose test container for service ${serviceName} with idle command`
     );
     let runOut = "";
+    containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
       runOut = await ShellExecuteSkill.config.run({
         command: `cd ${WORKSPACE} && docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`,
         timeout: 60000,
       });
+
+      containerId = extractContainerId(runOut);
+      if (containerId) {
+        break;
+      }
+
+      if (isRetryableDockerStartupFailure(runOut)) {
+        await AuditLogger.log(
+          WORKSPACE,
+          "Infrastructure",
+          `**Retry:** 检测到 compose 容器名冲突，重新拉起测试容器（第 ${attempt + 1} 次重试）`
+        );
+        continue;
+      }
 
       if (!isDockerPortConflict(runOut)) {
         break;
@@ -197,12 +230,10 @@ export async function infraNode(
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
 
-    containerId = parseSkillOutput(runOut).split("\n")[0].trim();
-
     if (!containerId) {
       console.warn(`[System] 无法直接获取 compose run 产生的容器 ID，尝试回退查询服务容器...`);
       const fallbackPs = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose ps -q ${serviceName}` });
-      containerId = parseSkillOutput(fallbackPs).split('\n')[0].trim();
+      containerId = extractContainerId(fallbackPs);
     }
 
     if (!containerId) {
@@ -224,12 +255,26 @@ export async function infraNode(
     // 3. 安全清理并启动单容器 (带端口映射)
     await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` });
     let startOut = "";
+    containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
       startOut = await ShellExecuteSkill.config.run({
         command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" -w /app ${image} tail -f /dev/null`,
         timeout: 60000,
       });
+      containerId = extractContainerId(startOut);
+      if (containerId) {
+        break;
+      }
       if (!isDockerPortConflict(startOut)) {
+        if (isRetryableDockerStartupFailure(startOut)) {
+          await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` }).catch(() => {});
+          await AuditLogger.log(
+            WORKSPACE,
+            "Infrastructure",
+            `**Retry:** 检测到 docker run 容器名冲突，清理同名容器后重试（第 ${attempt + 1} 次重试）`
+          );
+          continue;
+        }
         break;
       }
       hostPort += 1;
@@ -251,7 +296,18 @@ export async function infraNode(
       );
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
-    containerId = startOut.trim().split('\n').pop() || "";
+    if (!containerId) {
+      const errMsg = `[基础设施致命错误] docker run 启动后未能获取有效容器 ID，请检查 Docker 输出：\n${parseSkillOutput(startOut) || startOut}`;
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：容器启动失败`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 宿主机端口：${hostPort}\n- 容器端口：${containerPort}\n\n## 错误详情\n\`\`\`text\n${errMsg}\n\`\`\`\n`
+      );
+      return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
+    }
   }
 
   let hasPackageJson = false;
