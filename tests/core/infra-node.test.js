@@ -115,3 +115,76 @@ test("infra setup retries transient single-container startup failure before esca
     await removeTempWorkspace(workspace);
   }
 });
+
+test("infra setup retries transient install exec failure before escalating", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalFindPort = FindFreePortSkill.config.run;
+  let installCalls = 0;
+  let buildCalls = 0;
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      scripts: { build: "tsc" },
+    }, null, 2),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith("docker rm -f")) {
+      return "Output:\nremoved\nErrors:\n";
+    }
+    if (command.startsWith("docker run -d")) {
+      return "Output:\nabc123def456\nErrors:\n";
+    }
+    if (command.includes('docker exec abc123def456 sh -c "npm install --silent"')) {
+      installCalls += 1;
+      if (installCalls === 1) {
+        return [
+          "Command failed with exit code 137.",
+          "Output:",
+          "",
+          "Errors:",
+          "OCI runtime exec failed: exec failed: container is not running",
+        ].join("\n");
+      }
+      return "Output:\ninstalled\nErrors:\n";
+    }
+    if (command.includes('docker exec abc123def456 sh -c "npm run build"')) {
+      buildCalls += 1;
+      return "Output:\nbuilt\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await infraNode(
+      createBaseState({
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(installCalls, 2);
+    assert.equal(buildCalls, 1);
+    assert.equal(result.containerId, "abc123def456");
+    assert.equal(result.testResults, "");
+    assert.equal(result.lastFailedNode, "");
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    FindFreePortSkill.config.run = originalFindPort;
+    await removeTempWorkspace(workspace);
+  }
+});

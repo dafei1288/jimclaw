@@ -65,6 +65,14 @@ function isRetryableDockerStartupFailure(raw: string): boolean {
   return /Conflict\. The container name|container name .* already in use|already in use by container/i.test(raw || "");
 }
 
+function isRetryableContainerExecFailure(raw: string): boolean {
+  return /OCI runtime exec failed|container .* is not running|No such container/i.test(raw || "");
+}
+
+function isCommandFailureOutput(raw: string): boolean {
+  return /^Command failed with exit code\s+\d+/i.test(String(raw || "").trim());
+}
+
 function extractContainerId(raw: string): string {
   const candidates = [
     ...parseSkillOutput(raw).split(/\r?\n/),
@@ -77,6 +85,40 @@ function extractContainerId(raw: string): string {
     }
   }
   return "";
+}
+
+async function runInfraContainerCommand(
+  workspace: string,
+  containerId: string,
+  command: string,
+  label: string,
+  timeout: number
+): Promise<string> {
+  let lastOutput = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      lastOutput = await execInContainer(containerId, command, { timeout });
+    } catch (error: any) {
+      lastOutput = String(error?.message || error || "");
+    }
+
+    if (attempt === 0 && isRetryableContainerExecFailure(lastOutput)) {
+      await AuditLogger.log(
+        workspace,
+        "Infrastructure",
+        `**Retry:** ${label} 遇到瞬时容器执行错误，正在重试一次\n${lastOutput}`
+      );
+      continue;
+    }
+
+    if (isCommandFailureOutput(lastOutput)) {
+      throw new Error(`${label}失败：${parseSkillOutput(lastOutput) || lastOutput}`);
+    }
+
+    return lastOutput;
+  }
+
+  throw new Error(`${label}失败：${parseSkillOutput(lastOutput) || lastOutput}`);
 }
 
 /**
@@ -321,22 +363,24 @@ export async function infraNode(
     if (hasPackageJson) {
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (npm install)`);
       const installOut = hasCompose
-        ? await execInContainer(
+        ? await runInfraContainerCommand(
+            WORKSPACE,
             containerId,
             "NODE_ENV=development npm install --include=dev --silent",
-            { timeout: 300000 }
+            "npm install",
+            300000
           )
-        : await execInContainer(containerId, "npm install --silent", { timeout: 300000 });
+        : await runInfraContainerCommand(WORKSPACE, containerId, "npm install --silent", "npm install", 300000);
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${installOut}`);
 
       if (hasBuildScript(packageJsonContent)) {
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace (npm run build)`);
-        const buildOut = await execInContainer(containerId, "npm run build", { timeout: 300000 });
+        const buildOut = await runInfraContainerCommand(WORKSPACE, containerId, "npm run build", "npm run build", 300000);
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Output:**\n${buildOut}`);
       }
     }
   } catch (e: any) {
-    const errorMsg = `[基础设施异常] npm install 失败: ${e.message || e}`;
+    const errorMsg = `[基础设施异常] ${e.message || e}`;
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Critical Error:** ${errorMsg}`);
     const note = await writeMeetingNote(
       WORKSPACE,
