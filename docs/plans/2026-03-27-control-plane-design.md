@@ -273,9 +273,9 @@ type RepairPlan = {
 定义：客户确认与默认授权状态。
 
 职责：
-- 记录哪些阶段必须人工确认
+- 记录哪些阶段需要客户确认或客户授权
 - 记录客户是否给了“默认同意”授权
-- 决定流程在关键节点是自动通过还是暂停等待
+- 决定流程在关键节点是自动通过、暂停等待，还是驳回回退
 
 建议结构：
 
@@ -312,6 +312,7 @@ type CustomerApprovalState = {
 硬闸门：
 - 用户说“前后端”时，必须同时设置 `frontendRequired=true`、`backendRequired=true`
 - 不能把用户需求缩成技术实现
+- 需求 checkpoint 只能处于“默认授权自动通过”或“待客户确认”两种初始状态
 
 失败分流：
 - PM 自己失败则终止
@@ -332,6 +333,7 @@ type CustomerApprovalState = {
 - `coverageMatrix` 不能为空
 - 任一 requirement 没被覆盖，直接失败
 - 不能继续到 Orchestrator
+- `solution` checkpoint 未授权且未确认时，必须进入 approval 控制层
 
 失败分流：
 - 回 Architect 重做
@@ -480,6 +482,7 @@ type CustomerApprovalState = {
 
 硬闸门：
 - 任意 blocking failure 存在时禁止 deploy
+- `deploy` checkpoint 未授权且未确认时，禁止部署
 
 ## 错误分类和分流
 
@@ -510,7 +513,7 @@ type CustomerApprovalState = {
 
 客户确认是正式控制层，不是可选提示。
 
-系统默认支持两种模式：
+系统默认支持两种确认模式：
 
 1. 显式确认
    - 到达关键阶段时暂停
@@ -520,6 +523,23 @@ type CustomerApprovalState = {
    - 客户可预先授权某些阶段自动通过
    - 系统在对应 checkpoint 自动记录为 `approvedBy=default-authorization`
    - 不再每次都打断客户
+
+系统必须严格区分 3 种结果：
+
+1. 默认授权通过
+   - `autoApprove.<stage>=true`
+   - 不阻塞流程
+   - 自动记录 `approved=true` 与 `approvedBy=default-authorization`
+
+2. 人工确认通过
+   - `autoApprove.<stage>=false`
+   - 进入 approval 控制层并暂停
+   - 客户明确确认后，记录 `approved=true` 与 `approvedBy=customer`
+
+3. 人工驳回
+   - 客户明确拒绝当前 checkpoint
+   - 当前 checkpoint 不得伪装成已批准
+   - 流程必须回到对应节点重做，而不是继续向后执行
 
 建议只保留 3 个高价值确认点：
 
@@ -550,6 +570,8 @@ type CustomerApprovalState = {
 - 已明确驳回时，必须回到对应节点重做
 - 确认记录必须写入 `CustomerApprovalState`
 - 后续节点只能读取已确认版本，不允许继续漂移
+- approval 控制语义不能依赖 UI transport；不能因为没有 `onEvent` 就直接绕过 checkpoint
+- approval 节点不能把“等待客户确认”伪装成 `approvedBy=customer`
 
 ## 重规划规则
 
@@ -596,6 +618,7 @@ type CustomerApprovalState = {
 5. `fix_plan` 只接受 `implementation_bug`
 6. `planning_gap` 强制触发重规划
 7. `CustomerApprovalState` 的默认同意授权机制
+8. approval 节点正确区分“自动授权 / 人工确认 / 驳回回退”
 
 ## 预期效果
 

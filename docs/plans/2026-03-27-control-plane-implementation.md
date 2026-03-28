@@ -4,7 +4,7 @@
 
 **Goal:** 把 JimClaw 从“观测协议”升级成“控制协议”，让需求、技术栈、方案、任务图、验证、修复和客户确认成为真正的执行控制平面。
 
-**Architecture:** 先在 state 中正式引入 `TechnologyDecision`、`ValidationReport`、`RepairPlan`、`CustomerApprovalState`，再把 `architect -> orchestrator -> verifier -> fix_plan -> graph route` 接到这些对象上。第一批不追求一次性替换全部旧字段，而是优先建立“规划错误强制重规划、实现错误才进 fix_plan、客户可默认授权确认”的硬闸门。
+**Architecture:** 先在 state 中正式引入 `TechnologyDecision`、`ValidationReport`、`RepairPlan`、`CustomerApprovalState`，再把 `architect -> orchestrator -> verifier -> fix_plan -> graph route` 接到这些对象上。第一批不追求一次性替换全部旧字段，而是优先建立“规划错误强制重规划、实现错误才进 fix_plan、客户可默认授权确认、未授权才暂停等待”的硬闸门。
 
 **Tech Stack:** TypeScript, LangGraph.js, Node.js, Jest(node test), JimClaw existing graph/node architecture
 
@@ -295,7 +295,7 @@ git add src/core/logic_utils.ts src/core/graph.ts tests/core/workflow-replay.tes
 git commit -m "feat: trigger replanning after control-plane patches"
 ```
 
-### Task 8: 加入客户确认与默认授权
+### Task 8: 修正客户确认语义与默认授权
 
 **Files:**
 - Modify: `src/core/graph_types.ts`
@@ -307,8 +307,10 @@ git commit -m "feat: trigger replanning after control-plane patches"
 **Step 1: Write the failing test**
 
 新增测试：
-- 未确认且未默认授权时，在 `requirements/solution/deploy` 阶段暂停
 - 开启 `autoApprove` 时自动通过并记录 `approvedBy=default-authorization`
+- 关闭 `autoApprove` 时，approval 节点必须发出等待确认事件，不能直接伪装成 `approvedBy=customer`
+- 收到人工批准后，才记录 `approvedBy=customer`
+- 没有审批通道且未默认授权时，必须报错或中止，不能静默绕过
 
 **Step 2: Run test to verify it fails**
 
@@ -319,8 +321,10 @@ Expected: 客户确认控制测试失败
 
 引入 `CustomerApprovalState`：
 - graph 路由识别关键 checkpoint
+- approval 节点区分“默认授权自动通过”和“人工确认后通过”
 - server/dashboard 展示当前确认状态
 - 默认同意授权可配置
+- 不再由 UI 外层伪造 `approvedBy=customer`
 
 **Step 4: Run test to verify it passes**
 
@@ -346,6 +350,7 @@ git commit -m "feat: add customer approval control layer"
 - “只有 5 个壳文件但用户要完整后端 API” 必须归类为 `planning_gap`
 - 不能进入 `fix_plan/coder`
 - 必须触发重规划
+- “审批 checkpoint 未授权却继续执行” 必须被拦截或显式自动授权
 
 **Step 2: Run test to verify it fails**
 
@@ -405,4 +410,3 @@ Expected:
 git add .
 git commit -m "feat: implement control plane for planning and execution"
 ```
-

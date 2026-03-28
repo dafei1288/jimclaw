@@ -57,20 +57,57 @@ test("approval marks solution checkpoint as pending manual confirmation when not
 
   try {
     const events = [];
+    const approvals = [];
     const result = await approvalNode(
       state,
       {},
       workspace,
       (type, sender, content, metadata) => events.push({ type, sender, content, metadata }),
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      async (request) => {
+        approvals.push(request);
+        return { approved: true };
+      }
     );
 
-    assert.equal(result.requiresApproval, true);
+    assert.equal(result.requiresApproval, false);
     assert.equal(result.approvalNextNode, "contract_sync");
+    assert.equal(approvals.length, 1);
+    assert.equal(approvals[0].stage, "solution");
     assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approved, true);
     assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approvedBy, "customer");
     assert.equal(events.some((event) => event.type === "approval_required"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("approval throws when manual confirmation is required but no approval channel exists", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    contract: { title: "演示系统", requirements: ["前后端"], acceptanceCriteria: ["可访问"] },
+    spec: { language: "TypeScript", filesToCreate: ["src/index.ts"] },
+    manifest: { services: [{ name: "api", port: 3000 }] },
+    customerApprovalState: buildCustomerApprovalState({
+      autoApprove: { requirements: true, solution: false, deploy: false },
+      summaries: { solution: "方案待确认" },
+    }),
+  });
+
+  try {
+    await assert.rejects(
+      approvalNode(
+        state,
+        {},
+        workspace,
+        createNoopEmit,
+        createNoopStartSpan,
+        recorder.save
+      ),
+      /未提供审批通道/
+    );
   } finally {
     await removeTempWorkspace(workspace);
   }

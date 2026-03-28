@@ -247,7 +247,24 @@ io.on("connection", (socket) => {
         }
         currentSession.events.push({ ...event, timestamp: new Date().toLocaleTimeString() });
         io.emit("agent-event", event);
-      }, graphOptions);
+      }, {
+        ...graphOptions,
+        requestApproval: async ({ stage, summary, nextNode }) => {
+          currentSession.requiresApproval = true;
+          currentSession.pendingApprovalStage = stage;
+          currentSession.approvalNextNode = nextNode;
+          io.emit("state-update", currentSession);
+
+          return await new Promise<{ approved: boolean; reason?: string }>((resolve) => {
+            socket.once("approve-task", () => {
+              currentSession.requiresApproval = false;
+              currentSession.pendingApprovalStage = null;
+              io.emit("state-update", currentSession);
+              resolve({ approved: true });
+            });
+          });
+        },
+      });
 
       const stream = await (appGraph as any).stream(initialGraphState, { recursionLimit: 500 });
 
@@ -336,17 +353,6 @@ io.on("connection", (socket) => {
         }
 
         io.emit("state-update", currentSession);
-
-        if (stateUpdate.requiresApproval) {
-          console.log(`Node ${nodeName} requires approval. Pausing stream...`);
-          await new Promise<void>((resolve) => {
-            socket.once("approve-task", () => {
-              currentSession.requiresApproval = false;
-              io.emit("state-update", currentSession);
-              resolve();
-            });
-          });
-        }
       }
 
       const finalPhase = currentSession.currentPhase;

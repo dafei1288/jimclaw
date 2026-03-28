@@ -36,7 +36,12 @@ export async function approvalNode(
   WORKSPACE: string,
   emit: any,
   startSpan: any,
-  saveBoulder: any
+  saveBoulder: any,
+  requestApproval?: (request: {
+    stage: ApprovalStage;
+    summary: string;
+    nextNode: string;
+  }) => Promise<{ approved: boolean; reason?: string; }>
 ) {
   startSpan("approval");
   emit("phase-change", "System", "approval");
@@ -88,17 +93,34 @@ export async function approvalNode(
     validationReport: state.validationReport,
   });
 
+  const pendingResult = {
+    requiresApproval: true,
+    pendingApprovalStage: stage,
+    approvalNextNode: nextNode,
+    customerApprovalState,
+  };
+  await saveBoulder({ ...state, ...pendingResult }, "approval_pending");
+
+  if (!requestApproval) {
+    throw new Error(`审批阶段 ${stage} 需要客户确认，但当前会话未提供审批通道。请启用默认授权或使用支持审批的会话。`);
+  }
+
+  const decision = await requestApproval({ stage, summary, nextNode });
+  if (!decision?.approved) {
+    throw new Error(`客户拒绝了 ${stage} 阶段确认${decision?.reason ? `：${decision.reason}` : ""}`);
+  }
+
   const nextApprovalState = markCheckpointApproved(customerApprovalState, stage, "customer");
   const note = await writeMeetingNote(
     WORKSPACE,
     `note-approval-${stage}-r${state.retryCount || 0}`,
     "approval",
     state.retryCount || 0,
-    `客户确认：${stage} 待确认`,
-    `# 客户确认\n\n- 阶段：${stage}\n- 结果：等待客户确认\n- 下一节点：${nextNode}\n- 摘要：${summary || "（无）"}\n`
+    `客户确认：${stage} 人工批准`,
+    `# 客户确认\n\n- 阶段：${stage}\n- 结果：人工批准\n- 下一节点：${nextNode}\n- 摘要：${summary || "（无）"}\n`
   );
   const result = {
-    requiresApproval: true,
+    requiresApproval: false,
     pendingApprovalStage: null,
     approvalNextNode: nextNode,
     customerApprovalState: nextApprovalState,

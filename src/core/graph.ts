@@ -31,8 +31,23 @@ function logPrefix(agentName: string = "System"): string {
   return `[${getBeijingTime()}] [${agentName}]`;
 }
 
-function shouldRequireApproval(state: JimClawState, stage: "requirements" | "solution" | "deploy", onEvent?: Function) {
-  if (!onEvent) return false;
+type ApprovalDecision = {
+  approved: boolean;
+  reason?: string;
+};
+
+type ApprovalRequest = {
+  stage: "requirements" | "solution" | "deploy";
+  summary: string;
+  nextNode: string;
+};
+
+function shouldRequireApproval(
+  state: JimClawState,
+  stage: "requirements" | "solution" | "deploy",
+  requestApproval?: (request: ApprovalRequest) => Promise<ApprovalDecision>
+) {
+  if (!requestApproval) return false;
   const checkpoint = state.customerApprovalState?.checkpoints?.find((item) => item.stage === stage);
   return Boolean(checkpoint?.required) && !checkpoint?.approved;
 }
@@ -45,6 +60,7 @@ export async function createJimClawGraph(agents: {
 }, onEvent?: (event: { type: string; sender: string; content: string; metadata?: any }) => void, options?: {
   workspacePath?: string;
   traceId?: string;
+  requestApproval?: (request: ApprovalRequest) => Promise<ApprovalDecision>;
 }) {
   const maxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
   const WORKSPACE = options?.workspacePath || path.join(process.cwd(), "workspace", `run_${Date.now()}`);
@@ -162,7 +178,7 @@ export async function createJimClawGraph(agents: {
     .addNode("pm", withNodeGuard("pm", (s) => pmNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("architect", withNodeGuard("architect", (s) => architectNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("contract_sync", withNodeGuard("contract_sync", (s) => contractSyncNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
-    .addNode("approval", withNodeGuard("approval", (s) => approvalNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
+    .addNode("approval", withNodeGuard("approval", (s) => approvalNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder, options?.requestApproval)))
     .addNode("orchestrator", withNodeGuard("orchestrator", (s) => orchestratorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("coder", withNodeGuard("coder", (s) => coderNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("env_guard", withNodeGuard("env_guard", (s) => envGuardNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -199,11 +215,11 @@ export async function createJimClawGraph(agents: {
     fix_plan: "fix_plan",
   });
   workflow.addConditionalEdges("pm", (s) => {
-    if (shouldRequireApproval(s, "requirements", onEvent)) return "approval";
+    if (shouldRequireApproval(s, "requirements", options?.requestApproval)) return "approval";
     return "architect";
   }, { approval: "approval", architect: "architect" });
   workflow.addConditionalEdges("architect", (s) => {
-    if (shouldRequireApproval(s, "solution", onEvent)) return "approval";
+    if (shouldRequireApproval(s, "solution", options?.requestApproval)) return "approval";
     return "contract_sync";
   }, { approval: "approval", contract_sync: "contract_sync" });
   workflow.addEdge("contract_sync", "orchestrator");
@@ -248,7 +264,7 @@ export async function createJimClawGraph(agents: {
     const failureEvidence = extractFailureEvidence(s.testResults || "", s.deploymentStatus, s.blockedReason);
     const failureType = s.validationReport?.failureType;
     if (s.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
-      if (shouldRequireApproval(s, "deploy", onEvent)) return "approval";
+      if (shouldRequireApproval(s, "deploy", options?.requestApproval)) return "approval";
       return "deploy";
     }
     if (failureType === "planning_gap") return "architect";
