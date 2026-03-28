@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import { builtinModules } from "module";
 import { JimClawState, RepairLedgerEntry, ConsensusProgress } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
@@ -17,6 +18,166 @@ function toolFailed(output: string): boolean {
 function truncateForLog(s: string, max = 1200): string {
   if (!s) return "";
   return s.length > max ? `${s.slice(0, max)}\n...(truncated)` : s;
+}
+
+const NODE_BUILTINS = new Set([...builtinModules, ...builtinModules.map((item) => `node:${item}`)]);
+const KNOWN_DEP_VERSIONS: Record<string, string> = {
+  express: "^4.18.2",
+  cors: "^2.8.5",
+  jsonwebtoken: "^9.0.2",
+  uuid: "^9.0.1",
+  bcryptjs: "^2.4.3",
+  morgan: "^1.10.0",
+  helmet: "^7.1.0",
+  "rate-limiter-flexible": "^5.0.5",
+  supertest: "^7.1.1",
+  jest: "^29.7.0",
+  "ts-jest": "^29.1.1",
+  typescript: "^5.3.3",
+  "ts-node": "^10.9.2",
+};
+
+function isTrackedSourceFile(filePath: string): boolean {
+  return /\.(ts|tsx|js|jsx|mjs|cjs)$/.test(filePath);
+}
+
+function isDevOnlyFile(filePath: string): boolean {
+  const normalized = filePath.replace(/\\/g, "/").toLowerCase();
+  return normalized.startsWith("tests/")
+    || normalized.includes("/__tests__/")
+    || /\.test\.[tj]sx?$/.test(normalized)
+    || /\.spec\.[tj]sx?$/.test(normalized)
+    || /jest\.config\./.test(normalized)
+    || normalized.startsWith("scripts/");
+}
+
+function normalizePackageName(raw: string): string {
+  if (!raw || raw.startsWith(".") || raw.startsWith("/") || NODE_BUILTINS.has(raw)) return "";
+  if (raw.startsWith("@")) {
+    const parts = raw.split("/");
+    return parts.length >= 2 ? `${parts[0]}/${parts[1]}` : raw;
+  }
+  return raw.split("/")[0];
+}
+
+function collectImportedPackages(filePath: string, content: string): Array<{ packageName: string; devOnly: boolean }> {
+  const found = new Map<string, boolean>();
+  const devOnly = isDevOnlyFile(filePath);
+  const patterns = [
+    /import\s+[^'"]*?\s+from\s+['"]([^'"]+)['"]/g,
+    /export\s+[^'"]*?\s+from\s+['"]([^'"]+)['"]/g,
+    /require\(\s*['"]([^'"]+)['"]\s*\)/g,
+    /import\(\s*['"]([^'"]+)['"]\s*\)/g,
+  ];
+  for (const pattern of patterns) {
+    for (const match of content.matchAll(pattern)) {
+      const packageName = normalizePackageName(match[1]);
+      if (!packageName) continue;
+      const current = found.get(packageName);
+      found.set(packageName, current === undefined ? devOnly : current && devOnly);
+    }
+  }
+  return Array.from(found.entries()).map(([packageName, fileDevOnly]) => ({ packageName, devOnly: fileDevOnly }));
+}
+
+async function listTrackedFiles(workspace: string): Promise<string[]> {
+  const results: string[] = [];
+  const walk = async (relativeDir: string) => {
+    const absoluteDir = path.join(workspace, relativeDir);
+    let entries: Array<{ name: string; isDirectory: () => boolean }>;
+    try {
+      entries = await fs.readdir(absoluteDir, { withFileTypes: true }) as Array<{ name: string; isDirectory: () => boolean }>;
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      if (entry.name === "node_modules" || entry.name === ".git" || entry.name === "dist") continue;
+      const relativePath = relativeDir ? path.posix.join(relativeDir.replace(/\\/g, "/"), entry.name) : entry.name;
+      if (entry.isDirectory()) {
+        await walk(relativePath);
+      } else if (isTrackedSourceFile(relativePath)) {
+        results.push(relativePath.replace(/\\/g, "/"));
+      }
+    }
+  };
+  await walk("");
+  return results;
+}
+
+function resolveDependencyVersion(
+  packageName: string,
+  state: JimClawState,
+  kind: "dependencies" | "devDependencies"
+): string {
+  return state.spec?.[kind]?.[packageName]
+    || state.spec?.dependencies?.[packageName]
+    || state.spec?.devDependencies?.[packageName]
+    || KNOWN_DEP_VERSIONS[packageName]
+    || "latest";
+}
+
+async function closePackageDependencyGaps(
+  workspace: string,
+  state: JimClawState
+): Promise<{ changed: boolean; actions: string[]; code?: string }> {
+  const pkgPath = path.join(workspace, "package.json");
+  const raw = await fs.readFile(pkgPath, "utf-8");
+  const pkg = JSON.parse(raw || "{}");
+  const actions: string[] = [];
+  const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
+  const trackedFiles = new Set<string>([
+    ...Object.keys(filesContent).filter(isTrackedSourceFile),
+    ...(await listTrackedFiles(workspace)),
+  ]);
+
+  const runtimeDeps = { ...(pkg.dependencies || {}) } as Record<string, string>;
+  const devDeps = { ...(pkg.devDependencies || {}) } as Record<string, string>;
+  let changed = false;
+
+  for (const filePath of trackedFiles) {
+    const absolutePath = path.join(workspace, filePath);
+    const content = filesContent[filePath] ?? await fs.readFile(absolutePath, "utf-8").catch(() => "");
+    if (!content) continue;
+    for (const imported of collectImportedPackages(filePath, content)) {
+      if (imported.devOnly) {
+        if (!runtimeDeps[imported.packageName] && !devDeps[imported.packageName]) {
+          devDeps[imported.packageName] = resolveDependencyVersion(imported.packageName, state, "devDependencies");
+          actions.push(`补齐测试依赖 ${imported.packageName} -> devDependencies`);
+          changed = true;
+        }
+        continue;
+      }
+
+      if (devDeps[imported.packageName] && !runtimeDeps[imported.packageName]) {
+        runtimeDeps[imported.packageName] = devDeps[imported.packageName];
+        delete devDeps[imported.packageName];
+        actions.push(`移动运行时依赖 ${imported.packageName} 到 dependencies`);
+        changed = true;
+        continue;
+      }
+
+      if (!runtimeDeps[imported.packageName]) {
+        runtimeDeps[imported.packageName] = resolveDependencyVersion(imported.packageName, state, "dependencies");
+        actions.push(`补齐运行时依赖 ${imported.packageName} -> dependencies`);
+        changed = true;
+      }
+    }
+  }
+
+  if (!changed) {
+    return { changed: false, actions };
+  }
+
+  pkg.dependencies = runtimeDeps;
+  pkg.devDependencies = devDeps;
+  const nextContent = `${JSON.stringify(pkg, null, 2)}\n`;
+  await fs.writeFile(pkgPath, nextContent, "utf-8");
+  filesContent["package.json"] = nextContent;
+  return {
+    changed: true,
+    actions,
+    code: JSON.stringify(filesContent, null, 2),
+  };
 }
 
 async function normalizePackageJson(workspace: string): Promise<{ changed: boolean; actions: string[] }> {
@@ -167,6 +328,17 @@ export async function envGuardNode(
   }
 
   try {
+    const closureResult = await closePackageDependencyGaps(WORKSPACE, { ...state, ...bootstrapPatch } as JimClawState);
+    if (closureResult.changed) {
+      bootstrapPatch = {
+        ...bootstrapPatch,
+        code: closureResult.code,
+      };
+      const actionText = closureResult.actions.join("；");
+      ledger.push({ round, phase: "env_guard", action: actionText, result: "success" });
+      await AuditLogger.log(WORKSPACE, "Environment", `**Action:** ${actionText}`);
+    }
+
     const normalized = await normalizePackageJson(WORKSPACE);
     if (normalized.changed) {
       const actionText = normalized.actions.join("；");
