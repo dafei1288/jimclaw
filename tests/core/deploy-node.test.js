@@ -1,5 +1,15 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const {
+  createTempWorkspace,
+  removeTempWorkspace,
+  createBaseState,
+  createNoopEmit,
+  createNoopStartSpan,
+  createSnapshotRecorder,
+} = require("./test-helpers");
+const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
+const { GetServerIPSkill } = require("../../src/skills/get_server_ip");
 
 require("ts-node/register/transpile-only");
 
@@ -8,6 +18,7 @@ const {
   buildDeployLaunchCommand,
   getHealthCheckPath,
   getDeployPreconditionFailure,
+  deployNode,
 } = require("../../src/core/nodes/deploy_node");
 
 test("deploy health check uses localhost while preserving public url for display", () => {
@@ -98,4 +109,71 @@ test("deploy precondition failure blocks deploy when current infra state already
     }),
     null
   );
+});
+
+test("deploy retries transient launch exec failure before final health verification", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  let launchCalls = 0;
+  let launchReady = false;
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith('docker exec -d container-123 sh -c')) {
+      launchCalls += 1;
+      if (launchCalls === 1) {
+        return [
+          "Command failed with exit code 137.",
+          "Output:",
+          "",
+          "Errors:",
+          "OCI runtime exec failed: exec failed: container is not running",
+        ].join("\n");
+      }
+      launchReady = true;
+      return "Output:\n\nErrors:\n";
+    }
+    if (command.startsWith("curl ")) {
+      return launchReady ? "Output:\n200\nErrors:\n" : "Output:\n000\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        containerId: "container-123",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(launchCalls, 2);
+    assert.equal(result.deploymentStatus.status, "running");
+    assert.equal(result.lastFailedNode, "");
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
 });

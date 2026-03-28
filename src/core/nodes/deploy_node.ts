@@ -4,6 +4,46 @@ import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
 
+function isRetryableDeployLaunchFailure(output: string): boolean {
+  return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
+}
+
+function isCommandFailureOutput(output: string): boolean {
+  return /^Command failed with exit code\s+\d+/i.test(String(output || "").trim());
+}
+
+async function launchServiceWithRetry(
+  workspace: string,
+  containerId: string,
+  launchCommand: string
+): Promise<string> {
+  let lastOutput = "";
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      lastOutput = await execInContainer(containerId, launchCommand, { background: true });
+    } catch (error: any) {
+      lastOutput = String(error?.message || error || "");
+    }
+
+    if (attempt === 0 && isRetryableDeployLaunchFailure(lastOutput)) {
+      await AuditLogger.log(
+        workspace,
+        "Infrastructure",
+        `**Retry:** 服务启动命令遇到瞬时容器执行错误，正在重试一次\n${lastOutput}`
+      );
+      continue;
+    }
+
+    if (isCommandFailureOutput(lastOutput)) {
+      throw new Error(`服务启动失败：${lastOutput}`);
+    }
+
+    return lastOutput;
+  }
+
+  throw new Error(`服务启动失败：${lastOutput}`);
+}
+
 export function buildDeploymentUrls(ip: string, hostPort: string) {
   return {
     publicUrl: `http://${ip}:${hostPort}`,
@@ -126,7 +166,30 @@ export async function deployNode(
 
   // 2. 启动服务
   const launchCommand = buildDeployLaunchCommand(runCmd);
-  await execInContainer(state.containerId, launchCommand, { background: true });
+  try {
+    await launchServiceWithRetry(WORKSPACE, state.containerId, launchCommand);
+  } catch (error: any) {
+    const errorMsg = `[部署启动失败] ${error.message || error}`;
+    await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Launch Failed\n${errorMsg}`);
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-deploy-r${round}`,
+      "deploy",
+      round,
+      `Deploy 第${round}轮：启动失败`,
+      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：失败\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
+    );
+    const result = {
+      deploymentStatus: { url: publicUrl, status: "failed" as const },
+      testResults: `${state.testResults || ""}\n${errorMsg}`.trim(),
+      isDone: false,
+      meetingNotes: [note],
+      lastFailedNode: "deploy",
+      lastFailureSummary: errorMsg,
+    };
+    await saveBoulder({ ...state, ...result }, "deploy");
+    return result;
+  }
 
   // 3. 核心改进：真实连通性校验 (Health Check)
   emit("thinking", "System", `正在验证服务连通性: ${healthCheckTarget} ...`);
