@@ -231,3 +231,153 @@ test("verifier success clears stale protocol and failure markers", async () => {
     await removeTempWorkspace(workspace);
   }
 });
+
+test("verifier classifies missing package metadata as environment gap", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      testCommand: "npm test",
+      filesToCreate: ["package.json", "src/index.ts"],
+    },
+  });
+
+  try {
+    await fs.mkdir(path.join(workspace, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "src/index.ts"),
+      `const app = { listen() {} };\napp.listen(10000);\nexport default app;\n`,
+      "utf-8"
+    );
+
+    const result = await verifierNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.validationReport.failureType, "environment_gap");
+    assert.equal(result.repairPlan.repairType, "environment");
+    assert.match(result.testResults || "", /缺少 package\.json/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("verifier classifies broken entry runtime wiring as runtime gap", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      testCommand: "npm test",
+      filesToCreate: ["package.json", "jest.config.cjs", "tests/setup.test.ts", "src/index.ts"],
+      entryPoint: "src/index.ts",
+    },
+  });
+
+  try {
+    await fs.mkdir(path.join(workspace, "tests"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "jest" } }, null, 2),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "jest.config.cjs"),
+      `module.exports = { preset: "ts-jest", testEnvironment: "node", roots: ["<rootDir>/tests"], testMatch: ["**/*.test.ts"] };`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "tests/setup.test.ts"),
+      `describe("setup", () => { it("works", () => { expect(true).toBe(true); }); });`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "src/index.ts"),
+      `const app = { get() {} };\nexport default app;\n`,
+      "utf-8"
+    );
+
+    const result = await verifierNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.validationReport.failureType, "runtime_gap");
+    assert.equal(result.repairPlan.repairType, "runtime");
+    assert.match(result.testResults || "", /未找到监听声明/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("verifier classifies syntax-broken source files as implementation bug", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      testCommand: "npm test",
+      filesToCreate: ["package.json", "jest.config.cjs", "tests/setup.test.ts", "src/index.ts", "src/routes/books.ts"],
+      entryPoint: "src/index.ts",
+    },
+  });
+
+  try {
+    await fs.mkdir(path.join(workspace, "tests"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "routes"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "jest" } }, null, 2),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "jest.config.cjs"),
+      `module.exports = { preset: "ts-jest", testEnvironment: "node", roots: ["<rootDir>/tests"], testMatch: ["**/*.test.ts"] };`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "tests/setup.test.ts"),
+      `describe("setup", () => { it("works", () => { expect(true).toBe(true); }); });`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "src/index.ts"),
+      `const app = { listen() {} };\napp.listen(10000);\nexport default app;\n`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "src/routes/books.ts"),
+      `export const broken = ;\n`,
+      "utf-8"
+    );
+
+    const result = await verifierNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.validationReport.failureType, "implementation_bug");
+    assert.equal(result.repairPlan.repairType, "implementation");
+    assert.match(result.testResults || "", /语法错误|Expression expected/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});

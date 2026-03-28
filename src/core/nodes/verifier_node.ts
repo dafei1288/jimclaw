@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as ts from "typescript";
 import { JimClawState } from "../graph_types";
 import {
   buildRepairPlan,
@@ -12,6 +13,66 @@ import {
   normalizeNodeJestTestFilePath,
   writeMeetingNote
 } from "../logic_utils";
+
+type VerifierFailureType = "planning_gap" | "implementation_bug" | "environment_gap" | "runtime_gap";
+
+function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: readonly ts.Diagnostic[]): string {
+  return diagnostics
+    .map((diag) => {
+      const message = ts.flattenDiagnosticMessageText(diag.messageText, "\n");
+      if (typeof diag.start !== "number") {
+        return `语法错误: ${message}`;
+      }
+      const sourceFile = ts.createSourceFile(fileTarget, content, ts.ScriptTarget.ES2020, true);
+      const position = sourceFile.getLineAndCharacterOfPosition(diag.start);
+      return `语法错误(${fileTarget}:L${position.line + 1}:C${position.character + 1}): ${message}`;
+    })
+    .join("; ");
+}
+
+function getSyntaxValidationError(fileTarget: string, content: string): string | null {
+  if (!/\.(ts|tsx|js|jsx)$/i.test(fileTarget)) return null;
+  const diagnostics = ts.transpileModule(content, {
+    fileName: fileTarget,
+    reportDiagnostics: true,
+    compilerOptions: {
+      target: ts.ScriptTarget.ES2020,
+      module: ts.ModuleKind.CommonJS,
+    },
+  }).diagnostics || [];
+  if (diagnostics.length === 0) return null;
+  return formatTsDiagnostics(fileTarget, content, diagnostics);
+}
+
+function extractIssueFile(issue: string): string | undefined {
+  const explicitFileMatch = issue.match(/(?:文件|服务文件|测试文件|入口文件)\s+([^\s:，,]+)/);
+  if (explicitFileMatch?.[1]) {
+    return explicitFileMatch[1].replace(/\\/g, "/");
+  }
+  const pathMatch = issue.match(/([A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|cjs|mjs|html|py|go|ya?ml)|Dockerfile)/);
+  return pathMatch?.[1] ? pathMatch[1].replace(/\\/g, "/") : undefined;
+}
+
+function classifyVerifierIssue(issue: string): {
+  failureType: VerifierFailureType;
+  protocolType: "layout_mismatch" | "contract_drift" | "runtime_mismatch" | "test_discovery_gap" | "tooling_unavailable";
+} {
+  if (
+    /缺少 package\.json|缺少 jest\.config\.cjs|运行时框架 .*devDependencies|jest: not found|npm ERR|node_modules|module not found/i.test(issue)
+  ) {
+    return { failureType: "environment_gap", protocolType: "tooling_unavailable" };
+  }
+  if (/未找到监听声明|入口挂载缺失|前端页面入口|健康检查/i.test(issue)) {
+    return { failureType: "runtime_gap", protocolType: "runtime_mismatch" };
+  }
+  if (/契约漂移|语法错误/i.test(issue)) {
+    return { failureType: "implementation_bug", protocolType: "contract_drift" };
+  }
+  if (/Jest roots|Jest testMatch|测试文件 .*覆盖范围/.test(issue)) {
+    return { failureType: "planning_gap", protocolType: "test_discovery_gap" };
+  }
+  return { failureType: "planning_gap", protocolType: "layout_mismatch" };
+}
 
 /**
  * Verifier 节点：纯静态预检，无 LLM 调用，运行极快。
@@ -137,6 +198,19 @@ export async function verifierNode(
     }
   }
 
+  for (const file of filesToCreate) {
+    if (!/\.(ts|tsx|js|jsx)$/i.test(file)) continue;
+    try {
+      const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
+      const syntaxError = getSyntaxValidationError(file, content);
+      if (syntaxError) {
+        issues.push(syntaxError);
+      }
+    } catch {
+      // 文件缺失已由前置检查覆盖
+    }
+  }
+
   const isNodeProject = /typescript|javascript/.test(language);
   const pkgPath = path.join(WORKSPACE, "package.json");
   try {
@@ -230,17 +304,26 @@ export async function verifierNode(
   }
 
   const output = `[Verifier 预检失败]\n${issues.join("\n")}`;
-  const hasContractDrift = issues.some((issue) => /契约漂移/.test(issue));
-  const hasEnvironmentGap = issues.some((issue) => /jest: not found|npm ERR|node_modules|module not found/i.test(issue));
-  const failureType = hasEnvironmentGap
+  const classifiedIssues = issues.map((issue) => {
+    const category = classifyVerifierIssue(issue);
+    return {
+      issue,
+      file: extractIssueFile(issue),
+      ...category,
+    };
+  });
+  const failureType = classifiedIssues.some((item) => item.failureType === "environment_gap")
     ? "environment_gap"
-    : hasContractDrift
-      ? "implementation_bug"
-      : "planning_gap";
+    : classifiedIssues.some((item) => item.failureType === "runtime_gap")
+      ? "runtime_gap"
+      : classifiedIssues.some((item) => item.failureType === "implementation_bug")
+        ? "implementation_bug"
+        : "planning_gap";
   const validationReport = buildValidationReport(
-    issues.map((issue) => ({
-      summary: issue,
-      evidence: [issue],
+    classifiedIssues.map((item) => ({
+      summary: item.issue,
+      file: item.file,
+      evidence: [item.issue],
     })),
     { failureType, blocking: true }
   );
@@ -257,15 +340,12 @@ export async function verifierNode(
     testResults: output,
     validationReport,
     repairPlan: buildRepairPlan(validationReport),
-    protocolFailures: issues.map((issue) => ({
-      type: (/Jest roots|Jest testMatch|测试文件/.test(issue)
-        ? "test_discovery_gap"
-        : /契约漂移/.test(issue)
-          ? "contract_drift"
-          : "layout_mismatch") as "test_discovery_gap" | "contract_drift" | "layout_mismatch",
+    protocolFailures: classifiedIssues.map((item) => ({
+      type: item.protocolType,
       node: "verifier",
-      summary: issue,
-      evidence: [issue],
+      file: item.file,
+      summary: item.issue,
+      evidence: [item.issue],
       blocking: true,
     })),
     meetingNotes: [note],
