@@ -6,7 +6,7 @@ const {
   removeTempWorkspace,
   createBaseState,
 } = require("./test-helpers");
-const { createJimClawGraph } = require("../../src/core/graph");
+const { createJimClawGraph, getVerifierNextNode } = require("../../src/core/graph");
 const { loadTraceIndex } = require("../../src/core/logic_utils");
 const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
 const { GetServerIPSkill } = require("../../src/skills/get_server_ip");
@@ -93,6 +93,51 @@ test("workflow replay routes verifier planning gaps back to architect instead of
   } finally {
     await removeTempWorkspace(workspace);
   }
+});
+
+test("verifier routing sends environment gaps directly to env_guard", () => {
+  const next = getVerifierNextNode(createBaseState({
+    testResults: "[Verifier 预检失败]\n缺少 package.json：Node.js/TypeScript 项目必须包含 package.json，否则无法安装依赖和运行测试",
+    validationReport: {
+      version: "v1",
+      status: "fail",
+      failureType: "environment_gap",
+      blocking: true,
+      findings: [{ type: "environment_gap", summary: "缺少 package.json", evidence: ["缺少 package.json"] }],
+    },
+  }));
+
+  assert.equal(next, "env_guard");
+});
+
+test("verifier routing sends runtime gaps directly to infra_setup", () => {
+  const next = getVerifierNextNode(createBaseState({
+    testResults: "[Verifier 预检失败]\n服务文件 src/index.ts 未找到监听声明（如 app.listen()）",
+    validationReport: {
+      version: "v1",
+      status: "fail",
+      failureType: "runtime_gap",
+      blocking: true,
+      findings: [{ type: "runtime_gap", summary: "未找到监听声明", file: "src/index.ts", evidence: ["未找到监听声明"] }],
+    },
+  }));
+
+  assert.equal(next, "infra_setup");
+});
+
+test("verifier routing keeps implementation bugs flowing to qa analysis", () => {
+  const next = getVerifierNextNode(createBaseState({
+    testResults: "[Verifier 预检失败]\n语法错误(src/routes/books.ts:L1:C23): Expression expected",
+    validationReport: {
+      version: "v1",
+      status: "fail",
+      failureType: "implementation_bug",
+      blocking: true,
+      findings: [{ type: "implementation_bug", summary: "语法错误", file: "src/routes/books.ts", evidence: ["Expression expected"] }],
+    },
+  }));
+
+  assert.equal(next, "qa");
 });
 
 test("workflow replay persists deploy failure evidence and failure ownership", async () => {

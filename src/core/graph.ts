@@ -42,6 +42,21 @@ type ApprovalRequest = {
   nextNode: string;
 };
 
+export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "infra_setup" | "qa" {
+  if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
+    return "qa";
+  }
+  if (state.testResults.includes("文件缺失")) {
+    return "coder";
+  }
+
+  const failureType = state.validationReport?.failureType;
+  if (failureType === "planning_gap") return "architect";
+  if (failureType === "environment_gap") return "env_guard";
+  if (failureType === "runtime_gap") return "infra_setup";
+  return "qa";
+}
+
 function shouldRequireApproval(
   state: JimClawState,
   stage: "requirements" | "solution" | "deploy",
@@ -247,16 +262,14 @@ export async function createJimClawGraph(agents: {
   workflow.addEdge("infra_setup", "terminal");
   workflow.addEdge("terminal", "verifier");
 
-  // verifier：只有"文件缺失"才回 coder（coder 能创建文件）
-  // 其他预检失败（依赖分类错误、监听声明缺失等）交给 qa 分析后定向修复
-  // 避免 coder 无事可做时与 infra/verifier 形成无限循环
-  workflow.addConditionalEdges("verifier", (s) => {
-    if (s.testResults?.startsWith("[Verifier 预检失败]")) {
-      if (s.testResults.includes("文件缺失")) return "coder";
-      return "qa";
-    }
-    return "qa";
-  }, { coder: "coder", qa: "qa" });
+  // verifier：文件缺失直回 coder；其他失败按 ValidationReport.failureType 直接分流，减少无效 QA 自旋
+  workflow.addConditionalEdges("verifier", (s) => getVerifierNextNode(s), {
+    coder: "coder",
+    architect: "architect",
+    env_guard: "env_guard",
+    infra_setup: "infra_setup",
+    qa: "qa",
+  });
 
   workflow.addConditionalEdges("qa", (s) => {
     const openIssues = (s.issueTracker || []).filter((issue: any) => issue.status === "open");
