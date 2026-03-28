@@ -91,6 +91,60 @@ test("syntax blocker includes line and column details for faster repair", async 
   }
 });
 
+test("coder repairs a transient syntax error within the same task before escalating", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const state = createBaseState({
+    subTasks: [
+      {
+        id: "task-self-heal",
+        description: "write recoverable test",
+        fileTarget: "tests/bookService.test.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            if (chatCalls === 1) {
+              return {
+                content: "```typescript\ndescribe('book', () => {\n  it('works', () => {\n    const value = \n  });\n});\n```",
+              };
+            }
+            return {
+              content: "```typescript\ndescribe('book', () => {\n  it('works', () => {\n    const value = 1;\n    expect(value).toBe(1);\n  });\n});\n```",
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 2);
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(result.blockedReason, "");
+    const written = await fs.readFile(path.join(workspace, "tests/bookService.test.ts"), "utf-8");
+    assert.match(written, /expect\(value\)\.toBe\(1\)/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder regression harness is ready for snapshot consistency checks", () => {
   assert.equal(true, true);
 });

@@ -75,6 +75,38 @@ function validateGeneratedFileContent(fileTarget: string, content: string): stri
   return null;
 }
 
+function summarizeSelfHealArtifact(content: string, max = 400): string {
+  const normalized = String(content || "").replace(/\s+/g, " ").trim();
+  return normalized.length > max ? `${normalized.slice(0, max)}...` : normalized;
+}
+
+function isLocalSelfHealContentError(message: string | null | undefined): boolean {
+  const text = String(message || "").trim();
+  if (!text) return false;
+  return (
+    /语法错误/i.test(text) ||
+    /JSON 格式校验失败/i.test(text) ||
+    /Markdown 格式的汇报|非纯净代码/i.test(text) ||
+    /代码提取失败|提取失败|未找到.*代码块|无法提取/i.test(text)
+  );
+}
+
+function shouldRetryTaskLocally(options: {
+  attempt: number;
+  toolError: string | null;
+  formatError: string | null;
+  extractError: string;
+  unauthorizedWriteTargets: Set<string>;
+}): boolean {
+  if (options.attempt > 0) return false;
+  if (options.unauthorizedWriteTargets.size > 0) return false;
+  if (options.toolError) return false;
+  return (
+    isLocalSelfHealContentError(options.formatError) ||
+    isLocalSelfHealContentError(options.extractError)
+  );
+}
+
 function normalizeTaskFileTarget(fileTarget: string): string {
   return String(fileTarget || "").replace(/\\/g, "/");
 }
@@ -501,6 +533,8 @@ export async function coderNode(
   const codeLogEntries: FileChangeEntry[] = [];
   let blockedReason = "";
   let blockedFailedFiles: string[] = [];
+  const localRetryAttempts: Record<string, number> = {};
+  const localRetryArtifacts: Record<string, string> = {};
 
   // 1. 根据 QA 反馈，精准重置需要修复的任务状态
   if (state.qaFailures && state.qaFailures.failedFiles.length > 0) {
@@ -527,7 +561,8 @@ export async function coderNode(
         continue;
       }
 
-      emit("thinking", agents.coder.getPersona().name, `正在实现: ${task.fileTarget}`, { task });
+      const taskLocalAttempt = localRetryAttempts[task.fileTarget] || 0;
+      emit("thinking", agents.coder.getPersona().name, `正在实现: ${task.fileTarget}${taskLocalAttempt > 0 ? `（任务内重试 ${taskLocalAttempt}）` : ""}`, { task });
 
       // 检查是否有 QA-Coder 协商后的修复计划
       const fixPlanItem = (state.fixPlan || []).find(p => p.fileTarget === task.fileTarget);
@@ -574,6 +609,10 @@ export async function coderNode(
       // P0-B：注入具体错误原因（来自 task.lastError）
       if (currentRetry > 0 && task.lastError) {
         prompt += `\n\n[上次失败原因 - 必须针对性修复]：\n${task.lastError}`;
+      }
+
+      if (taskLocalAttempt > 0 && task.lastError) {
+        prompt += `\n\n[任务内自愈重试 - 必须修正上一次输出]：\n- 上一次失败原因：${task.lastError}\n- 上一次输出摘要：${localRetryArtifacts[task.fileTarget] || "（无）"}\n- 现在必须重新生成完整文件，确保语法合法、结构完整、无自然语言污染。`;
       }
 
       // P0-C：注入实际测试报错输出（从 testResults 中提取与本文件相关的片段）
@@ -655,6 +694,7 @@ CMD ["node", "dist/index.js"]`;
       let lintPassed = false;
       let missingTargetDiagnostic = false;
       const unauthorizedWriteTargets = new Set<string>();
+      let rawResponseText = "";
 
       const normalizeWriteTarget = (rawTarget: string) => {
         const trimmed = rawTarget.trim().replace(/^["']|["']$/g, "");
@@ -665,47 +705,46 @@ CMD ["node", "dist/index.js"]`;
       };
 
       const deterministicScaffold = getDeterministicTemplateScaffold(state, task.fileTarget);
-      const extractResult = deterministicScaffold
-        ? { isValid: true, code: deterministicScaffold, error: "" }
-        : extractCodeFromResponse(
-            extractText(
-              (
-                await agents.coder.chat(
-                  [{ role: "user", content: prompt }],
-                  (ev) => {
-                    emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
-                    // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
-                    if (ev.type === "tool_use" && ev.content) {
-                      const contentStr = String(ev.content);
-                      if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
-                        toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
-                      } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
-                        const targetMatch = contentStr.match(/Successfully wrote to\s+(.+)$/);
-                        const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
-                        if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
-                          fileWrittenByTool = true;
-                        } else if (writtenTarget) {
-                          unauthorizedWriteTargets.add(writtenTarget);
-                          toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
-                        }
-                      } else if (ev.tool === "diagnose_code") {
-                        if (/\[SUCCESS\]/i.test(contentStr)) {
-                          diagnosticsPassed = true;
-                        } else if (isMissingTargetFileDiagnostic(contentStr, task.fileTarget)) {
-                          missingTargetDiagnostic = true;
-                        }
-                      } else if (ev.tool === "lint_fix") {
-                        if (/\[WARNING\]/i.test(contentStr) || /已完成格式化|已完成格式化和规范修复|已使用 prettier 完成格式化/i.test(contentStr)) {
-                          lintPassed = true;
-                        }
-                      }
-                    }
-                  },
-                  { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-                )
-              ).content
-            )
-          );
+      let extractResult;
+      if (deterministicScaffold) {
+        extractResult = { isValid: true, code: deterministicScaffold, error: "" };
+      } else {
+        const coderResponse = await agents.coder.chat(
+          [{ role: "user", content: prompt }],
+          (ev) => {
+            emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
+            // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
+            if (ev.type === "tool_use" && ev.content) {
+              const contentStr = String(ev.content);
+              if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
+                toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
+              } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
+                const targetMatch = contentStr.match(/Successfully wrote to\s+(.+)$/);
+                const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
+                if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
+                  fileWrittenByTool = true;
+                } else if (writtenTarget) {
+                  unauthorizedWriteTargets.add(writtenTarget);
+                  toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
+                }
+              } else if (ev.tool === "diagnose_code") {
+                if (/\[SUCCESS\]/i.test(contentStr)) {
+                  diagnosticsPassed = true;
+                } else if (isMissingTargetFileDiagnostic(contentStr, task.fileTarget)) {
+                  missingTargetDiagnostic = true;
+                }
+              } else if (ev.tool === "lint_fix") {
+                if (/\[WARNING\]/i.test(contentStr) || /已完成格式化|已完成格式化和规范修复|已使用 prettier 完成格式化/i.test(contentStr)) {
+                  lintPassed = true;
+                }
+              }
+            }
+          },
+          { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+        );
+        rawResponseText = extractText(coderResponse.content);
+        extractResult = extractCodeFromResponse(rawResponseText);
+      }
 
       if (deterministicScaffold) {
         emit("thinking", "System", `[Coder] 使用模板骨架直接生成 ${task.fileTarget}`, { task });
@@ -840,6 +879,8 @@ CMD ["node", "dist/index.js"]`;
         });
         await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
         await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        delete localRetryAttempts[task.fileTarget];
+        delete localRetryArtifacts[task.fileTarget];
         progressMade = true;
         } catch (e: any) {
           await clearWriteRecoveryIntent(WORKSPACE, task.id);
@@ -861,8 +902,32 @@ CMD ["node", "dist/index.js"]`;
           console.error(`${logPrefix("System")} [Coder] 任务失败 (${task.fileTarget}): ${task.lastError}`);
         }
       } else {
+        const finalFailureReason = toolError || formatError || extractResult.error || "代码提取失败或工具执行异常";
+        if (
+          shouldRetryTaskLocally({
+            attempt: taskLocalAttempt,
+            toolError,
+            formatError,
+            extractError: extractResult.error || "",
+            unauthorizedWriteTargets,
+          })
+        ) {
+          localRetryAttempts[task.fileTarget] = taskLocalAttempt + 1;
+          localRetryArtifacts[task.fileTarget] = summarizeSelfHealArtifact(finalCode || rawResponseText || "");
+          task.status = "pending";
+          task.lastError = finalFailureReason;
+          progressMade = true;
+          emit(
+            "thinking",
+            "System",
+            `[Coder] ${task.fileTarget} 命中内容自愈错误，当前任务内重试一次：${finalFailureReason}`,
+            { task }
+          );
+          continue;
+        }
+
         task.status = "failed";
-        task.lastError = toolError || formatError || extractResult.error || "代码提取失败或工具执行异常";
+        task.lastError = finalFailureReason;
         console.error(`${logPrefix("System")} [Coder] 任务失败 (${task.fileTarget}): ${task.lastError}`);
         codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "error", error: task.lastError });
         blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${task.lastError}`;
