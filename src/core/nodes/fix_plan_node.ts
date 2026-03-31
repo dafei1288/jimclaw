@@ -1,11 +1,21 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState, FixPlanItem, ProtocolPatch } from "../graph_types";
-import { BaseAgent } from "../agent";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-function isModelResourceError(error: any): boolean {
+const FIX_PLAN_CODER_TIMEOUT_MS = 20000;
+const FIX_PLAN_QA_TIMEOUT_MS = 15000;
+
+function isRecoverableFixPlanError(error: any): boolean {
+  if (
+    error instanceof AgentTimeoutError ||
+    error instanceof AgentServiceUnavailableError ||
+    error instanceof AgentResourceExhaustedError
+  ) {
+    return true;
+  }
   const status = error?.status || error?.response?.status;
   if (status === 429) return true;
   const message = (error?.message || "").toLowerCase();
@@ -204,7 +214,12 @@ ${summarizedFiles}
     const coderResponse = await agents.coder.chat(
       [{ role: "user", content: coderPrompt }],
       (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
-      { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+      {
+        mode: "coding",
+        brief: buildSystemContext(state),
+        workspaceDir: WORKSPACE,
+        timeoutMs: FIX_PLAN_CODER_TIMEOUT_MS,
+      }
     );
 
     coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
@@ -212,7 +227,7 @@ ${summarizedFiles}
       items: [],
     });
   } catch (error: any) {
-    if (!isModelResourceError(error)) throw error;
+    if (!isRecoverableFixPlanError(error)) throw error;
     degradedByFallback = true;
     emit("thinking", "System", `fix_plan 模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
     coderPlan = {
@@ -269,7 +284,12 @@ ${summarizeCoderPlan(coderPlan)}
       const qaResponse = await agents.qa.chat(
         [{ role: "user", content: qaPrompt }],
         (ev) => emit(ev.type, ev.sender, "审查修复计划中", ev),
-        { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
+        {
+          mode: "coding",
+          brief: buildSystemContext(state),
+          workspaceDir: WORKSPACE,
+          timeoutMs: FIX_PLAN_QA_TIMEOUT_MS,
+        }
       );
 
       qaReview = parseJsonFromResponse(extractText(qaResponse.content), {
@@ -278,7 +298,7 @@ ${summarizeCoderPlan(coderPlan)}
         additional_fixes: [],
       });
     } catch (error: any) {
-      if (!isModelResourceError(error)) throw error;
+      if (!isRecoverableFixPlanError(error)) throw error;
       degradedByFallback = true;
       emit("thinking", "System", `fix_plan QA 审查模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
       qaReview = {
@@ -338,6 +358,27 @@ ${summarizeCoderPlan(coderPlan)}
       state.apiContract
     );
   }
+
+  for (const file of failingFiles) {
+    if (fixPlan.some((item) => item.fileTarget === file)) continue;
+    const issue = openIssues.find((item: any) => item.relatedFiles?.includes(file));
+    const matchingError = (state.qaFailures?.testErrors || []).find((msg: string) => msg.includes(file));
+    fixPlan.push({
+      fileTarget: file,
+      diagnosis: issue?.description || matchingError || `${file} 已被 QA 标记为需重开修复，但协商输出遗漏了该文件。`,
+      proposedChange: issue?.description
+        ? `围绕以下问题做最小修复：${issue.description}`
+        : `优先修复 ${file} 当前暴露的问题，保持改动最小且不要扩散到无关文件。`,
+      qaApproval: "approved",
+      qaFeedback: "该文件已进入 QA 重开集合，不能因协商遗漏而跳过。",
+    });
+  }
+
+  protocolPatches = buildProtocolPatchesForFixPlan(
+    Array.from(new Set(fixPlan.map((item) => item.fileTarget))),
+    state.executionProtocol,
+    state.apiContract
+  );
 
   // === 写入会议纪要 ===
   const approvedCount = fixPlan.filter(p => p.qaApproval === "approved").length;

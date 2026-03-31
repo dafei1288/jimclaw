@@ -1,3 +1,4 @@
+import * as path from "path";
 import { JimClawState, Issue, ConsensusProgress, ProtocolFailure, RepairLedgerEntry } from "../graph_types";
 import { BaseAgent } from "../agent";
 import {
@@ -7,10 +8,11 @@ import {
   buildValidationReport,
   buildSystemContext,
   extractFailureEvidence,
-  tryFixEnvironmentProblem,
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
+
+const QA_MODEL_TIMEOUT_MS = 15000;
 
 /**
  * QA 节点：负责测试结果分析、定级并更新 IssueTracker
@@ -84,18 +86,178 @@ export async function qaNode(
     return "implementation_bug";
   }
 
+  function isHostEnvironmentBlocked(text: string): boolean {
+    return /(spawn EPERM|spawn ENOENT|docker(\.exe)? .*not found|docker-compose .*not found|Docker Desktop is not running|permission denied while trying to connect to the Docker daemon|无法连接 Docker|宿主环境阻塞)/i.test(String(text || ""));
+  }
+
+  function normalizeFileTarget(file: string | undefined | null): string {
+    return String(file || "").replace(/\\/g, "/").trim();
+  }
+
+  function collectKnownProjectFiles(state: JimClawState): string[] {
+    return Array.from(
+      new Set([
+        ...((state.subTasks || []).map((task) => normalizeFileTarget(task.fileTarget))),
+        ...(((state.spec as any)?.filesToCreate || []).map((file: string) => normalizeFileTarget(file))),
+      ].filter(Boolean))
+    );
+  }
+
+  function buildBasenameIndex(fileTargets: string[]): Map<string, string[]> {
+    const index = new Map<string, string[]>();
+    for (const file of fileTargets) {
+      const base = path.posix.basename(file);
+      if (!base) continue;
+      const existing = index.get(base) || [];
+      existing.push(file);
+      index.set(base, existing);
+    }
+    return index;
+  }
+
+  function inferFilesFromText(
+    text: string,
+    knownFiles: string[],
+    basenameIndex: Map<string, string[]>
+  ): string[] {
+    const normalizedText = String(text || "");
+    if (!normalizedText.trim()) return [];
+    const hits = new Set<string>();
+
+    for (const file of knownFiles) {
+      if (normalizedText.includes(file)) hits.add(file);
+    }
+
+    for (const [base, files] of basenameIndex.entries()) {
+      if (files.length !== 1) continue;
+      const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (new RegExp(`(^|[^\\w./-])${escaped}([^\\w./-]|$)`).test(normalizedText)) {
+        hits.add(files[0]);
+      }
+    }
+
+    return Array.from(hits);
+  }
+
+  function inferConfigOwnedFiles(text: string, knownFiles: Set<string>): string[] {
+    const normalizedText = String(text || "");
+    const hits = new Set<string>();
+    const dependencyGap =
+      /cannot find module\s+['"]([^'"./][^'"]*)['"]|module not found|missing dependency|依赖缺失|未安装依赖|package\.json|npm install|pnpm install|yarn install|runtime dependency/i;
+    const tsConfigGap = /tsconfig|compileroptions|typescript|ts\d{4}|noUnusedLocals|moduleResolution/i;
+    const jestGap = /jest|ts-jest|@types\/jest|jest\.config/i;
+    const vitestGap = /vitest|vite\.config|vitest\.config/i;
+
+    if (knownFiles.has("package.json") && dependencyGap.test(normalizedText)) {
+      hits.add("package.json");
+    }
+    if (knownFiles.has("tsconfig.json") && tsConfigGap.test(normalizedText)) {
+      hits.add("tsconfig.json");
+    }
+    for (const file of knownFiles) {
+      if (/^jest\.config\.(cjs|js|ts)$/i.test(file) && jestGap.test(normalizedText)) hits.add(file);
+      if (/^vitest\.config\.(ts|js|mjs)$/i.test(file) && vitestGap.test(normalizedText)) hits.add(file);
+    }
+    return Array.from(hits);
+  }
+
+  function isTransientEnvironmentFailure(text: string): boolean {
+    return /spawn\s+\w+\s+ENOENT|spawn EPERM|EADDRINUSE|EACCES|docker|connect ECONNREFUSED|timed out|timeout|port already in use/i.test(String(text || ""));
+  }
+
+  function augmentIssueOwnership(
+    state: JimClawState,
+    issues: Issue[],
+    failingTestFiles: string[],
+    rawUnitOutput: string
+  ): { issues: Issue[]; reopenFiles: string[] } {
+    const knownFiles = collectKnownProjectFiles(state);
+    const knownFileSet = new Set(knownFiles);
+    const basenameIndex = buildBasenameIndex(knownFiles);
+    const normalizedFailingTests = failingTestFiles.map((file) => normalizeFileTarget(file)).filter(Boolean);
+    const validationText = (state.validationReport?.findings || [])
+      .flatMap((finding: any) => [finding?.summary, ...(finding?.evidence || []), finding?.file])
+      .filter(Boolean)
+      .join("\n");
+    const globalText = [rawUnitOutput, validationText, state.lastFailureSummary || "", state.blockedReason || ""]
+      .filter(Boolean)
+      .join("\n");
+    const globalConfigFiles = inferConfigOwnedFiles(globalText, knownFileSet);
+    const augmentedIssues = issues.map((issue) => {
+      const issueText = [issue.title, issue.description, issue.rawErrorSnippet, validationText].filter(Boolean).join("\n");
+      const nextFiles = new Set((issue.relatedFiles || []).map((file) => normalizeFileTarget(file)).filter(Boolean));
+      for (const file of inferFilesFromText(issueText, knownFiles, basenameIndex)) nextFiles.add(file);
+      for (const file of inferConfigOwnedFiles(issueText, knownFileSet)) nextFiles.add(file);
+      for (const file of normalizedFailingTests) {
+        if (issueText.includes(file)) nextFiles.add(file);
+      }
+      return {
+        ...issue,
+        relatedFiles: Array.from(nextFiles),
+      };
+    });
+
+    const reopenFiles = new Set<string>([
+      ...normalizedFailingTests,
+      ...globalConfigFiles,
+      ...augmentedIssues.filter((issue) => issue.status === "open").flatMap((issue) => issue.relatedFiles || []),
+    ]);
+
+    return {
+      issues: augmentedIssues,
+      reopenFiles: Array.from(reopenFiles).filter(Boolean),
+    };
+  }
+
   startSpan("qa");
   emit("phase-change", "System", "verification");
 
   const round = state.retryCount || 0;
   const rawUnitOutput = state.testResults || "";
-  const failureEvidence = extractFailureEvidence(rawUnitOutput, state.deploymentStatus, state.blockedReason);
+  let failureEvidence = extractFailureEvidence(rawUnitOutput, state.deploymentStatus, state.blockedReason);
+  const hasPersistedQaFailure =
+    !failureEvidence.hasBlockingFailure &&
+    Boolean(
+      state.validationReport?.blocking &&
+      ((state.qaFailures?.failedFiles?.length || 0) > 0 || state.lastFailedNode || state.lastFailureSummary)
+    );
+  if (hasPersistedQaFailure) {
+    failureEvidence = {
+      ...failureEvidence,
+      hasBlockingFailure: true,
+      coderBlocked: state.lastFailedNode === "coder" || /Coder 阻塞失败/.test(state.lastFailureSummary || ""),
+      verifierFailed: state.lastFailedNode === "verifier" || state.validationReport?.failureType === "planning_gap",
+      deploymentFailed: state.lastFailedNode === "deploy" || state.validationReport?.failureType === "runtime_gap",
+    };
+  }
   const unitTestFail = failureEvidence.hasBlockingFailure && !failureEvidence.deploymentFailed;
   const deploymentFail = failureEvidence.deploymentFailed;
   const failureFingerprint = buildFailureFingerprint(rawUnitOutput);
   const sameFailureCount = failureFingerprint && state.failureFingerprint === failureFingerprint
     ? (state.sameFailureCount || 0) + 1
     : (failureFingerprint ? 1 : 0);
+  const problem = analyzeTestProblem(rawUnitOutput, round, Boolean(state.mediationDirectives?.length));
+  const knownProjectFiles = new Set(collectKnownProjectFiles(state));
+  const configOwnedFailure =
+    !isTransientEnvironmentFailure([rawUnitOutput, state.blockedReason || "", state.lastFailureSummary || ""].join("\n")) &&
+    inferConfigOwnedFiles(
+      [
+        rawUnitOutput,
+        state.validationReport?.findings?.map((item: any) => [item?.summary, ...(item?.evidence || []), item?.file].filter(Boolean).join("\n")).join("\n") || "",
+        state.lastFailureSummary || "",
+      ].join("\n"),
+      knownProjectFiles
+    ).length > 0;
+  const hostEnvironmentBlocked = isHostEnvironmentBlocked(
+    [rawUnitOutput, state.blockedReason || "", state.lastFailureSummary || ""].join("\n")
+  );
+  const environmentProblemDetected =
+    hostEnvironmentBlocked ||
+    (problem.type === "environment_problem" && !configOwnedFailure) ||
+    state.validationReport?.failureType === "environment_gap" ||
+    state.lastFailedNode === "env_guard" ||
+    /^\[EnvGuard\]/.test(state.blockedReason || "") ||
+    /^\[EnvGuard\]/.test(rawUnitOutput);
 
   // P0-D：拆分单元测试输出与部署错误，避免 QA 标签混乱
   const unitTestSection = rawUnitOutput.split("[部署验证失败]")[0].trim() || rawUnitOutput;
@@ -105,7 +267,46 @@ export async function qaNode(
 
   // 1. 如果完全没有错误，且之前的 Issue 都已解决，则直接通过
   const openIssues = (state.issueTracker || []).filter(i => i.status === 'open');
-  if (!failureEvidence.hasBlockingFailure && openIssues.length === 0) {
+  const hasPendingTasks = (state.subTasks || []).some((task) => task.status !== "completed");
+  if (!failureEvidence.hasBlockingFailure && hasPendingTasks && !hostEnvironmentBlocked) {
+    const noteId = `note-qa-r${round}`;
+    const pendingCount = state.subTasks.filter((task) => task.status !== "completed").length;
+    const resumedFromCheckpoint = Boolean(state.validationCheckpointRequested);
+    const summary = resumedFromCheckpoint
+      ? `QA 第${round}轮：阶段验证通过，恢复 coder 完成剩余 ${pendingCount} 个文件`
+      : `QA 第${round}轮：当前无阻塞失败，恢复 coder 完成剩余 ${pendingCount} 个文件`;
+    const fullContent = `# QA 第${round}轮阶段验证纪要
+
+## 判定结论
+- 结论：阶段验证通过
+- 说明：当前核心骨架已可通过验证，但仍存在待补齐文件，因此恢复 coder 继续实现，不进入 deploy。
+
+## 待完成文件
+${state.subTasks.filter((task) => task.status !== "completed").map((task) => `- ${task.fileTarget}`).join("\n") || "无"}
+`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
+    const validationReport = buildValidationReport([], { status: "pass", blocking: false });
+    const result = {
+      isDone: false,
+      retryCount: state.retryCount || 0,
+      qaFailures: null,
+      recoveredEnvironment: false,
+      failureFingerprint: "",
+      sameFailureCount: 0,
+      validationReport,
+      repairPlan: null,
+      blockedReason: "",
+      validationCheckpointRequested: false,
+      validationCheckpointCompleted: resumedFromCheckpoint,
+      validationCheckpointReason: "",
+      resumeAfterValidation: true,
+      meetingNotes: [meetingNote],
+    };
+    await saveBoulder({ ...state, ...result }, "qa_checkpoint_resume");
+    return result;
+  }
+
+  if (!failureEvidence.hasBlockingFailure && !environmentProblemDetected && openIssues.length === 0 && !hasPendingTasks) {
     const validationReport = buildValidationReport([], { status: "pass", blocking: false });
     return {
       isDone: true,
@@ -176,41 +377,52 @@ ${JSON.stringify(resolvedIssues.filter((issue) => issue.status === "resolved"), 
   }
 
   // 1.1 环境问题优先自动修复，避免把依赖缺失误判为代码缺陷反复返工
-  const problem = analyzeTestProblem(rawUnitOutput, round, Boolean(state.mediationDirectives?.length));
-  if (problem.type === "environment_problem") {
-    emit("thinking", "System", `检测到环境类故障，尝试自动修复：${problem.reason}`, {});
-    const fixed = await tryFixEnvironmentProblem(rawUnitOutput, state, WORKSPACE);
-    if (fixed.fixed) {
-      const ledger: RepairLedgerEntry[] = [{
-        round,
-        phase: "qa",
-        action: fixed.action || "环境自动修复",
-        result: "success",
-        fingerprint: failureFingerprint || undefined,
-      }];
-      const validationReport = buildValidationReport(
-        [{
-          summary: fixed.action || "环境问题已自动修复",
-          evidence: [problem.reason || fixed.action || "environment repaired"],
-        }],
-        { failureType: "environment_gap", blocking: true }
-      );
-      const result = {
-        isDone: false,
-        // 环境修复成功后不消耗重试次数，直接进入下一轮验证链路
-        retryCount: state.retryCount || 0,
-        recoveredEnvironment: true,
-        failureFingerprint,
-        sameFailureCount,
-        qaFailures: { failedFiles: [], testErrors: [fixed.action || "环境修复成功"], failedTestNames: [] },
-        testResults: `${rawUnitOutput}\n[环境自动修复] ${fixed.action || "已完成"}`,
-        repairLedger: ledger,
-        validationReport,
-        repairPlan: buildRepairPlan(validationReport),
-      };
-      await saveBoulder({ ...state, ...result }, "qa_env_fix");
-      return result;
-    }
+  if (environmentProblemDetected) {
+    const environmentSummary =
+      state.validationReport?.findings?.[0]?.summary ||
+      state.lastFailureSummary ||
+      state.blockedReason ||
+      problem.reason ||
+      "检测到环境类故障";
+    const environmentFingerprint = `env:${environmentSummary}`;
+    const environmentSameFailureCount =
+      state.failureFingerprint === environmentFingerprint
+        ? (state.sameFailureCount || 0) + 1
+        : 1;
+    emit("thinking", "System", `检测到环境类故障，转交 EnvGuard 统一修复：${environmentSummary}`, {});
+    const ledger: RepairLedgerEntry[] = [{
+      round,
+      phase: "qa",
+      action: "识别环境类故障并转交 EnvGuard",
+      result: "success",
+      fingerprint: failureFingerprint || undefined,
+    }];
+    const validationReport = buildValidationReport(
+      [{
+        summary: problem.reason || "检测到环境类故障",
+        evidence: [rawUnitOutput || problem.reason || "environment problem"],
+      }],
+      { failureType: "environment_gap", blocking: true }
+    );
+    const result = {
+      isDone: false,
+      retryCount: (state.retryCount || 0) + 1,
+      recoveredEnvironment: false,
+      failureFingerprint: environmentFingerprint,
+      sameFailureCount: environmentSameFailureCount,
+      qaFailures: { failedFiles: [], testErrors: [environmentSummary], failedTestNames: [] },
+      repairLedger: ledger,
+      validationReport,
+      repairPlan: buildRepairPlan(validationReport),
+      validationCheckpointRequested: false,
+      validationCheckpointCompleted: false,
+      validationCheckpointReason: "",
+      resumeAfterValidation: false,
+      lastFailedNode: "qa",
+      lastFailureSummary: environmentSummary,
+    };
+    await saveBoulder({ ...state, ...result }, "qa_env_fix");
+    return result;
   }
 
   // 静态提取失败的测试文件（比 LLM 更可靠）
@@ -382,7 +594,8 @@ ${JSON.stringify(state.issueTracker || [])}
   const response = await agents.qa.chat([{ role: "user", content: prompt }], (ev) => emit(ev.type, ev.sender, "正在深度审计质量问题", ev), {
     mode: "coding",
     workspaceDir: WORKSPACE,
-    brief: buildSystemContext(state)
+    brief: buildSystemContext(state),
+    timeoutMs: QA_MODEL_TIMEOUT_MS,
   });
 
   const parsed = parseJsonFromResponse(extractText(response.content), { issues: [] });
@@ -431,9 +644,13 @@ ${JSON.stringify(state.issueTracker || [])}
     }
   }
 
+  const augmentedOwnership = augmentIssueOwnership(state, issues, failingTestFiles, rawUnitOutput);
+  issues = augmentedOwnership.issues;
+  const reopenFiles = augmentedOwnership.reopenFiles;
+
   // 3. 决策路由逻辑
   const activeOpenIssues = issues.filter(i => i.status === 'open');
-  const isDone = activeOpenIssues.length === 0 && !failureEvidence.hasBlockingFailure;
+  const isDone = activeOpenIssues.length === 0 && !failureEvidence.hasBlockingFailure && !hasPendingTasks;
 
   // 更新 consensusProgress.openIssues
   const stillOpenIssues = issues.filter(i => i.status === 'open');
@@ -452,7 +669,7 @@ ${JSON.stringify(state.issueTracker || [])}
     : inferQaFailureType(issues, {
         verifierFailed: failureEvidence.verifierFailed,
         deploymentFail,
-        environmentProblem: problem.type === "environment_problem",
+        environmentProblem: environmentProblemDetected,
       });
   const noteId = `note-qa-r${round}`;
   const decisionLabel = isDone ? "放行" : "阻塞";
@@ -499,6 +716,7 @@ ${JSON.stringify(issues, null, 2)}
       failedFiles: Array.from(new Set([
         ...issues.filter(i => i.status === 'open').flatMap(i => i.relatedFiles),
         ...failingTestFiles,
+        ...reopenFiles,
       ])),
       testErrors: issues.filter(i => i.status === 'open').map(i => `${i.title}: ${i.description}`),
       failedTestNames: []

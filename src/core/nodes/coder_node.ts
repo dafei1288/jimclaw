@@ -2,17 +2,276 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import * as ts from "typescript";
 import { JimClawState, FileChangeEntry, ConsensusProgress } from "../graph_types";
-import { BaseAgent } from "../agent";
+import { AgentTimeoutError, BaseAgent } from "../agent";
 import {
-  buildSystemContext,
+  buildCoderExecutionContext,
   getProtocolFileContract,
   getDeterministicTemplateScaffold,
+  getExecutionDependencyStem,
+  isAggregateExecutionServiceFile,
   logPrefix,
   writeMeetingNote,
   persistWriteRecoveryIntent,
   clearWriteRecoveryIntent
 } from "../logic_utils";
 import { extractText, extractCodeFromResponse } from "../../utils/common";
+
+function isUiLikeFile(fileTarget: string): boolean {
+  const normalized = String(fileTarget || "").replace(/\\/g, "/").toLowerCase();
+  return normalized.startsWith("public/") || normalized.endsWith(".html");
+}
+
+function getCheckpointRole(state: JimClawState, fileTarget: string): string {
+  if (isUiLikeFile(fileTarget)) return "ui";
+  return getProtocolFileContract(state.executionProtocol, fileTarget)?.role || "other";
+}
+
+function isAppShellFile(fileTarget: string): boolean {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return /(^|\/)(app|server|main)\.(ts|tsx|js|jsx|py|go)$/i.test(normalized);
+}
+
+function isPeripheralFile(fileTarget: string): boolean {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return (
+    normalized === ".env.example" ||
+    normalized.startsWith("data/") ||
+    normalized === "readme.md" ||
+    normalized.startsWith("docs/") ||
+    normalized.endsWith(".md") ||
+    normalized === "dockerfile" ||
+    normalized.endsWith("/dockerfile") ||
+    normalized.endsWith("docker-compose.yml") ||
+    normalized.startsWith("scripts/")
+  );
+}
+
+function getReopenedFileTargets(state: JimClawState): Set<string> {
+  return new Set(
+    [
+      ...((state.qaFailures?.failedFiles || []).map((file) => normalizeTaskFileTarget(file))),
+      ...(((state.fixPlan || []) as Array<{ fileTarget: string }>).map((item) => normalizeTaskFileTarget(item.fileTarget))),
+    ].filter(Boolean)
+  );
+}
+
+function getTaskExecutionPriority(state: JimClawState, task: { fileTarget: string }): number {
+  const fileTarget = normalizeTaskFileTarget(task.fileTarget);
+  if (getReopenedFileTargets(state).has(fileTarget)) return -100;
+  const role = getCheckpointRole(state, fileTarget);
+  if (fileTarget === "package.json") return 0;
+  if (fileTarget === "tsconfig.json") return 1;
+  if (/^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(fileTarget)) return 2;
+  if (role === "model") return 10;
+  if (role === "repository") return 20;
+  if (role === "service") return 30;
+  if (role === "middleware") return 40;
+  if (role === "controller") return 50;
+  if (role === "route") return 60;
+  if (role === "entry" || isAppShellFile(fileTarget)) return 70;
+  if (role === "ui") return 80;
+  if (role === "test") return 90;
+  if (isPeripheralFile(fileTarget)) return 200;
+  return 120;
+}
+
+function isCorePhaseDeferredFile(fileTarget: string): boolean {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return (
+    normalized === ".env.example" ||
+    normalized.startsWith("public/") ||
+    normalized.startsWith("tests/") ||
+    normalized.includes("/__tests__/") ||
+    /\.test\.[^.]+$/.test(normalized) ||
+    /\.spec\.[^.]+$/.test(normalized) ||
+    normalized === "readme.md" ||
+    normalized.startsWith("docs/") ||
+    normalized.startsWith("scripts/") ||
+    normalized === "dockerfile" ||
+    normalized.endsWith("/dockerfile") ||
+    normalized.endsWith("docker-compose.yml") ||
+    normalized.startsWith("data/")
+  );
+}
+
+function isCorePhaseActive(
+  state: JimClawState,
+  subTasks: Array<{ fileTarget: string }> = []
+): boolean {
+  return (state.retryCount || 0) === 0 && !state.validationCheckpointCompleted && subTasks.length >= 10;
+}
+
+function getCoderTaskTimeoutMs(
+  state: JimClawState,
+  subTasks: Array<{ fileTarget: string }>
+): number {
+  const overrideTimeout = Number((state as any).coderTaskTimeoutMs || 0);
+  if (overrideTimeout > 0) return overrideTimeout;
+  return isCorePhaseActive(state, subTasks) ? 120000 : 240000;
+}
+
+function getCoderFirstWriteTimeoutMs(
+  state: JimClawState,
+  subTasks: Array<{ fileTarget: string }>,
+  fileTarget: string
+): number {
+  const overrideTimeout = Number((state as any).coderFirstWriteTimeoutMs || 0);
+  if (overrideTimeout > 0) return overrideTimeout;
+  if (!isCorePhaseActive(state, subTasks)) return 0;
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  const isHeavyRole = normalized.includes("/services/") || normalized.includes("/controllers/") || normalized.includes("/routes/");
+  if (!isHeavyRole) return 0;
+  return 45000;
+}
+
+function isAgentTimeoutError(error: any): boolean {
+  return (
+    error instanceof AgentTimeoutError ||
+    error?.code === "AGENT_TIMEOUT" ||
+    error?.name === "AgentTimeoutError"
+  );
+}
+
+async function invokeCoderWithTaskTimeout(args: {
+  agent: {
+    chat: (
+      messages: Array<{ role: string; content: string }>,
+      onEvent?: (event: any) => void,
+      options?: Record<string, any>
+    ) => Promise<any>;
+    getPersona?: () => { name?: string };
+  };
+  prompt: string;
+  onEvent: (event: any) => void;
+  brief: string[];
+  workspaceDir: string;
+  timeoutMs: number;
+  firstWriteTimeoutMs?: number;
+}): Promise<any> {
+  const controller = new AbortController();
+  const agentName = args.agent.getPersona?.()?.name || "Coder";
+  let timeoutHandle: NodeJS.Timeout | null = null;
+  let firstWriteHandle: NodeJS.Timeout | null = null;
+  let firstWriteObserved = false;
+
+  try {
+    const wrappedOnEvent = (event: any) => {
+      const contentStr = String(event?.content || "");
+      if (!firstWriteObserved && event?.tool === "write_file" && contentStr.includes("Successfully wrote")) {
+        firstWriteObserved = true;
+        if (firstWriteHandle) {
+          clearTimeout(firstWriteHandle);
+          firstWriteHandle = null;
+        }
+      }
+      args.onEvent(event);
+    };
+
+    const chatPromise = Promise.resolve(
+      args.agent.chat(
+        [{ role: "user", content: args.prompt }],
+        wrappedOnEvent,
+        {
+          mode: "coding",
+          brief: args.brief,
+          workspaceDir: args.workspaceDir,
+          timeoutMs: args.timeoutMs,
+          signal: controller.signal,
+        }
+      )
+    );
+
+    const firstWriteTimeoutPromise = new Promise<never>((_, reject) => {
+      if (!args.firstWriteTimeoutMs || args.firstWriteTimeoutMs <= 0) return;
+      firstWriteHandle = setTimeout(() => {
+        if (firstWriteObserved) return;
+        const timeoutError: any = new Error(`${agentName} 首个写入超时（>${args.firstWriteTimeoutMs}ms）`);
+        timeoutError.name = "FirstWriteTimeoutError";
+        timeoutError.code = "CODER_FIRST_WRITE_TIMEOUT";
+        timeoutError.timeoutMs = args.firstWriteTimeoutMs;
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, args.firstWriteTimeoutMs);
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      timeoutHandle = setTimeout(() => {
+        const timeoutError = new AgentTimeoutError(agentName, args.timeoutMs);
+        controller.abort(timeoutError);
+        reject(timeoutError);
+      }, args.timeoutMs);
+    });
+
+    return await Promise.race([chatPromise, timeoutPromise, firstWriteTimeoutPromise]);
+  } catch (error: any) {
+    if (controller.signal.aborted && (isAgentTimeoutError(controller.signal.reason) || controller.signal.reason?.code === "CODER_FIRST_WRITE_TIMEOUT")) {
+      throw controller.signal.reason;
+    }
+    throw error;
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+    if (firstWriteHandle) {
+      clearTimeout(firstWriteHandle);
+    }
+  }
+}
+
+function getPrioritizedSubTasks(
+  state: JimClawState,
+  subTasks: Array<{ fileTarget: string }>
+): Array<{ fileTarget: string }> {
+  return [...subTasks].sort((left, right) => {
+    const priorityDelta = getTaskExecutionPriority(state, left) - getTaskExecutionPriority(state, right);
+    if (priorityDelta !== 0) return priorityDelta;
+    return normalizeTaskFileTarget(left.fileTarget).localeCompare(normalizeTaskFileTarget(right.fileTarget));
+  });
+}
+
+function hasCompletedFile(subTasks: Array<{ fileTarget: string; status: string }>, expected: string): boolean {
+  return subTasks.some((task) => task.fileTarget.replace(/\\/g, "/") === expected && task.status === "completed");
+}
+
+function shouldRequestValidationCheckpoint(state: JimClawState, subTasks: Array<{ fileTarget: string; status: string }>): {
+  requested: boolean;
+  reason: string;
+} {
+  if ((state.retryCount || 0) !== 0) return { requested: false, reason: "" };
+  if (state.validationCheckpointCompleted) return { requested: false, reason: "" };
+  if ((subTasks || []).length < 10) return { requested: false, reason: "" };
+
+  const pendingTasks = subTasks.filter((task) => task.status !== "completed");
+  if (pendingTasks.length === 0) return { requested: false, reason: "" };
+
+  const completedTasks = subTasks.filter((task) => task.status === "completed");
+  if (completedTasks.length < 10) return { requested: false, reason: "" };
+
+  const allRoles = new Set(subTasks.map((task) => getCheckpointRole(state, task.fileTarget)));
+  const completedRoles = new Set(completedTasks.map((task) => getCheckpointRole(state, task.fileTarget)));
+  const requiredRoles = ["entry", "route", "controller", "service", "model"];
+  if (allRoles.has("repository")) requiredRoles.push("repository");
+  if (state.requirementProtocol?.capabilities?.authRequired || allRoles.has("middleware")) requiredRoles.push("middleware");
+
+  if (!hasCompletedFile(completedTasks, "package.json")) return { requested: false, reason: "" };
+  if (subTasks.some((task) => task.fileTarget === "tsconfig.json") && !hasCompletedFile(completedTasks, "tsconfig.json")) {
+    return { requested: false, reason: "" };
+  }
+  const hasTestConfigTask = subTasks.some((task) => /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(task.fileTarget));
+  if (hasTestConfigTask) {
+    const testConfigReady = completedTasks.some((task) => /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(task.fileTarget));
+    if (!testConfigReady) return { requested: false, reason: "" };
+  }
+
+  for (const role of requiredRoles) {
+    if (!completedRoles.has(role)) return { requested: false, reason: "" };
+  }
+
+  return {
+    requested: true,
+    reason: `首轮后端核心骨架已完成（${completedTasks.length}/${subTasks.length}），先进行环境与可运行性验证，再继续补齐前端、测试与部署外围文件`,
+  };
+}
 
 function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: readonly ts.Diagnostic[]): string {
   return diagnostics
@@ -87,7 +346,7 @@ function isLocalSelfHealContentError(message: string | null | undefined): boolea
     /语法错误/i.test(text) ||
     /JSON 格式校验失败/i.test(text) ||
     /Markdown 格式的汇报|非纯净代码/i.test(text) ||
-    /代码提取失败|提取失败|未找到.*代码块|无法提取/i.test(text)
+    /代码提取失败|提取失败|未找到.*代码块|未检测到.*代码块|无法提取/i.test(text)
   );
 }
 
@@ -98,7 +357,7 @@ function shouldRetryTaskLocally(options: {
   extractError: string;
   unauthorizedWriteTargets: Set<string>;
 }): boolean {
-  if (options.attempt > 0) return false;
+  if (options.attempt > 1) return false;
   if (options.unauthorizedWriteTargets.size > 0) return false;
   if (options.toolError) return false;
   return (
@@ -127,9 +386,49 @@ function isServiceFile(fileTarget: string): boolean {
   return normalizeTaskFileTarget(fileTarget).toLowerCase().includes("/services/");
 }
 
-function normalizeStructuralDependencies(
-  subTasks: Array<{ fileTarget: string; dependencies?: string[] }>
+function isCrossCuttingStructuralFile(fileTarget: string): boolean {
+  const stem = getExecutionDependencyStem(fileTarget);
+  return ["auth", "permission", "rbac", "logger", "logging", "error", "audit"].includes(stem);
+}
+
+function pickSameStemTargets(
+  targets: string[],
+  currentFile: string,
+  stem: string,
+  options?: { preferAggregateService?: boolean; includeCrossCutting?: boolean }
+): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  const candidates = targets.filter((target) => normalizeTaskFileTarget(target) !== normalizeTaskFileTarget(currentFile));
+  const sameStem = normalizedStem
+    ? candidates.filter((target) => getExecutionDependencyStem(target) === normalizedStem)
+    : [];
+  const picked = options?.preferAggregateService
+    ? (() => {
+        const aggregate = sameStem.find((target) => isAggregateExecutionServiceFile(target));
+        return aggregate ? [aggregate] : sameStem.slice(0, 1);
+      })()
+    : sameStem;
+  if (!options?.includeCrossCutting) return picked;
+  return Array.from(new Set([...picked, ...candidates.filter((target) => isCrossCuttingStructuralFile(target))]));
+}
+
+function pickSplitServiceHelperTargets(targets: string[], currentFile: string, stem: string): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  if (!normalizedStem || !isAggregateExecutionServiceFile(currentFile)) return [];
+  return targets
+    .filter((target) => normalizeTaskFileTarget(target) !== normalizeTaskFileTarget(currentFile))
+    .filter((target) => getExecutionDependencyStem(target) === normalizedStem)
+    .filter((target) => !isAggregateExecutionServiceFile(target));
+}
+
+export function normalizeStructuralDependencies(
+  subTasks: Array<{ id?: string; fileTarget: string; dependencies?: string[] }>
 ): void {
+  const resolveDependency = (dependency: string): string => {
+    const normalizedDependency = normalizeTaskFileTarget(dependency);
+    const dependencyTask = subTasks.find((candidate) => candidate.id === normalizedDependency || normalizeTaskFileTarget(candidate.fileTarget) === normalizedDependency);
+    return dependencyTask ? normalizeTaskFileTarget(dependencyTask.fileTarget) : normalizedDependency;
+  };
   const controllerTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isControllerFile);
   const middlewareTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isMiddlewareFile);
   const modelTargets = subTasks.map((task) => normalizeTaskFileTarget(task.fileTarget)).filter(isModelFile);
@@ -137,7 +436,8 @@ function normalizeStructuralDependencies(
 
   for (const task of subTasks) {
     const fileTarget = normalizeTaskFileTarget(task.fileTarget);
-    const nextDependencies = new Set((task.dependencies || []).map((dependency) => normalizeTaskFileTarget(dependency)));
+    const dependencyStem = getExecutionDependencyStem(fileTarget);
+    const nextDependencies = new Set((task.dependencies || []).map((dependency) => resolveDependency(dependency)));
 
     if (isControllerFile(fileTarget)) {
       for (const dependency of Array.from(nextDependencies)) {
@@ -145,11 +445,9 @@ function normalizeStructuralDependencies(
           nextDependencies.delete(dependency);
         }
       }
-      for (const dependency of [...modelTargets, ...serviceTargets, ...middlewareTargets]) {
-        if (dependency !== fileTarget) {
-          nextDependencies.add(dependency);
-        }
-      }
+      for (const dependency of pickSameStemTargets(serviceTargets, fileTarget, dependencyStem, { preferAggregateService: true })) nextDependencies.add(dependency);
+      for (const dependency of pickSameStemTargets(modelTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
+      for (const dependency of pickSameStemTargets(middlewareTargets, fileTarget, dependencyStem, { includeCrossCutting: true })) nextDependencies.add(dependency);
     }
 
     if (isMiddlewareFile(fileTarget)) {
@@ -158,11 +456,8 @@ function normalizeStructuralDependencies(
           nextDependencies.delete(dependency);
         }
       }
-      for (const dependency of [...modelTargets, ...serviceTargets]) {
-        if (dependency !== fileTarget) {
-          nextDependencies.add(dependency);
-        }
-      }
+      for (const dependency of pickSameStemTargets(serviceTargets, fileTarget, dependencyStem, { preferAggregateService: true })) nextDependencies.add(dependency);
+      for (const dependency of pickSameStemTargets(modelTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
     }
 
     if (isModelFile(fileTarget)) {
@@ -179,11 +474,8 @@ function normalizeStructuralDependencies(
           nextDependencies.delete(dependency);
         }
       }
-      for (const dependency of modelTargets) {
-        if (dependency !== fileTarget) {
-          nextDependencies.add(dependency);
-        }
-      }
+      for (const dependency of pickSplitServiceHelperTargets(serviceTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
+      for (const dependency of pickSameStemTargets(modelTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
     }
 
     if (isRouteFile(fileTarget)) {
@@ -192,15 +484,40 @@ function normalizeStructuralDependencies(
           nextDependencies.delete(dependency);
         }
       }
-      for (const dependency of [...controllerTargets, ...middlewareTargets]) {
-        if (dependency !== fileTarget) {
-          nextDependencies.add(dependency);
-        }
-      }
+      for (const dependency of pickSameStemTargets(controllerTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
+      for (const dependency of pickSameStemTargets(middlewareTargets, fileTarget, dependencyStem, { includeCrossCutting: true })) nextDependencies.add(dependency);
     }
 
     task.dependencies = Array.from(nextDependencies);
   }
+}
+
+function buildCompactTaskSpecSummary(
+  state: JimClawState,
+  task: { fileTarget: string; dependencies?: string[] }
+): string {
+  const spec = (state.spec || {}) as any;
+  const dependencyFiles = (task.dependencies || [])
+    .map((dependency) => {
+      const normalizedDependency = normalizeTaskFileTarget(dependency);
+      const dependencyTask = (state.subTasks || []).find((item) => item.id === normalizedDependency || normalizeTaskFileTarget(item.fileTarget) === normalizedDependency);
+      return dependencyTask?.fileTarget || (/[/\\.]/.test(normalizedDependency) ? normalizedDependency : "");
+    })
+    .filter(Boolean);
+  return JSON.stringify(
+    {
+      language: spec.language || "",
+      framework: spec.framework || "",
+      testCommand: spec.testCommand || "",
+      runCommand: spec.runCommand || "",
+      entryPoint: spec.entryPoint || "",
+      declaredFiles: Array.from(new Set([normalizeTaskFileTarget(task.fileTarget), ...dependencyFiles])),
+      dependencies: Object.keys(spec.dependencies || {}),
+      devDependencies: Object.keys(spec.devDependencies || {}),
+    },
+    null,
+    2
+  );
 }
 
 function areTaskDependenciesSatisfied(
@@ -273,6 +590,97 @@ function getFocusedContextFiles(
   }
 
   return Array.from(focused);
+}
+
+function singularizeStem(value: string): string {
+  const normalized = String(value || "").trim().toLowerCase();
+  if (normalized.endsWith("ies")) return `${normalized.slice(0, -3)}y`;
+  if (normalized.endsWith("ses")) return normalized.slice(0, -2);
+  if (normalized.endsWith("s") && normalized.length > 1) return normalized.slice(0, -1);
+  return normalized;
+}
+
+function getTaskDomainStems(fileTarget: string): string[] {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  const base = path.posix.basename(normalized, path.posix.extname(normalized));
+  const stem = base
+    .replace(/(controller|service|repository|model|routes?|middleware|test|spec)$/i, "")
+    .trim();
+  const singular = singularizeStem(stem);
+  const plural = singular ? `${singular}s` : "";
+  return Array.from(new Set([stem, singular, plural].filter(Boolean)));
+}
+
+function summarizeApiEndpoint(endpoint: any) {
+  const request = endpoint?.request || {};
+  const requestSummary: Record<string, string[]> = {};
+  const bodyFields = Object.keys(request.body || {});
+  const queryFields = Object.keys(request.query || {});
+  const paramsFields = Object.keys(request.params || {});
+  const headerKeys = Object.keys(request.headers || {});
+  if (bodyFields.length > 0) requestSummary.bodyFields = bodyFields;
+  if (queryFields.length > 0) requestSummary.queryFields = queryFields;
+  if (paramsFields.length > 0) requestSummary.paramsFields = paramsFields;
+  if (headerKeys.length > 0) requestSummary.headerKeys = headerKeys;
+
+  return {
+    method: String(endpoint?.method || "").toUpperCase(),
+    path: String(endpoint?.path || ""),
+    description: endpoint?.description || "",
+    auth: endpoint?.auth || undefined,
+    request: Object.keys(requestSummary).length > 0 ? requestSummary : undefined,
+    responseStatus: Object.keys(endpoint?.responses || {}),
+  };
+}
+
+function buildRelevantApiContract(task: { fileTarget: string }, state: JimClawState): string {
+  const endpoints = state.apiContract?.endpoints || [];
+  if (endpoints.length === 0) return "";
+
+  const normalizedTarget = normalizeTaskFileTarget(task.fileTarget).toLowerCase();
+  const fileContract = getProtocolFileContract(state.executionProtocol, normalizedTarget);
+  const ownedEndpoints = new Set(
+    (fileContract?.ownedEndpoints || []).map((entry) => String(entry || "").toUpperCase())
+  );
+
+  let relevantEndpoints = endpoints;
+  if (ownedEndpoints.size > 0) {
+    relevantEndpoints = endpoints.filter((endpoint) =>
+      ownedEndpoints.has(`${String(endpoint.method || "").toUpperCase()} ${String(endpoint.path || "")}`.trim())
+    );
+  } else if (/\/health\./i.test(normalizedTarget)) {
+    relevantEndpoints = endpoints.filter((endpoint) => /\/health$/i.test(String(endpoint.path || "")));
+  } else {
+    const stems = getTaskDomainStems(normalizedTarget);
+    if (stems.length > 0) {
+      const stemSet = new Set(stems);
+      const narrowed = endpoints.filter((endpoint) =>
+        String(endpoint.path || "")
+          .toLowerCase()
+          .split("/")
+          .filter(Boolean)
+          .some((segment) => stemSet.has(segment.replace(/:[^/]+/g, "")))
+      );
+      if (narrowed.length > 0) {
+        relevantEndpoints = narrowed;
+      }
+    }
+
+    if (/\/middleware\/auth/i.test(normalizedTarget)) {
+      const authEndpoints = endpoints.filter((endpoint) => {
+        const endpointPath = String(endpoint.path || "").toLowerCase();
+        return /\/auth(\/|$)/.test(endpointPath) || Boolean((endpoint as any).auth);
+      });
+      if (authEndpoints.length > 0) {
+        relevantEndpoints = authEndpoints;
+      }
+    }
+  }
+
+  const compactContract = {
+    endpoints: relevantEndpoints.map((endpoint) => summarizeApiEndpoint(endpoint)),
+  };
+  return JSON.stringify(compactContract, null, 2);
 }
 
 function extractExportContract(code: string): { hasDefaultExport: boolean; namedExports: string[] } {
@@ -533,6 +941,8 @@ export async function coderNode(
   const codeLogEntries: FileChangeEntry[] = [];
   let blockedReason = "";
   let blockedFailedFiles: string[] = [];
+  let validationCheckpointRequested = false;
+  let validationCheckpointReason = "";
   const localRetryAttempts: Record<string, number> = {};
   const localRetryArtifacts: Record<string, string> = {};
 
@@ -553,9 +963,13 @@ export async function coderNode(
   let progressMade = true;
   while (progressMade && !blockedReason) {
     progressMade = false;
-    for (const task of subTasks) {
+    for (const task of getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
+      if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) {
+        emit("thinking", "System", `[Coder] 首轮核心阶段暂缓 ${task.fileTarget}，等待阶段验证后再补齐外围文件`, { task });
+        continue;
+      }
       if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) {
         emit("thinking", "System", `[Coder] 暂缓 ${task.fileTarget}，其依赖尚未完成: ${(task.dependencies || []).join(", ")}`, { task });
         continue;
@@ -569,13 +983,14 @@ export async function coderNode(
 
       let prompt = fixPlanItem
         // 有协商计划：直接按计划执行，不再靠自己猜
-        ? `请修复 ${task.fileTarget}。\n\n[与QA协商后的修复方案（必须严格按此执行）]：\n- 根因：${fixPlanItem.diagnosis}\n- 具体修改：${fixPlanItem.proposedChange}${fixPlanItem.qaFeedback ? `\n- QA的纠正意见：${fixPlanItem.qaFeedback}` : ""}\n\n规范：${JSON.stringify(state.spec)}\n上下文：${task.contextRequirement}`
+        ? `请修复 ${task.fileTarget}。\n\n[与QA协商后的修复方案（必须严格按此执行）]：\n- 根因：${fixPlanItem.diagnosis}\n- 具体修改：${fixPlanItem.proposedChange}${fixPlanItem.qaFeedback ? `\n- QA的纠正意见：${fixPlanItem.qaFeedback}` : ""}\n\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}`
         // 无协商计划：首轮正常实现
-        : `请实现 ${task.fileTarget}。\n规范：${JSON.stringify(state.spec)}\n上下文：${task.contextRequirement}`;
+        : `请实现 ${task.fileTarget}。\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}`;
 
       // P0-A：注入 API 接口契约
       if (state.apiContract?.endpoints?.length) {
-        prompt += `\n\n[API 接口契约]：\n${JSON.stringify(state.apiContract, null, 2)}`;
+        const relevantApiContract = buildRelevantApiContract(task, state);
+        prompt += `\n\n[API 接口契约 - 仅保留当前文件相关端点摘要]：\n${relevantApiContract}`;
       }
       const protocolFileContract = getProtocolFileContract(state.executionProtocol, task.fileTarget);
       if (state.executionProtocol && protocolFileContract) {
@@ -613,6 +1028,9 @@ export async function coderNode(
 
       if (taskLocalAttempt > 0 && task.lastError) {
         prompt += `\n\n[任务内自愈重试 - 必须修正上一次输出]：\n- 上一次失败原因：${task.lastError}\n- 上一次输出摘要：${localRetryArtifacts[task.fileTarget] || "（无）"}\n- 现在必须重新生成完整文件，确保语法合法、结构完整、无自然语言污染。`;
+        if (taskLocalAttempt >= 1) {
+          prompt += `\n- 这是最后一次内容自愈机会。你的回复第一行必须直接开始代码块（例如 \`\`\`typescript），不得再输出计划、解释、JSON、总结或任何自然语言句子。`;
+        }
       }
 
       // P0-C：注入实际测试报错输出（从 testResults 中提取与本文件相关的片段）
@@ -709,41 +1127,65 @@ CMD ["node", "dist/index.js"]`;
       if (deterministicScaffold) {
         extractResult = { isValid: true, code: deterministicScaffold, error: "" };
       } else {
-        const coderResponse = await agents.coder.chat(
-          [{ role: "user", content: prompt }],
-          (ev) => {
-            emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
-            // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
-            if (ev.type === "tool_use" && ev.content) {
-              const contentStr = String(ev.content);
-              if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
-                toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
-              } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
-                const targetMatch = contentStr.match(/Successfully wrote to\s+(.+)$/);
-                const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
-                if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
-                  fileWrittenByTool = true;
-                } else if (writtenTarget) {
-                  unauthorizedWriteTargets.add(writtenTarget);
-                  toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
-                }
-              } else if (ev.tool === "diagnose_code") {
-                if (/\[SUCCESS\]/i.test(contentStr)) {
-                  diagnosticsPassed = true;
-                } else if (isMissingTargetFileDiagnostic(contentStr, task.fileTarget)) {
-                  missingTargetDiagnostic = true;
-                }
-              } else if (ev.tool === "lint_fix") {
-                if (/\[WARNING\]/i.test(contentStr) || /已完成格式化|已完成格式化和规范修复|已使用 prettier 完成格式化/i.test(contentStr)) {
-                  lintPassed = true;
+        const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any);
+        const taskFirstWriteTimeoutMs = getCoderFirstWriteTimeoutMs(state, subTasks as any, task.fileTarget);
+        try {
+          const coderResponse = await invokeCoderWithTaskTimeout({
+            agent: agents.coder,
+            prompt,
+            onEvent: (ev) => {
+              emit(ev.type, ev.sender, `正在开发: ${task.fileTarget}`, ev);
+              // 深度校验：通过监听工具调用的回显，准确捕获底层工具的报错
+              if (ev.type === "tool_use" && ev.content) {
+                const contentStr = String(ev.content);
+                if (contentStr.includes("Error executing") || contentStr.includes("修复规范时出错") || contentStr.includes("Command failed")) {
+                  toolError = `工具执行异常: ${contentStr.slice(0, 200)}`;
+                } else if (ev.tool === "write_file" && contentStr.includes("Successfully wrote")) {
+                  const targetMatch = contentStr.match(/Successfully wrote to\s+(.+)$/);
+                  const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
+                  if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
+                    fileWrittenByTool = true;
+                  } else if (writtenTarget) {
+                    unauthorizedWriteTargets.add(writtenTarget);
+                    toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
+                  }
+                } else if (ev.tool === "diagnose_code") {
+                  if (/\[SUCCESS\]/i.test(contentStr)) {
+                    diagnosticsPassed = true;
+                  } else if (isMissingTargetFileDiagnostic(contentStr, task.fileTarget)) {
+                    missingTargetDiagnostic = true;
+                  }
+                } else if (ev.tool === "lint_fix") {
+                  if (/\[WARNING\]/i.test(contentStr) || /已完成格式化|已完成格式化和规范修复|已使用 prettier 完成格式化/i.test(contentStr)) {
+                    lintPassed = true;
+                  }
                 }
               }
-            }
-          },
-          { mode: "coding", brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-        );
-        rawResponseText = extractText(coderResponse.content);
-        extractResult = extractCodeFromResponse(rawResponseText);
+            },
+            brief: buildCoderExecutionContext(state, task),
+            workspaceDir: WORKSPACE,
+            timeoutMs: taskTimeoutMs,
+            firstWriteTimeoutMs: taskFirstWriteTimeoutMs,
+          });
+          rawResponseText = extractText(coderResponse.content);
+          extractResult = extractCodeFromResponse(rawResponseText);
+        } catch (error: any) {
+          if (error?.code === "CODER_FIRST_WRITE_TIMEOUT") {
+            extractResult = {
+              isValid: false,
+              code: "",
+              error: `首个写入超时（>${taskFirstWriteTimeoutMs}ms），在首次 write_file 前未产生任何落盘动作，判定当前任务过大或提示过重，请拆分职责或缩减上下文后重试`,
+            };
+          } else if (isAgentTimeoutError(error)) {
+            extractResult = {
+              isValid: false,
+              code: "",
+              error: `单文件生成超时（>${taskTimeoutMs}ms），已中止当前文件生成，请缩小任务范围或继续后续验证`,
+            };
+          } else {
+            throw error;
+          }
+        }
       }
 
       if (deterministicScaffold) {
@@ -882,6 +1324,13 @@ CMD ["node", "dist/index.js"]`;
         delete localRetryAttempts[task.fileTarget];
         delete localRetryArtifacts[task.fileTarget];
         progressMade = true;
+        const checkpointDecision = shouldRequestValidationCheckpoint(state, subTasks as any);
+        if (checkpointDecision.requested) {
+          validationCheckpointRequested = true;
+          validationCheckpointReason = checkpointDecision.reason;
+          emit("thinking", "System", `[Coder] ${validationCheckpointReason}`, { task });
+          break;
+        }
         } catch (e: any) {
           await clearWriteRecoveryIntent(WORKSPACE, task.id);
           if (previousCode === undefined) {
@@ -937,15 +1386,33 @@ CMD ["node", "dist/index.js"]`;
       }
 
       // 3. 写一个存一个：每完成一个文件立即持久化状态，防止截断导致全盘丢失
-  }
+    }
 
+    if (validationCheckpointRequested) {
+      break;
+    }
   }
 
   await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol);
 
+  if (blockedReason && blockedFailedFiles.length > 0) {
+    const unresolvedBlockedFiles = blockedFailedFiles.filter((fileTarget) =>
+      subTasks.some((task) => task.fileTarget === fileTarget && task.status !== "completed")
+    );
+    if (unresolvedBlockedFiles.length === 0) {
+      blockedReason = "";
+      blockedFailedFiles = [];
+    }
+  }
+
   if (!blockedReason) {
     const pendingTasks = subTasks.filter((task) => task.status !== "completed");
-    if (pendingTasks.length > 0 && codeLogEntries.filter((entry) => entry.status === "written").length === 0) {
+    const hasLocalSelfHealInFlight = Object.keys(localRetryAttempts).length > 0;
+    if (
+      pendingTasks.length > 0 &&
+      codeLogEntries.filter((entry) => entry.status === "written").length === 0 &&
+      !hasLocalSelfHealInFlight
+    ) {
       const deadlocked = pendingTasks.map((task) => {
         const unmet = (task.dependencies || []).filter((dependency) => filesContent[dependency] === undefined);
         return `${task.fileTarget} <- ${unmet.join(", ") || "无可满足依赖"}`;
@@ -980,6 +1447,10 @@ CMD ["node", "dist/index.js"]`;
     consensusProgress,
     meetingNotes: [meetingNote],
     blockedReason,
+    validationCheckpointRequested,
+    validationCheckpointCompleted: state.validationCheckpointCompleted || false,
+    validationCheckpointReason,
+    resumeAfterValidation: false,
     testResults: blockedReason ? `[Coder 阻塞失败]\n${blockedReason}` : "",
     qaFailures: blockedReason
       ? {

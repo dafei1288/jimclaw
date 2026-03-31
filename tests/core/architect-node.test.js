@@ -11,6 +11,7 @@ const {
   createSnapshotRecorder,
 } = require("./test-helpers");
 const { architectNode } = require("../../src/core/nodes/architect_node");
+const { AgentTimeoutError } = require("../../src/core/agent");
 
 function createArchitectAgent(responses) {
   let index = 0;
@@ -217,7 +218,7 @@ test("architect enriches heavy full-stack requirements into executable backend a
     assert.equal(files.includes("src/models/product.ts"), true);
     assert.equal(files.includes("src/middleware/auth.ts"), true);
     assert.equal(files.includes("src/logging/logger.ts"), true);
-    assert.equal(files.includes("scripts/verify.ps1"), true);
+    assert.equal(files.includes("scripts/verify.ps1") || files.includes("scripts/verify.ts"), true);
     assert.equal(files.includes("Dockerfile"), true);
     assert.equal(files.includes("docker-compose.yml"), true);
     assert.equal(
@@ -228,6 +229,60 @@ test("architect enriches heavy full-stack requirements into executable backend a
       result.apiContract.endpoints.some((endpoint) => endpoint.path === "/api/auth/login" && endpoint.method === "POST"),
       true
     );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("architect node falls back to a deterministic executable skeleton when model is unavailable", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    contract: {
+      title: "图书管理系统",
+      requirements: [
+        "需要前端页面和后端 API",
+        "支持图书列表、添加图书、编辑图书、删除图书",
+        "需要登录认证和权限控制",
+        "需要记录操作审计日志",
+        "需要 Docker 部署和验证脚本",
+      ],
+      acceptanceCriteria: [
+        "用户可以访问图书列表页面",
+        "后端提供图书 CRUD 接口",
+      ],
+    },
+  });
+
+  try {
+    const result = await architectNode(
+      state,
+      {
+        architect: {
+          getPersona() {
+            return { name: "测试架构师" };
+          },
+          async chat() {
+            throw new AgentTimeoutError("测试架构师", 10);
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.validationReport.status, "pass");
+    assert.equal(result.spec.filesToCreate.includes("package.json"), true);
+    assert.equal(result.spec.filesToCreate.some((file) => /src\/routes\/books?\.ts$/.test(file)), true);
+    assert.equal(result.spec.filesToCreate.some((file) => /tests\/books?\.test\.ts$/.test(file)), true);
+    assert.equal(result.spec.filesToCreate.includes("scripts/verify.ts"), true);
+    assert.equal(result.spec.filesToCreate.includes("Dockerfile"), true);
+    assert.equal(result.manifest.services.length > 0, true);
+    assert.equal(Number(result.manifest.services[0].port) >= 4000, true);
+    const readme = await fs.readFile(path.join(workspace, "README.md"), "utf-8");
+    assert.match(readme, /图书管理系统/);
   } finally {
     await removeTempWorkspace(workspace);
   }

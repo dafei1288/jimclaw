@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { spawn } from "child_process";
 import { Skill } from "../core/skill";
+import { CapabilitySnapshot, ExecutionIntent, ExecutorResult } from "../executor/types";
 
 /**
  * 执行 Shell 命令的 Skill: 支持背景运行和超时控制
@@ -23,21 +24,31 @@ export const ShellExecuteSkill = new Skill({
       console.log(`[System] Executing in ${effectiveWorkDir}: ${command}${isBackground ? " (background)" : ""}`);
       
       if (isBackground) {
-        const child = spawn(command, {
-          shell: true,
-          detached: true,
-          stdio: 'ignore',
-          cwd: effectiveWorkDir
-        });
-        child.unref();
-        return `Background process started with PID: ${child.pid} in ${effectiveWorkDir}`;
+        try {
+          const child = spawn(command, {
+            shell: true,
+            detached: true,
+            stdio: 'ignore',
+            cwd: effectiveWorkDir
+          });
+          child.unref();
+          return `Background process started with PID: ${child.pid} in ${effectiveWorkDir}`;
+        } catch (error: any) {
+          return `Command failed with error: ${error.message}`;
+        }
       }
 
       return new Promise<string>((resolve, reject) => {
-        const child = spawn(command, { 
-          shell: true,
-          cwd: effectiveWorkDir
-        });
+        let child;
+        try {
+          child = spawn(command, {
+            shell: true,
+            cwd: effectiveWorkDir
+          });
+        } catch (error: any) {
+          resolve(`Command failed with error: ${error.message}`);
+          return;
+        }
         let stdout = "";
         let stderr = "";
         let timer: NodeJS.Timeout;
@@ -63,7 +74,7 @@ export const ShellExecuteSkill = new Skill({
 
         child.on("error", (err) => {
           if (timer) clearTimeout(timer);
-          reject(err);
+          resolve(`Command failed with error: ${err.message}`);
         });
       });
     } catch (error: any) {
@@ -71,3 +82,56 @@ export const ShellExecuteSkill = new Skill({
     }
   },
 });
+
+type LocalShellAdapterDeps = {
+  runCommand?: (args: {
+    command: string;
+    workDir?: string;
+    isBackground?: boolean;
+    timeout?: number;
+  }) => Promise<string>;
+};
+
+function unwrapSkillOutput(raw: string) {
+  const text = String(raw || "");
+  const match = text.match(/Output:\n([\s\S]*?)(?:\nErrors:|$)/);
+  return (match ? match[1] : text).trim();
+}
+
+function extractSkillErrors(raw: string) {
+  const text = String(raw || "");
+  const match = text.match(/\nErrors:\n([\s\S]*)$/);
+  return (match ? match[1] : "").trim();
+}
+
+export function createLocalShellAdapter(deps: LocalShellAdapterDeps = {}) {
+  const runCommand =
+    deps.runCommand ||
+    ((args: { command: string; workDir?: string; isBackground?: boolean; timeout?: number }) =>
+      ShellExecuteSkill.config.run(args));
+
+  return {
+    async execute(
+      intent: ExecutionIntent,
+      _context: { capabilitySnapshot: CapabilitySnapshot }
+    ): Promise<ExecutorResult> {
+      const raw = await runCommand({
+        command: intent.command || "",
+        workDir: intent.workspace,
+        isBackground: intent.background,
+        timeout: 30000,
+      });
+
+      const failed = /^Command failed/i.test(String(raw || "").trim());
+      return {
+        ok: !failed,
+        backend: "local_shell",
+        stdout: unwrapSkillOutput(raw),
+        stderr: extractSkillErrors(raw),
+        retryable: false,
+        requiresApproval: false,
+        blocked: false,
+      };
+    },
+  };
+}

@@ -149,6 +149,80 @@ test("coder repairs a transient syntax error within the same task before escalat
   }
 });
 
+test("coder prioritizes reopened files ahead of ordinary pending work", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const state = createBaseState({
+    qaFailures: {
+      failedFiles: ["tests/books.test.ts"],
+      testErrors: ["tests/books.test.ts 需要重开修复"],
+      failedTestNames: [],
+    },
+    fixPlan: [
+      {
+        fileTarget: "tests/books.test.ts",
+        diagnosis: "测试文件导入错误",
+        proposedChange: "修正导入并保留断言",
+        qaApproval: "approved",
+      },
+    ],
+    subTasks: [
+      {
+        id: "task-service",
+        description: "write service",
+        fileTarget: "src/services/bookService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "pending",
+      },
+      {
+        id: "task-test",
+        description: "repair books test",
+        fileTarget: "tests/books.test.ts",
+        dependencies: [],
+        contextRequirement: "test",
+        status: "completed",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请(?:实现|修复)\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            if (target === "tests/books.test.ts") {
+              return {
+                content: "```typescript\ndescribe('books', () => {\n  it('works', () => {\n    expect(true).toBe(true);\n  });\n});\n```",
+              };
+            }
+            return {
+              content: "```typescript\nexport const bookService = { ok: true };\nexport default bookService;\n```",
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(attemptedTargets[0], "tests/books.test.ts");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "tests/books.test.ts").status, "completed");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder regression harness is ready for snapshot consistency checks", () => {
   assert.equal(true, true);
 });

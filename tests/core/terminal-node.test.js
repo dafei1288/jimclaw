@@ -11,6 +11,7 @@ const {
 } = require("./test-helpers");
 const logicUtils = require("../../src/core/logic_utils");
 const { terminalNode } = require("../../src/core/nodes/terminal_node");
+const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
 
 test("terminal retries transient exec failure before returning test output", async () => {
   const workspace = await createTempWorkspace();
@@ -54,6 +55,45 @@ test("terminal retries transient exec failure before returning test output", asy
     assert.equal(result.lastFailedNode, "");
   } finally {
     logicUtils.execInContainer = originalExecInContainer;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("terminal executes tests on host backend without requiring container", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const calls = [];
+
+  ShellExecuteSkill.config.run = async ({ command, workDir }) => {
+    calls.push({ command, workDir });
+    return "Output:\nPASS tests/setup.test.ts\nErrors:\n";
+  };
+
+  try {
+    const result = await terminalNode(
+      createBaseState({
+        executionBackend: "host",
+        containerId: "",
+        spec: {
+          language: "TypeScript",
+          testCommand: "npm test",
+          filesToCreate: [],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.testResults.includes("PASS tests/setup.test.ts"), true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].command, "npm test");
+    assert.equal(calls[0].workDir, workspace);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
     await removeTempWorkspace(workspace);
   }
 });

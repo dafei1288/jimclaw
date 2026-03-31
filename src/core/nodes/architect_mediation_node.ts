@@ -1,7 +1,17 @@
 import { JimClawState, ConsensusCore, ProtocolPatch } from "../graph_types";
-import { BaseAgent } from "../agent";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 import { applyProtocolPatches, buildSystemContext, buildProtocolPatchesForFixPlan, writeMeetingNote } from "../logic_utils";
+
+const ARCHITECT_MEDIATION_TIMEOUT_MS = 15000;
+
+function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
+  return (
+    error instanceof AgentTimeoutError ||
+    error instanceof AgentServiceUnavailableError ||
+    error instanceof AgentResourceExhaustedError
+  );
+}
 
 /**
  * ArchitectMediation 节点：在多轮失败后，由架构师输出绑定性的修复指令与协议补丁。
@@ -89,15 +99,33 @@ ${latestTestOutput}
   "protocolPatches": [{"target":"contracts","action":"replace","path":"files.src/routes/users.ts.ownedEndpoints","value":["GET /api/users"],"reason":"统一端点归属"}]
 }`;
 
-  const response = await agents.architect.chat(
-    [{ role: "user", content: prompt }],
-    (ev) => emit(ev.type, ev.sender, "正在分析冲突并进行仲裁", ev),
-    { workspaceDir: WORKSPACE, brief: buildSystemContext(state) }
-  );
+  let mediationDirectives: any[] = [];
+  let protocolPatches: ProtocolPatch[] = [];
+  try {
+    const response = await agents.architect.chat(
+      [{ role: "user", content: prompt }],
+      (ev) => emit(ev.type, ev.sender, "正在分析冲突并进行仲裁", ev),
+      {
+        workspaceDir: WORKSPACE,
+        brief: buildSystemContext(state),
+        timeoutMs: ARCHITECT_MEDIATION_TIMEOUT_MS,
+      }
+    );
 
-  const parsed = parseJsonFromResponse(extractText(response.content), { directives: [], protocolPatches: [] });
-  const mediationDirectives = parsed.directives || [];
-  let protocolPatches: ProtocolPatch[] = parsed.protocolPatches || [];
+    const parsed = parseJsonFromResponse(extractText(response.content), { directives: [], protocolPatches: [] });
+    mediationDirectives = parsed.directives || [];
+    protocolPatches = parsed.protocolPatches || [];
+  } catch (error: any) {
+    if (!isRecoverableAgentError(error)) throw error;
+    emit("thinking", "System", `架构仲裁模型暂不可用，改用规则化仲裁指令继续执行：${error.message || error}`, {});
+    mediationDirectives = openIssues.flatMap((issue) =>
+      (issue.relatedFiles || []).map((file: string) => ({
+        file,
+        action: "stabilize",
+        detail: `围绕缺陷“${issue.title}”做最小修复，严格对齐当前 ApiContract / ExecutionProtocol，不要扩散到无关文件。`,
+      }))
+    );
+  }
 
   if (protocolPatches.length === 0) {
     const fallbackFiles = Array.from(new Set(openIssues.flatMap((issue) => issue.relatedFiles || [])));

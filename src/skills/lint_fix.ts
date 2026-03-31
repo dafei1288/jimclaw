@@ -15,6 +15,9 @@ export function classifyPrettierFailure(message: string): "blocking" | "warning"
   ) {
     return "warning";
   }
+  if (/No files matching the pattern were found/i.test(text)) {
+    return "warning";
+  }
   return "blocking";
 }
 

@@ -15,9 +15,37 @@ function isRetryableError(err: any): boolean {
   const status = err.status || err.response?.status;
   if (status === 429 || (status >= 500 && status < 600)) return true;
   const code = err.code || err.cause?.code;
-  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND") return true;
+  if (code === "ECONNRESET" || code === "ETIMEDOUT" || code === "ENOTFOUND" || code === "ECONNREFUSED" || code === "EACCES" || code === "ABORT_ERR") return true;
   const message = (err.message || "").toLowerCase();
-  if (message.includes("timeout") || message.includes("econnreset") || message.includes("network error")) return true;
+  if (
+    message.includes("timeout")
+    || message.includes("econnreset")
+    || message.includes("network error")
+    || message.includes("connection error")
+    || message.includes("api connection error")
+    || message.includes("request was aborted")
+    || message.includes("aborterror")
+  ) return true;
+  return false;
+}
+
+function isResourceExhaustedError(err: any): boolean {
+  const status = err.status || err.response?.status;
+  const code = String(err.code || err.error?.code || err.cause?.code || "").toLowerCase();
+  const type = String(err.type || err.error?.type || "").toLowerCase();
+  const message = String(err.message || err.error?.message || "").toLowerCase();
+
+  if ((status === 402 || status === 403) && (
+    code.includes("insufficient") ||
+    code.includes("quota") ||
+    type.includes("quota") ||
+    message.includes("quota") ||
+    message.includes("额度不足") ||
+    message.includes("balance exhausted")
+  )) {
+    return true;
+  }
+
   return false;
 }
 
@@ -65,6 +93,50 @@ export interface AgentPersona {
   specialty: string;
   personality: string;
   color?: string; // 终端显示的颜色（支持 chalk 颜色名称）
+}
+
+export class AgentTimeoutError extends Error {
+  code: string;
+  timeoutMs: number;
+
+  constructor(agentName: string, timeoutMs: number) {
+    super(`${agentName} 调用超时（>${timeoutMs}ms）`);
+    this.name = "AgentTimeoutError";
+    this.code = "AGENT_TIMEOUT";
+    this.timeoutMs = timeoutMs;
+  }
+}
+
+export class AgentServiceUnavailableError extends Error {
+  code: string;
+  agentName: string;
+  mode?: string;
+  cause?: unknown;
+
+  constructor(agentName: string, reason: string, mode?: string, cause?: unknown) {
+    super(`${agentName} 模型服务暂不可用：${reason}`);
+    this.name = "AgentServiceUnavailableError";
+    this.code = "AGENT_SERVICE_UNAVAILABLE";
+    this.agentName = agentName;
+    this.mode = mode;
+    this.cause = cause;
+  }
+}
+
+export class AgentResourceExhaustedError extends Error {
+  code: string;
+  agentName: string;
+  mode?: string;
+  cause?: unknown;
+
+  constructor(agentName: string, reason: string, mode?: string, cause?: unknown) {
+    super(`${agentName} 模型额度或资源不足：${reason}`);
+    this.name = "AgentResourceExhaustedError";
+    this.code = "AGENT_RESOURCE_EXHAUSTED";
+    this.agentName = agentName;
+    this.mode = mode;
+    this.cause = cause;
+  }
 }
 
 /**
@@ -121,11 +193,41 @@ export class BaseAgent {
     return ordered;
   }
 
-  private async invokeWithRetry(model: any, messages: BaseMessage[], workspaceDir?: string) {
+  private async invokeWithRetry(
+    model: any,
+    messages: BaseMessage[],
+    workspaceDir?: string,
+    options?: { timeoutMs?: number; signal?: AbortSignal }
+  ) {
     for (let attempt = 0; attempt < 3; attempt++) {
+      const timeoutMs = options?.timeoutMs;
+      const upstreamSignal = options?.signal;
+      const controller = new AbortController();
+      let timeoutHandle: NodeJS.Timeout | null = null;
+      let didTimeout = false;
+      const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+
+      if (upstreamSignal) {
+        if (upstreamSignal.aborted) {
+          controller.abort(upstreamSignal.reason);
+        } else {
+          upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+        }
+      }
+
+      if (timeoutMs && timeoutMs > 0) {
+        timeoutHandle = setTimeout(() => {
+          didTimeout = true;
+          controller.abort(new AgentTimeoutError(this.persona.name, timeoutMs));
+        }, timeoutMs);
+      }
+
       try {
-        return await model.invoke(messages);
+        return await model.invoke(messages, { signal: controller.signal } as any);
       } catch (error: any) {
+        if (didTimeout) {
+          throw new AgentTimeoutError(this.persona.name, timeoutMs!);
+        }
         if (attempt < 2 && isRetryableError(error)) {
           const delay = 1000 * Math.pow(2, attempt);
           console.warn(`[Agent] ${this.persona.name} 第 ${attempt + 1} 次调用失败，${delay}ms 后重试...`);
@@ -133,11 +235,23 @@ export class BaseAgent {
           continue;
         }
         throw error;
+      } finally {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle);
+        }
+        if (upstreamSignal) {
+          upstreamSignal.removeEventListener("abort", abortFromUpstream);
+        }
       }
     }
   }
 
-  private async invokeWithFallback(messages: BaseMessage[], mode: string | undefined, workspaceDir?: string) {
+  private async invokeWithFallback(
+    messages: BaseMessage[],
+    mode: string | undefined,
+    workspaceDir?: string,
+    options?: { timeoutMs?: number; signal?: AbortSignal }
+  ) {
     const chain = this.buildFallbackChain(mode);
     let lastError: any;
 
@@ -150,12 +264,44 @@ export class BaseAgent {
         : selectedModel;
 
       try {
-        const response = await this.invokeWithRetry(modelWithTools, messages, workspaceDir);
+        const response = await this.invokeWithRetry(modelWithTools, messages, workspaceDir, options);
         return { response, usedMode: candidateMode };
       } catch (error: any) {
         lastError = error;
         const hasMoreCandidates = idx < chain.length - 1;
-        if (!hasMoreCandidates || !isRetryableError(error)) {
+        if (!hasMoreCandidates && isResourceExhaustedError(error)) {
+          const wrapped = new AgentResourceExhaustedError(
+            this.persona.name,
+            formatErrorMessage(error),
+            candidateMode,
+            error
+          );
+          console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
+          console.error("Error Detail:", wrapped);
+          await AuditLogger.log(
+            workspaceDir,
+            this.persona.name,
+            `### [Agent Resource Exhausted]\n\n${wrapped.message}\n\n最后尝试模式：${candidateMode}`
+          );
+          throw wrapped;
+        }
+        if (!hasMoreCandidates && isRetryableError(error)) {
+          const wrapped = new AgentServiceUnavailableError(
+            this.persona.name,
+            formatErrorMessage(error),
+            candidateMode,
+            error
+          );
+          console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
+          console.error("Error Detail:", wrapped);
+          await AuditLogger.log(
+            workspaceDir,
+            this.persona.name,
+            `### [Agent Unavailable]\n\n${wrapped.message}\n\n最后尝试模式：${candidateMode}`
+          );
+          throw wrapped;
+        }
+        if (!hasMoreCandidates || (!isRetryableError(error) && !isResourceExhaustedError(error))) {
           console.error(`\n[Critical Error in Agent ${this.persona.name}]:`);
           if (error.response?.data) {
             console.error("Raw API Response Data:", JSON.stringify(error.response.data, null, 2));
@@ -226,8 +372,16 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
    * @param options.mode         选择使用哪个能力模型（coding/reasoning/default）
    * @param options.brief        团队共识条目，注入 system prompt 让所有 agent 共享上下文
    * @param options.workspaceDir 当前运行的 workspace 路径，注入 system prompt 防止 agent 在错误目录操作
+   * @param options.timeoutMs    单次模型调用超时时间，超时后主动中断请求
+   * @param options.signal       外部中断信号，可用于提前取消当前模型调用
    */
-  async chat(messages: any[], eventCallback?: (event: any) => void, options?: { mode?: string; brief?: string[]; workspaceDir?: string }) {
+  async chat(messages: any[], eventCallback?: (event: any) => void, options?: {
+    mode?: string;
+    brief?: string[];
+    workspaceDir?: string;
+    timeoutMs?: number;
+    signal?: AbortSignal;
+  }) {
     const systemPrompt = this.getSystemPrompt(options?.brief, options?.workspaceDir);
     const formattedMessages: BaseMessage[] = [
       new SystemMessage(systemPrompt),
@@ -253,7 +407,10 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
     let activeMode = options?.mode;
 
     for (let iteration = 0; iteration < MAX_TOOL_ITERATIONS; iteration++) {
-      const invoked = await this.invokeWithFallback(currentMessages, activeMode, options?.workspaceDir);
+      const invoked = await this.invokeWithFallback(currentMessages, activeMode, options?.workspaceDir, {
+        timeoutMs: options?.timeoutMs,
+        signal: options?.signal,
+      });
       response = invoked.response;
       activeMode = invoked.usedMode;
 

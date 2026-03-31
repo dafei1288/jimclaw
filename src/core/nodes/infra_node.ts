@@ -70,7 +70,7 @@ function isRetryableContainerExecFailure(raw: string): boolean {
 }
 
 function isCommandFailureOutput(raw: string): boolean {
-  return /^Command failed with exit code\s+\d+/i.test(String(raw || "").trim());
+  return /^Command failed with (exit code\s+\d+|error:)/i.test(String(raw || "").trim());
 }
 
 function extractContainerId(raw: string): string {
@@ -85,6 +85,14 @@ function extractContainerId(raw: string): string {
     }
   }
   return "";
+}
+
+function isHostExecutionBackend(state: JimClawState): boolean {
+  return state.executionBackend === "host";
+}
+
+function isDockerUnavailableOutput(raw: string): boolean {
+  return /(spawn EPERM|spawn ENOENT|docker(\.exe)? .*not found|failed to connect to the docker api|docker desktop is not running|permission denied while trying to connect to the docker daemon|无法连接 Docker)/i.test(String(raw || ""));
 }
 
 function readRuntimeRepairEvidence(state: JimClawState): string {
@@ -148,6 +156,23 @@ async function runInfraContainerCommand(
   throw new Error(`${label}失败：${parseSkillOutput(lastOutput) || lastOutput}`);
 }
 
+async function runInfraHostCommand(
+  workspace: string,
+  command: string,
+  label: string,
+  timeout: number
+): Promise<string> {
+  const output = await ShellExecuteSkill.config.run({
+    command,
+    workDir: workspace,
+    timeout,
+  });
+  if (isCommandFailureOutput(output)) {
+    throw new Error(`${label}失败：${parseSkillOutput(output) || output}`);
+  }
+  return output;
+}
+
 /**
  * Infra 节点：负责构建运行和测试所需的基础设施
  */
@@ -186,8 +211,79 @@ export async function infraNode(
     hostPort += 1000; // 强制偏移到安全区域
   }
   const containerPort = state.manifest?.services?.[0]?.port || 8080;
+  const executionBackend = state.executionBackend || "docker";
 
   await AuditLogger.log(WORKSPACE, "Infrastructure", `### [Infrastructure Setup]\n\n**Host Port Allocated:** ${hostPort}\n**Container Port Target:** ${containerPort}`);
+
+  const finalizeHostBackend = async () => {
+    let hasPackageJson = false;
+    let packageJsonContent = "";
+    try {
+      packageJsonContent = await fs.readFile(path.join(WORKSPACE, "package.json"), "utf-8");
+      hasPackageJson = true;
+    } catch {}
+
+    try {
+      if (hasPackageJson) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies on host (npm install)`);
+        const installOut = await runInfraHostCommand(WORKSPACE, "npm install --silent", "npm install", 300000);
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Install Output:**\n${installOut}`);
+
+        if (hasBuildScript(packageJsonContent)) {
+          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace on host (npm run build)`);
+          const buildOut = await runInfraHostCommand(WORKSPACE, "npm run build", "npm run build", 300000);
+          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Build Output:**\n${buildOut}`);
+        }
+      }
+    } catch (e: any) {
+      const errorMsg = `[基础设施异常] ${e.message || e}`;
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Critical Error:** ${errorMsg}`);
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-infra_setup-r${round}`,
+        "infra_setup",
+        round,
+        `Infra 第${round}轮：宿主机依赖安装失败`,
+        `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：失败\n- 后端：host\n- 宿主机端口：${hostPort}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
+      );
+      return {
+        executionBackend: "host" as const,
+        containerId: "",
+        testResults: errorMsg,
+        retryCount: (state.retryCount || 0) + 1,
+        allocatedHostPort: hostPort,
+        meetingNotes: [note],
+        lastFailedNode: "infra_setup",
+        lastFailureSummary: errorMsg.slice(0, 120),
+      };
+    }
+
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-infra_setup-r${round}`,
+      "infra_setup",
+      round,
+      `Infra 第${round}轮：宿主机环境与依赖已就绪`,
+      `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：成功\n- 后端：host\n- 宿主机端口：${hostPort}\n- 运行目录：${WORKSPACE}\n`
+    );
+
+    return {
+      executionBackend: "host" as const,
+      containerId: "",
+      allocatedHostPort: hostPort,
+      meetingNotes: [note],
+      testResults: "",
+      blockedReason: "",
+      protocolFailures: [],
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    };
+  };
+
+  if (isHostExecutionBackend(state)) {
+    await AuditLogger.log(WORKSPACE, "Infrastructure", `**Backend:** host`);
+    return finalizeHostBackend();
+  }
 
   // 2. 检查是否有 docker-compose.yml
   const composePath = path.join(WORKSPACE, "docker-compose.yml");
@@ -240,6 +336,10 @@ export async function infraNode(
 
     // 构建失败（exit code != 0）立即返回，错误写入 testResults 供 QA 分析
     if (composeOut.includes("Command failed") || composeOut.includes("failed to solve") || composeOut.includes("dockerfile parse error") || composeOut.includes("ERROR:")) {
+      if (isDockerUnavailableOutput(composeOut)) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fallback:** Docker Compose 不可用，切换到 host backend`);
+        return finalizeHostBackend();
+      }
       const errMsg = `[基础设施构建失败] docker-compose 构建错误，请检查 Dockerfile 和 docker-compose.yml：\n${parseSkillOutput(composeOut)}`;
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Failed:** ${errMsg}`);
       console.error(`[System] ${errMsg}`);
@@ -310,6 +410,10 @@ export async function infraNode(
     }
 
     if (!containerId) {
+      if (isDockerUnavailableOutput(runOut)) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fallback:** Docker Compose 启动不可用，切换到 host backend`);
+        return finalizeHostBackend();
+      }
       console.warn(`[System] 无法直接获取 compose run 产生的容器 ID，尝试回退查询服务容器...`);
       const fallbackPs = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose ps -q ${serviceName}` });
       containerId = extractContainerId(fallbackPs);
@@ -376,6 +480,10 @@ export async function infraNode(
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
     if (!containerId) {
+      if (isDockerUnavailableOutput(startOut)) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fallback:** Docker 不可用，切换到 host backend`);
+        return finalizeHostBackend();
+      }
       const errMsg = `[基础设施致命错误] docker run 启动后未能获取有效容器 ID，请检查 Docker 输出：\n${parseSkillOutput(startOut) || startOut}`;
       const note = await writeMeetingNote(
         WORKSPACE,

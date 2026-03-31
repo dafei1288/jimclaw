@@ -11,6 +11,7 @@ const {
   createSnapshotRecorder,
 } = require("./test-helpers");
 const { fixPlanNode } = require("../../src/core/nodes/fix_plan_node");
+const { AgentTimeoutError } = require("../../src/core/agent");
 
 function createRateLimitError(message = "429 余额不足或无可用资源包,请充值。") {
   const error = new Error(message);
@@ -97,11 +98,90 @@ test("fix plan falls back to deterministic repair plan when model calls are exha
   }
 });
 
+test("fix plan treats coder timeout as recoverable and still produces deterministic repair plan", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const failingFile = "src/models/book.ts";
+  await fs.mkdir(path.join(workspace, "src", "models"), { recursive: true });
+  await fs.writeFile(path.join(workspace, failingFile), "export interface Book {}\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 1,
+    testResults: "Coder 阻塞失败: src/models/book.ts -> 单文件生成超时",
+    qaFailures: {
+      failedFiles: [failingFile],
+      testErrors: ["Coder 阻塞失败: src/models/book.ts -> 单文件生成超时"],
+      failedTestNames: [],
+    },
+    issueTracker: [
+      {
+        id: "BUG-CODER-BLOCK-1",
+        title: "src/models/book.ts 阻塞了本轮生成",
+        description: "模型文件生成超时，需要先收敛为最小可用实体定义。",
+        severity: "major",
+        status: "open",
+        relatedFiles: [failingFile],
+        detectedRound: 1,
+      },
+    ],
+    subTasks: [
+      {
+        id: "task-model",
+        fileTarget: failingFile,
+        description: "实现图书模型",
+        dependencies: [],
+        contextRequirement: "定义图书实体",
+        status: "failed",
+        lastError: "单文件生成超时",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() {
+        return { name: "星河" };
+      },
+      async chat() {
+        throw new AgentTimeoutError("星河", 20000);
+      },
+    },
+    qa: {
+      getPersona() {
+        return { name: "清扬" };
+      },
+      async chat() {
+        throw new Error("qa should not be called after fallback");
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.fixPlan.length, 1);
+    assert.equal(result.fixPlan[0].fileTarget, failingFile);
+    assert.equal(result.fixPlan[0].qaApproval, "approved");
+    assert.equal(result.subTasks[0].status, "pending");
+    assert.equal(recorder.snapshots.at(-1).node, "fix_plan");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("fix plan uses coding mode for coder and qa collaboration", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
   const failingFile = "src/middleware/authMiddleware.ts";
   const observedModes = [];
+  const observedTimeouts = [];
   await fs.mkdir(path.join(workspace, "src", "middleware"), { recursive: true });
   await fs.writeFile(path.join(workspace, failingFile), "export const auth = true;\n", "utf8");
 
@@ -144,6 +224,7 @@ test("fix plan uses coding mode for coder and qa collaboration", async () => {
       },
       async chat(_messages, _onEvent, options) {
         observedModes.push(options?.mode || "");
+        observedTimeouts.push(Number(options?.timeoutMs || 0));
         return {
           content: '{"overall_diagnosis":"token 校验逻辑不完整","items":[{"file":"src/middleware/authMiddleware.ts","issue_id":"BUG-001","my_understanding":"缺少 token 校验与 user 注入","proposed_change":"补全 token 解析、校验和 req.user 注入","confidence":"high"}]}',
         };
@@ -155,6 +236,7 @@ test("fix plan uses coding mode for coder and qa collaboration", async () => {
       },
       async chat(_messages, _onEvent, options) {
         observedModes.push(options?.mode || "");
+        observedTimeouts.push(Number(options?.timeoutMs || 0));
         return {
           content: '{"overall_assessment":"方案可行","items":[{"file":"src/middleware/authMiddleware.ts","approved":true,"feedback":""}],"additional_fixes":[]}',
         };
@@ -173,8 +255,192 @@ test("fix plan uses coding mode for coder and qa collaboration", async () => {
     );
 
     assert.deepEqual(observedModes, ["coding", "coding"]);
+    assert.equal(observedTimeouts.every((value) => value > 0), true);
     assert.equal(result.fixPlan.length, 1);
     assert.equal(result.fixPlan[0].fileTarget, failingFile);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("fix plan backfills missed reopen files from qa failures even when agents only discuss one file", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  await fs.writeFile(path.join(workspace, "package.json"), "{\n  \"name\": \"demo\"\n}\n", "utf8");
+  await fs.mkdir(path.join(workspace, "tests"), { recursive: true });
+  await fs.writeFile(path.join(workspace, "tests", "books.test.ts"), "describe('books', () => {});\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 3,
+    testResults: "FAIL tests/books.test.ts\nCannot find module 'express' from src/app.ts",
+    qaFailures: {
+      failedFiles: ["tests/books.test.ts", "package.json"],
+      testErrors: ["依赖缺失：package.json 中缺少 express"],
+      failedTestNames: [],
+    },
+    issueTracker: [
+      {
+        id: "BUG-001",
+        title: "依赖缺失导致测试失败",
+        description: "package.json 中缺少 express 运行时依赖，tests/books.test.ts 因此失败。",
+        severity: "major",
+        status: "open",
+        relatedFiles: ["tests/books.test.ts", "package.json"],
+        detectedRound: 3,
+      },
+    ],
+    subTasks: [
+      {
+        id: "task-package",
+        fileTarget: "package.json",
+        description: "配置依赖",
+        dependencies: [],
+        contextRequirement: "声明运行时依赖",
+        status: "completed",
+      },
+      {
+        id: "task-books-test",
+        fileTarget: "tests/books.test.ts",
+        description: "图书测试",
+        dependencies: ["package.json"],
+        contextRequirement: "验证图书接口",
+        status: "completed",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() {
+        return { name: "星河" };
+      },
+      async chat() {
+        return {
+          content: '{"overall_diagnosis":"测试文件直接暴露了依赖缺失问题","items":[{"file":"tests/books.test.ts","issue_id":"BUG-001","my_understanding":"需要修正测试用例以匹配当前服务入口","proposed_change":"更新 tests/books.test.ts 的导入和断言","confidence":"medium"}]}',
+        };
+      },
+    },
+    qa: {
+      getPersona() {
+        return { name: "清扬" };
+      },
+      async chat() {
+        return {
+          content: '{"overall_assessment":"测试文件方案不完整，还需要补齐配置文件，但这里先保持原样输出","items":[{"file":"tests/books.test.ts","approved":true,"feedback":""}],"additional_fixes":[]}',
+        };
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.fixPlan.some((item) => item.fileTarget === "tests/books.test.ts"), true);
+    assert.equal(result.fixPlan.some((item) => item.fileTarget === "package.json"), true);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "package.json").status, "pending");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("fix plan can parse conversational json code blocks without collapsing into empty plans", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const failingFile = "src/routes/books.ts";
+  await fs.mkdir(path.join(workspace, "src", "routes"), { recursive: true });
+  await fs.writeFile(path.join(workspace, failingFile), "export default {};\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 3,
+    testResults: "[Coder 阻塞失败]\nCoder 阻塞失败: src/routes/books.ts -> contract drift",
+    qaFailures: {
+      failedFiles: [failingFile],
+      testErrors: ["Coder 阻塞失败: src/routes/books.ts -> contract drift"],
+      failedTestNames: [],
+    },
+    issueTracker: [
+      {
+        id: "BUG-CODER-BLOCK-1",
+        title: "src/routes/books.ts 阻塞了本轮生成",
+        description: "路由文件与控制器命名导出契约不一致。",
+        severity: "major",
+        status: "open",
+        relatedFiles: [failingFile],
+        detectedRound: 3,
+      },
+    ],
+    subTasks: [
+      {
+        id: "task-route",
+        fileTarget: failingFile,
+        description: "实现图书路由",
+        dependencies: [],
+        contextRequirement: "保持命名导出与控制器一致",
+        status: "failed",
+        lastError: "contract drift",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() {
+        return { name: "星河" };
+      },
+      async chat() {
+        return {
+          content: `现在我完全理解了问题的根因。让我输出修复计划：
+
+\`\`\`json
+{
+  "overall_diagnosis": "路由层引用的控制器命名导出与现有实现不一致",
+  "items": [
+    {
+      "file": "src/routes/books.ts",
+      "issue_id": "BUG-CODER-BLOCK-1",
+      "my_understanding": "当前路由文件需要对齐控制器导出名称",
+      "proposed_change": "更新 routes/books.ts 的导入与绑定，使用控制器中实际存在的导出或新增别名导出",
+      "confidence": "high"
+    }
+  ]
+}
+\`\`\``,
+        };
+      },
+    },
+    qa: {
+      getPersona() {
+        return { name: "清扬" };
+      },
+      async chat() {
+        return {
+          content: '{"overall_assessment":"方案可执行","items":[{"file":"src/routes/books.ts","approved":true,"feedback":""}],"additional_fixes":[]}',
+        };
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.fixPlan.length, 1);
+    assert.equal(result.fixPlan[0].fileTarget, failingFile);
+    assert.match(result.fixPlan[0].diagnosis, /命名导出|控制器/);
+    assert.match(result.fixPlan[0].proposedChange, /routes\/books\.ts/);
   } finally {
     await removeTempWorkspace(workspace);
   }

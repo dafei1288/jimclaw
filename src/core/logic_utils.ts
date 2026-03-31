@@ -817,6 +817,10 @@ export function ensureRequirementDrivenFiles(
     ensureFile("docker-compose.yml");
   }
 
+  if (fileSet.has("Dockerfile") || fileSet.has("docker-compose.yml") || fileSet.has(".dockerignore")) {
+    ensureFile(".dockerignore");
+  }
+
   if (verifyScriptRequired) {
     ensureFile("scripts/verify.ps1");
   }
@@ -2212,6 +2216,348 @@ export function summarize${entityPascal}Inventory(records: ${entityPascal}Invent
 `;
 }
 
+function buildEntitySeedInputCode(entityStem: string): string {
+  switch (entityStem) {
+    case "book":
+      return `{
+  title: "示例图书",
+  author: "示例作者",
+  category: "默认分类",
+  isbn: "isbn-demo-001",
+  totalCopies: 3,
+  availableCopies: 3,
+  status: "available",
+}`;
+    case "product":
+      return `{
+  name: "示例商品",
+  sku: "sku-demo-001",
+  price: 99,
+  stock: 10,
+  status: "active",
+}`;
+    default:
+      return `{
+  name: "示例记录",
+  status: "active",
+}`;
+  }
+}
+
+function buildEntityModelScaffold(entityStem: string): string {
+  const singularStem = singularizeStem(entityStem) || "item";
+  const entityPascal = toPascalCase(singularStem) || "Item";
+  let shape = `  id: string;
+  name: string;
+  status: "active" | "inactive";
+  createdAt: string;
+  updatedAt: string;`;
+  let inputShape = `  name: string;
+  status?: "active" | "inactive";`;
+
+  if (singularStem === "book") {
+    shape = `  id: string;
+  title: string;
+  author: string;
+  category: string;
+  isbn: string;
+  totalCopies: number;
+  availableCopies: number;
+  status: "available" | "borrowed" | "reserved";
+  createdAt: string;
+  updatedAt: string;`;
+    inputShape = `  title: string;
+  author: string;
+  category?: string;
+  isbn: string;
+  totalCopies?: number;
+  availableCopies?: number;
+  status?: "available" | "borrowed" | "reserved";`;
+  } else if (singularStem === "product") {
+    shape = `  id: string;
+  name: string;
+  sku: string;
+  price: number;
+  stock: number;
+  status: "active" | "inactive";
+  createdAt: string;
+  updatedAt: string;`;
+    inputShape = `  name: string;
+  sku: string;
+  price?: number;
+  stock?: number;
+  status?: "active" | "inactive";`;
+  }
+
+  return `export interface ${entityPascal} {
+${shape}
+}
+
+export interface ${entityPascal}Input {
+${inputShape}
+}
+
+function build${entityPascal}Id(): string {
+  return "${singularStem}-" + Math.random().toString(36).slice(2, 10);
+}
+
+export function create${entityPascal}(input: ${entityPascal}Input): ${entityPascal} {
+  const now = new Date().toISOString();
+  return {
+    id: build${entityPascal}Id(),
+${singularStem === "book"
+    ? `    title: String(input.title || "").trim(),
+    author: String(input.author || "").trim(),
+    category: String(input.category || "未分类").trim(),
+    isbn: String(input.isbn || "").trim(),
+    totalCopies: Number(input.totalCopies || 1),
+    availableCopies: Number(input.availableCopies ?? input.totalCopies ?? 1),
+    status: input.status || "available",`
+    : singularStem === "product"
+      ? `    name: String(input.name || "").trim(),
+    sku: String(input.sku || "").trim(),
+    price: Number(input.price || 0),
+    stock: Number(input.stock || 0),
+    status: input.status || "active",`
+      : `    name: String(input.name || "").trim(),
+    status: input.status || "active",`}
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function update${entityPascal}FromPatch(
+  current: ${entityPascal},
+  patch: Partial<${entityPascal}Input>
+): ${entityPascal} {
+  return {
+    ...current,
+${singularStem === "book"
+    ? `    title: patch.title !== undefined ? String(patch.title).trim() : current.title,
+    author: patch.author !== undefined ? String(patch.author).trim() : current.author,
+    category: patch.category !== undefined ? String(patch.category).trim() : current.category,
+    isbn: patch.isbn !== undefined ? String(patch.isbn).trim() : current.isbn,
+    totalCopies: patch.totalCopies !== undefined ? Number(patch.totalCopies) : current.totalCopies,
+    availableCopies: patch.availableCopies !== undefined ? Number(patch.availableCopies) : current.availableCopies,
+    status: patch.status || current.status,`
+    : singularStem === "product"
+      ? `    name: patch.name !== undefined ? String(patch.name).trim() : current.name,
+    sku: patch.sku !== undefined ? String(patch.sku).trim() : current.sku,
+    price: patch.price !== undefined ? Number(patch.price) : current.price,
+    stock: patch.stock !== undefined ? Number(patch.stock) : current.stock,
+    status: patch.status || current.status,`
+      : `    name: patch.name !== undefined ? String(patch.name).trim() : current.name,
+    status: patch.status || current.status,`}
+    updatedAt: new Date().toISOString(),
+  };
+}
+`;
+}
+
+function buildAggregateCrudServiceScaffold(entityStem: string): string {
+  const singularStem = singularizeStem(entityStem) || "item";
+  const pluralStem = singularStem.endsWith("s") ? singularStem : `${singularStem}s`;
+  const entityPascal = toPascalCase(singularStem) || "Item";
+  const seedInput = buildEntitySeedInputCode(singularStem);
+  return `import {
+  ${entityPascal},
+  ${entityPascal}Input,
+  create${entityPascal} as create${entityPascal}Record,
+  update${entityPascal}FromPatch,
+} from "../models/${singularStem}";
+
+const ${pluralStem}Store: ${entityPascal}[] = [create${entityPascal}Record(${seedInput})];
+
+export function list${toPascalCase(pluralStem)}(): ${entityPascal}[] {
+  return ${pluralStem}Store.map((item) => ({ ...item }));
+}
+
+export function get${entityPascal}ById(id: string): ${entityPascal} | null {
+  return ${pluralStem}Store.find((item) => item.id === id) || null;
+}
+
+export function create${entityPascal}(input: ${entityPascal}Input): ${entityPascal} {
+  const created = create${entityPascal}Record(input);
+  ${pluralStem}Store.push(created);
+  return created;
+}
+
+export function update${entityPascal}(id: string, patch: Partial<${entityPascal}Input>): ${entityPascal} | null {
+  const index = ${pluralStem}Store.findIndex((item) => item.id === id);
+  if (index < 0) return null;
+  const updated = update${entityPascal}FromPatch(${pluralStem}Store[index], patch);
+  ${pluralStem}Store[index] = updated;
+  return updated;
+}
+
+export function update${entityPascal}Status(id: string, status: string): ${entityPascal} | null {
+  return update${entityPascal}(id, { status } as Partial<${entityPascal}Input>);
+}
+
+export function delete${entityPascal}(id: string): boolean {
+  const index = ${pluralStem}Store.findIndex((item) => item.id === id);
+  if (index < 0) return false;
+  ${pluralStem}Store.splice(index, 1);
+  return true;
+}
+
+export function borrow${entityPascal}(id: string): ${entityPascal} | null {
+  return update${entityPascal}Status(id, "borrowed");
+}
+
+export function return${entityPascal}(id: string): ${entityPascal} | null {
+  return update${entityPascal}Status(id, "available");
+}
+
+export function reserve${entityPascal}(id: string): ${entityPascal} | null {
+  return update${entityPascal}Status(id, "reserved");
+}
+`;
+}
+
+function buildEntityControllerScaffold(entityStem: string): string {
+  const singularStem = singularizeStem(entityStem) || "item";
+  const pluralStem = singularStem.endsWith("s") ? singularStem : `${singularStem}s`;
+  const entityPascal = toPascalCase(singularStem) || "Item";
+  const pluralPascal = toPascalCase(pluralStem) || "Items";
+  return `import { Request, Response } from "express";
+import {
+  list${pluralPascal} as list${pluralPascal}Records,
+  get${entityPascal}ById,
+  create${entityPascal} as create${entityPascal}Record,
+  update${entityPascal} as update${entityPascal}Record,
+  update${entityPascal}Status as update${entityPascal}StatusRecord,
+  delete${entityPascal} as delete${entityPascal}Record,
+  borrow${entityPascal} as borrow${entityPascal}Record,
+  return${entityPascal} as return${entityPascal}Record,
+  reserve${entityPascal} as reserve${entityPascal}Record,
+} from "../services/${singularStem}Service";
+
+export async function list${pluralPascal}(_req: Request, res: Response): Promise<void> {
+  const items = list${pluralPascal}Records();
+  res.status(200).json({ success: true, items, total: items.length });
+}
+
+export async function get${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const item = get${entityPascal}ById(resourceId);
+  if (!item) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item });
+}
+
+export async function create${entityPascal}(req: Request, res: Response): Promise<void> {
+  const created = create${entityPascal}Record(req.body || {});
+  res.status(201).json({ success: true, item: created });
+}
+
+export async function update${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const updated = update${entityPascal}Record(resourceId, req.body || {});
+  if (!updated) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item: updated });
+}
+
+export async function update${entityPascal}Status(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const updated = update${entityPascal}StatusRecord(resourceId, String(req.body?.status || "active"));
+  if (!updated) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item: updated });
+}
+
+export async function delete${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const deleted = delete${entityPascal}Record(resourceId);
+  if (!deleted) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(204).send();
+}
+
+export async function borrow${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const updated = borrow${entityPascal}Record(resourceId);
+  if (!updated) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item: updated });
+}
+
+export async function return${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const updated = return${entityPascal}Record(resourceId);
+  if (!updated) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item: updated });
+}
+
+export async function reserve${entityPascal}(req: Request, res: Response): Promise<void> {
+  const resourceId = Array.isArray(req.params.id) ? req.params.id[0] : req.params.id;
+  const updated = reserve${entityPascal}Record(resourceId);
+  if (!updated) {
+    res.status(404).json({ success: false, message: "${entityPascal} 不存在" });
+    return;
+  }
+  res.status(200).json({ success: true, item: updated });
+}
+`;
+}
+
+function buildAuthControllerScaffold(): string {
+  return `import { Request, Response } from "express";
+import { createAuthServiceState, createUser, login as loginWithPassword } from "../services/authService";
+
+const authState = createAuthServiceState();
+
+export async function register(req: Request, res: Response): Promise<void> {
+  try {
+    const user = createUser(authState, {
+      username: String(req.body?.username || ""),
+      password: String(req.body?.password || ""),
+      roles: Array.isArray(req.body?.roles) ? req.body.roles : ["member"],
+    });
+    res.status(201).json({ success: true, user });
+  } catch (error) {
+    res.status(400).json({
+      success: false,
+      message: error instanceof Error ? error.message : "注册失败",
+    });
+  }
+}
+
+export async function login(req: Request, res: Response): Promise<void> {
+  try {
+    const result = loginWithPassword(authState, {
+      username: String(req.body?.username || ""),
+      password: String(req.body?.password || ""),
+    });
+    res.status(200).json({
+      success: true,
+      token: result.session.token,
+      user: result.user,
+    });
+  } catch (error) {
+    res.status(401).json({
+      success: false,
+      message: error instanceof Error ? error.message : "登录失败",
+    });
+  }
+}
+`;
+}
+
 export function getDeterministicTemplateScaffold(
   state: JimClawState,
   fileTarget: string
@@ -2222,7 +2568,9 @@ export function getDeterministicTemplateScaffold(
   const port = state.manifest?.services?.[0]?.port || state.consensusCore?.port || 10000;
   const declaredFiles = new Set((state.spec?.filesToCreate || []).map((file) => String(file).replace(/\\/g, "/")));
   const codeMap = parseStateCodeMap(state);
-  const loggerModulePath = declaredFiles.has("src/middleware/logger.ts")
+  const loggerModulePath = declaredFiles.has("src/logging/logger.ts")
+    ? "./logging/logger"
+    : declaredFiles.has("src/middleware/logger.ts")
     ? "./middleware/logger"
     : declaredFiles.has("src/logger.ts")
       ? "./logger"
@@ -2259,6 +2607,28 @@ export function getDeterministicTemplateScaffold(
   const description = state.contract?.title || state.consensusCore?.projectTitle || "Express TypeScript service";
   const runtimeDeps = { ...(state.spec?.dependencies || {}) };
   const devDeps = { ...(state.spec?.devDependencies || {}) };
+
+  if (normalizedTarget === ".env.example") {
+    return `PORT=${port}
+NODE_ENV=development
+JWT_SECRET=change-me-in-production
+`;
+  }
+
+  if (normalizedTarget === ".dockerignore") {
+    return `node_modules
+dist
+coverage
+workspace
+audit
+.git
+.DS_Store
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+`;
+  }
 
   if (normalizedTarget === "package.json") {
     const language = String(state.spec?.language || "").toLowerCase();
@@ -2360,6 +2730,11 @@ export function getDeterministicTemplateScaffold(
 `;
   }
 
+  const modelMatch = normalizedTarget.match(/^src\/models\/([^/]+)\.(ts|js)$/i);
+  if (modelMatch) {
+    return buildEntityModelScaffold(modelMatch[1]);
+  }
+
   if (normalizedTarget === "src/errors.ts") {
     return buildErrorModuleScaffold();
   }
@@ -2383,6 +2758,11 @@ export function getDeterministicTemplateScaffold(
         ? "../logger"
         : "../middleware/logger";
     return buildAuthServiceScaffold(authLoggerImportPath);
+  }
+
+  const aggregateServiceMatch = normalizedTarget.match(/^src\/services\/(.+?)Service\.(ts|js)$/i);
+  if (aggregateServiceMatch && !/^auth/i.test(aggregateServiceMatch[1]) && !/(Query|Mutation|Inventory)$/i.test(aggregateServiceMatch[1])) {
+    return buildAggregateCrudServiceScaffold(aggregateServiceMatch[1]);
   }
 
   const splitServiceMatch = normalizedTarget.match(/^src\/services\/(.+?)(Query|Mutation|Inventory)Service\.(ts|js)$/i);
@@ -2612,6 +2992,42 @@ export function requireRole(...allowedRoles: string[]): RequestHandler {
 `;
   }
 
+  if (/^src\/controllers\/authController\.(ts|js)$/i.test(normalizedTarget)) {
+    return buildAuthControllerScaffold();
+  }
+
+  const controllerMatch = normalizedTarget.match(/^src\/controllers\/(.+?)Controller\.(ts|js)$/i);
+  if (controllerMatch && !/^auth$/i.test(controllerMatch[1])) {
+    return buildEntityControllerScaffold(controllerMatch[1]);
+  }
+
+  if (/^src\/routes\/auth\.(ts|js)$/i.test(normalizedTarget)) {
+    const ownedEndpoints = inferOwnedEndpoints(normalizedTarget, state.apiContract);
+    const hasAuthMiddleware = declaredFiles.has("src/middleware/auth.ts");
+    const needsLogin = ownedEndpoints.some((endpoint) => /POST\s+\/api\/auth\/login$/i.test(endpoint));
+    const needsRegister = ownedEndpoints.some((endpoint) => /POST\s+\/api\/auth\/register$/i.test(endpoint));
+    const needsProfile = ownedEndpoints.some((endpoint) => /GET\s+\/api\/auth\/me$/i.test(endpoint));
+    const controllerImports = [
+      needsLogin ? "login" : "",
+      needsRegister ? "register" : "",
+    ].filter(Boolean);
+    return `import { Router${needsProfile ? ", Request, Response" : ""} } from "express";
+${controllerImports.length > 0 ? `import { ${controllerImports.join(", ")} } from "../controllers/authController";\n` : ""}${hasAuthMiddleware && needsProfile ? 'import { authMiddleware } from "../middleware/auth";\n' : ""}
+
+const router = Router();
+
+${needsLogin ? 'router.post("/login", login);\n' : ""}${needsRegister ? 'router.post("/register", register);\n' : ""}${hasAuthMiddleware && needsProfile ? `router.get("/me", authMiddleware, (req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    user: req.user || null,
+  });
+});
+` : ""}
+
+export default router;
+`;
+  }
+
   const crudRouteMatch = normalizedTarget.match(/^src\/routes\/([^/]+)\.(ts|js)$/);
   if (crudRouteMatch && !/health$/i.test(crudRouteMatch[1])) {
     const ownedEndpoints = inferOwnedEndpoints(normalizedTarget, state.apiContract);
@@ -2687,7 +3103,21 @@ ${routeImports.map((item) => `app.use("${item.mountPath}", ${item.identifier});`
 ${hasHealthRoute
   ? ""
   : `app.get("/api/health", (_req: Request, res: Response) => {
-  res.status(200).json({ success: true });
+  res.status(200).json({
+    success: true,
+    status: "ok",
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: "1.0.0",
+  });
+});
+
+app.get("/api/health/ping", (_req: Request, res: Response) => {
+  res.status(200).json({
+    success: true,
+    message: "pong",
+    timestamp: new Date().toISOString(),
+  });
 });
 `}
 ${hasFrontendPage ? `app.get("/", (_req: Request, res: Response) => {
@@ -3877,6 +4307,7 @@ function orderFilesByPreferredSequence(files: string[]): string[] {
     "README.md",
     "Dockerfile",
     "docker-compose.yml",
+    ".dockerignore",
   ];
   return [...files].sort((left, right) => {
     const leftIndex = preferredOrder.indexOf(left);
@@ -3984,6 +4415,7 @@ function buildBoundedCrudFilePlan(spec: any, requirementProtocol: RequirementPro
   if (requirementProtocol?.capabilities?.dockerRequired) {
     push("Dockerfile");
     push("docker-compose.yml");
+    push(".dockerignore");
   }
 
   if (framework === "vitest") {

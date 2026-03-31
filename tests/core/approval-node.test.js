@@ -42,7 +42,7 @@ test("approval auto-approves requirements checkpoint when default authorization 
   }
 });
 
-test("approval marks solution checkpoint as pending manual confirmation when not auto-approved", async () => {
+test("approval enters pending state instead of blocking for manual confirmation", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
   const state = createBaseState({
@@ -57,33 +57,27 @@ test("approval marks solution checkpoint as pending manual confirmation when not
 
   try {
     const events = [];
-    const approvals = [];
     const result = await approvalNode(
       state,
       {},
       workspace,
       (type, sender, content, metadata) => events.push({ type, sender, content, metadata }),
       createNoopStartSpan,
-      recorder.save,
-      async (request) => {
-        approvals.push(request);
-        return { approved: true };
-      }
+      recorder.save
     );
 
-    assert.equal(result.requiresApproval, false);
+    assert.equal(result.requiresApproval, true);
+    assert.equal(result.pendingApprovalStage, "solution");
     assert.equal(result.approvalNextNode, "contract_sync");
-    assert.equal(approvals.length, 1);
-    assert.equal(approvals[0].stage, "solution");
-    assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approved, true);
-    assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approvedBy, "customer");
+    assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approved, false);
     assert.equal(events.some((event) => event.type === "approval_required"), true);
+    assert.equal(recorder.snapshots.some((item) => item.node === "approval_pending"), true);
   } finally {
     await removeTempWorkspace(workspace);
   }
 });
 
-test("approval throws when manual confirmation is required but no approval channel exists", async () => {
+test("approval resumes immediately after customer decision was already persisted", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
   const state = createBaseState({
@@ -94,20 +88,30 @@ test("approval throws when manual confirmation is required but no approval chann
       autoApprove: { requirements: true, solution: false, deploy: false },
       summaries: { solution: "方案待确认" },
     }),
+    pendingApprovalStage: "solution",
+    approvalNextNode: "contract_sync",
   });
 
   try {
-    await assert.rejects(
-      approvalNode(
-        state,
-        {},
-        workspace,
-        createNoopEmit,
-        createNoopStartSpan,
-        recorder.save
-      ),
-      /未提供审批通道/
+    state.customerApprovalState.checkpoints = state.customerApprovalState.checkpoints.map((checkpoint) =>
+      checkpoint.stage === "solution"
+        ? { ...checkpoint, approved: true, approvedBy: "customer", timestamp: "2026-03-29 15:00:00" }
+        : checkpoint
     );
+
+    const result = await approvalNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.requiresApproval, false);
+    assert.equal(result.pendingApprovalStage, null);
+    assert.equal(result.approvalNextNode, "contract_sync");
+    assert.equal(result.customerApprovalState.checkpoints.find((item) => item.stage === "solution").approvedBy, "customer");
   } finally {
     await removeTempWorkspace(workspace);
   }

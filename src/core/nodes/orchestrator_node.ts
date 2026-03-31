@@ -1,4 +1,4 @@
-import { BaseAgent } from "../agent";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import { ConsensusProgress, JimClawState } from "../graph_types";
 import {
   buildExecutionPlan,
@@ -7,15 +7,23 @@ import {
   buildRequirementProtocol,
   buildSystemContext,
   buildValidationReport,
-  ensureRequirementDrivenFiles,
-  ensureTypeScriptTestBaseline,
   findExecutionPlanGaps,
   generateFallbackSubTasks,
   normalizeNodeJestTestFilePath,
-  normalizeNodeProjectFileLayout,
+  stabilizeSpecForExecution,
   writeMeetingNote,
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
+
+const ORCHESTRATOR_MODEL_TIMEOUT_MS = 10000;
+
+function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
+  return (
+    error instanceof AgentTimeoutError ||
+    error instanceof AgentServiceUnavailableError ||
+    error instanceof AgentResourceExhaustedError
+  );
+}
 
 export async function orchestratorNode(
   state: JimClawState,
@@ -29,9 +37,7 @@ export async function orchestratorNode(
   emit("phase-change", "System", "planning");
 
   const requirementProtocol = state.requirementProtocol || buildRequirementProtocol(state.contract);
-  const spec = normalizeNodeProjectFileLayout(
-    ensureTypeScriptTestBaseline(ensureRequirementDrivenFiles(state.spec, requirementProtocol))
-  );
+  const spec = stabilizeSpecForExecution(state.spec, requirementProtocol);
   const executionProtocol = state.executionProtocol || buildExecutionProtocol(spec, state.manifest, state.apiContract, requirementProtocol);
 
   const orchestratorPrompt = `请基于以下技术方案和 API 契约，将开发任务拆解为有序的文件级子任务列表。
@@ -63,13 +69,23 @@ ${JSON.stringify(executionProtocol, null, 2)}
 
 直接输出 JSON 数组，不要额外解释。`;
 
-  const response = await agents.pm.chat(
-    [{ role: "user", content: orchestratorPrompt }],
-    (ev) => emit(ev.type, ev.sender, "正在拆解任务", ev),
-    { brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-  );
-
-  let rawSubTasks = parseJsonFromResponse(extractText(response.content), []);
+  let rawSubTasks: any[] = [];
+  try {
+    const response = await agents.pm.chat(
+      [{ role: "user", content: orchestratorPrompt }],
+      (ev) => emit(ev.type, ev.sender, "正在拆解任务", ev),
+      {
+        brief: buildSystemContext(state),
+        workspaceDir: WORKSPACE,
+        timeoutMs: ORCHESTRATOR_MODEL_TIMEOUT_MS,
+      }
+    );
+    rawSubTasks = parseJsonFromResponse(extractText(response.content), []);
+  } catch (error: any) {
+    if (!isRecoverableAgentError(error)) throw error;
+    emit("thinking", "System", `任务拆解模型暂不可用，改用确定性子任务骨架继续执行：${error.message || error}`, {});
+    rawSubTasks = generateFallbackSubTasks(spec, state.apiContract);
+  }
   const filesToCreate = spec?.filesToCreate || [];
   const createdInTasks = rawSubTasks.map((task: any) => task.fileTarget);
   const missingFiles = filesToCreate.filter((file: string) => !createdInTasks.includes(file));

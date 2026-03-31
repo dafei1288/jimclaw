@@ -1,11 +1,21 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState, ApiEndpointSchema } from "../graph_types";
-import { BaseAgent } from "../agent";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import {
   buildSystemContext
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
+
+const CONTRACT_SYNC_MODEL_TIMEOUT_MS = 10000;
+
+function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
+  return (
+    error instanceof AgentTimeoutError ||
+    error instanceof AgentServiceUnavailableError ||
+    error instanceof AgentResourceExhaustedError
+  );
+}
 
 /**
  * ContractSync 节点：负责同步和校验 API 契约
@@ -47,9 +57,25 @@ ${validationErrors.length > 0 ? validationErrors.join("\n") : "无"}
 
 请直接输出修正后的完整 API 契约 JSON（保持原有格式），如无需修改则原样返回。`;
 
-  const response = await agents.architect.chat([{ role: "user", content: contractReviewPrompt }], (ev: any) => emit(ev.type, ev.sender, "正在审查契约", ev), { brief: buildSystemContext(state), workspaceDir: WORKSPACE });
-  const validatedContract = parseJsonFromResponse(extractText(response.content), state.apiContract);
+  let validatedContract = state.apiContract;
+  try {
+    const response = await agents.architect.chat(
+      [{ role: "user", content: contractReviewPrompt }],
+      (ev: any) => emit(ev.type, ev.sender, "正在审查契约", ev),
+      {
+        brief: buildSystemContext(state),
+        workspaceDir: WORKSPACE,
+        timeoutMs: CONTRACT_SYNC_MODEL_TIMEOUT_MS,
+      }
+    );
+    validatedContract = parseJsonFromResponse(extractText(response.content), state.apiContract);
+  } catch (error: any) {
+    if (!isRecoverableAgentError(error)) throw error;
+    emit("thinking", "System", `契约校验模型暂不可用，沿用当前 API 契约继续执行：${error.message || error}`, {});
+  }
 
   await fs.writeFile(path.join(WORKSPACE, "api_contract_validated.json"), JSON.stringify(validatedContract, null, 2));
-  return { apiContract: validatedContract };
+  const result = { apiContract: validatedContract };
+  await saveBoulder({ ...state, ...result }, "contract_sync");
+  return result;
 }

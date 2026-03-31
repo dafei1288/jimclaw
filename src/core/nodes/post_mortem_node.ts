@@ -13,5 +13,9 @@ export async function postMortemNode(
   saveBoulder: any
 ) {
   emit("phase-change", "System", "review");
-  return { teamChatLog: [{ sender: agents.pm.getPersona().name, content: "复盘完成。" }] };
+  const result = {
+    teamChatLog: [{ sender: agents.pm.getPersona().name, content: "复盘完成。" }],
+  };
+  await saveBoulder({ ...state, ...result }, "post_mortem");
+  return result;
 }

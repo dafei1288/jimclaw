@@ -29,11 +29,13 @@ test("deploy health check uses localhost while preserving public url for display
 });
 
 test("deploy launch command persists pid and startup log paths", () => {
-  const command = buildDeployLaunchCommand("npm start");
+  const command = buildDeployLaunchCommand("npm start", { port: 10000 });
 
   assert.match(command, /server\.pid/);
   assert.match(command, /server\.log/);
-  assert.match(command, /nohup sh -c "npm start"/);
+  assert.match(command, /PORT=10000/);
+  assert.match(command, /HOST=0\.0\.0\.0/);
+  assert.match(command, /nohup sh -c "PORT=10000 HOST=0\.0\.0\.0 npm start"/);
 });
 
 test("deploy health check path prefers protocol runtime then dedicated health endpoints", () => {
@@ -99,6 +101,16 @@ test("deploy precondition failure blocks deploy when current infra state already
       lastFailureSummary: "",
     }) || "",
     /未获得可用容器/
+  );
+
+  assert.equal(
+    getDeployPreconditionFailure({
+      executionBackend: "host",
+      containerId: "",
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    }),
+    null
   );
 
   assert.equal(
@@ -170,6 +182,324 @@ test("deploy retries transient launch exec failure before final health verificat
     assert.equal(launchCalls, 2);
     assert.equal(result.deploymentStatus.status, "running");
     assert.equal(result.lastFailedNode, "");
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy starts and verifies service on host backend without requiring container", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  const commands = [];
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command, workDir }) => {
+    commands.push({ command, workDir });
+    if (command.startsWith("powershell -NoProfile -Command") || command.startsWith("mkdir -p .jimclaw")) {
+      return "Output:\n4321\nErrors:\n";
+    }
+    if (command.startsWith("curl ")) {
+      return "Output:\n200\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        containerId: "",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.deploymentStatus.status, "running");
+    assert.equal(commands.some((item) => item.workDir === workspace && (item.command.startsWith("powershell -NoProfile -Command") || item.command.startsWith("mkdir -p .jimclaw"))), true);
+    assert.equal(commands.some((item) => item.command.startsWith("curl ")), true);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy host backend uses a valid windows powershell -Command separator", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  const commands = [];
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command, workDir }) => {
+    commands.push({ command, workDir });
+    if (command.startsWith("powershell -NoProfile -Command ") || command.startsWith("mkdir -p .jimclaw")) {
+      return "Output:\n4321\nErrors:\n";
+    }
+    if (command.startsWith("curl ")) {
+      return "Output:\n200\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        containerId: "",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const hostLaunch = commands.find((item) => item.command.startsWith("powershell -NoProfile -Command "));
+    assert.equal(Boolean(hostLaunch), true);
+    assert.match(hostLaunch.command, /^powershell -NoProfile -Command "/);
+    if (process.platform === "win32") {
+      assert.match(hostLaunch.command, /RedirectStandardOutput \$stdoutLogPath/);
+      assert.match(hostLaunch.command, /RedirectStandardError \$stderrLogPath/);
+      assert.doesNotMatch(hostLaunch.command, /RedirectStandardOutput \$logPath -RedirectStandardError \$logPath/);
+    }
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy host backend fails fast when launch output has no valid pid", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  let curlCalled = false;
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith("powershell -NoProfile -Command ") || command.startsWith("mkdir -p .jimclaw")) {
+      return [
+        "Output:",
+        "PID=",
+        "",
+        "Errors:",
+        "Start-Process : RedirectStandardOutput and RedirectStandardError are same.",
+      ].join("\n");
+    }
+    if (command.startsWith("curl ")) {
+      curlCalled = true;
+      return "Output:\n000\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        containerId: "",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          entryPoint: "src/index.ts",
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.deploymentStatus.status, "failed");
+    assert.equal(result.lastFailedNode, "deploy");
+    assert.match(result.lastFailureSummary || "", /部署启动失败/);
+    assert.equal(curlCalled, false);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy failure emits structured runtime gap diagnostics instead of raw text only", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith('docker exec -d container-123 sh -c')) {
+      return "Output:\n\nErrors:\n";
+    }
+    if (command.startsWith("curl ")) {
+      return "Output:\n000\nErrors:\n";
+    }
+    if (command.startsWith("docker exec container-123 sh -c \"netstat")) {
+      return "Output:\n\nErrors:\n";
+    }
+    if (command.startsWith("docker exec container-123 sh -c \"cat /tmp/jimclaw/server.log")) {
+      return "Output:\nlisten EADDRNOTAVAIL\nErrors:\n";
+    }
+    if (command.startsWith("docker exec container-123 sh -c \"cat /tmp/jimclaw/server.pid")) {
+      return "Output:\n123\nErrors:\n";
+    }
+    if (command.startsWith("docker logs container-123")) {
+      return "Output:\napp crashed on startup\nlisten EADDRNOTAVAIL\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        containerId: "container-123",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          entryPoint: "src/index.ts",
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.deploymentStatus.status, "failed");
+    assert.equal(result.validationReport.failureType, "runtime_gap");
+    assert.equal(result.repairPlan.repairType, "runtime");
+    assert.match(result.lastFailureSummary || "", /EADDRNOTAVAIL|监听地址不可用|部署验证失败/);
+    assert.equal(result.protocolFailures.some((item) => item.type === "runtime_mismatch"), true);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy falls back to alternate reachable health path before classifying runtime failure", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  const curlCommands = [];
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith('docker exec -d container-123 sh -c')) {
+      return "Output:\n\nErrors:\n";
+    }
+    if (command.startsWith("curl ")) {
+      curlCommands.push(command);
+      if (command.includes("http://127.0.0.1:4000/api/health")) {
+        return "Output:\n000\nErrors:\n";
+      }
+      if (command.includes("http://127.0.0.1:4000/")) {
+        return "Output:\n200\nErrors:\n";
+      }
+      return "Output:\n000\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        containerId: "container-123",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        executionProtocol: {
+          runtime: { healthCheckPath: "/api/health" },
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.deploymentStatus.status, "running");
+    assert.equal(curlCommands.some((command) => command.includes("http://127.0.0.1:4000/api/health")), true);
+    assert.equal(curlCommands.some((command) => command.includes("http://127.0.0.1:4000/")), true);
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
     GetServerIPSkill.config.run = originalGetServerIP;

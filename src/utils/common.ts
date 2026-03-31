@@ -37,6 +37,54 @@ export function extractText(content: any): string {
 /**
  * 鲁棒的 JSON 解析器，支持提取 Markdown 中的 JSON 块
  */
+function extractBalancedJsonBlock(text: string, openChar: "{" | "["): string | null {
+  const closeChar = openChar === "{" ? "}" : "]";
+  const start = text.indexOf(openChar);
+  if (start < 0) return null;
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+        continue;
+      }
+      if (char === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (char === "\"") {
+      inString = true;
+      continue;
+    }
+
+    if (char === openChar) {
+      depth += 1;
+      continue;
+    }
+
+    if (char === closeChar) {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, index + 1);
+      }
+    }
+  }
+
+  return null;
+}
+
 export function parseJsonFromResponse(content: string, defaultValue: any): any {
   const text = content.trim();
   const hasBrackets = /[\{\}\[\]]/.test(text);
@@ -53,14 +101,14 @@ export function parseJsonFromResponse(content: string, defaultValue: any): any {
     if (typeof result === 'object' && result !== null) return result;
   } catch (e) {}
 
-  const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
-  if (arrayMatch) {
-    try { return JSON.parse(arrayMatch[0]); } catch {}
+  const objectBlock = extractBalancedJsonBlock(cleaned, "{");
+  if (objectBlock) {
+    try { return JSON.parse(objectBlock); } catch {}
   }
 
-  const objMatch = cleaned.match(/\{[\s\S]*\}/);
-  if (objMatch) {
-    try { return JSON.parse(objMatch[0]); } catch {}
+  const arrayBlock = extractBalancedJsonBlock(cleaned, "[");
+  if (arrayBlock) {
+    try { return JSON.parse(arrayBlock); } catch {}
   }
 
   return defaultValue;

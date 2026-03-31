@@ -1,15 +1,17 @@
 import { JimClawState } from "../graph_types";
-import { execInContainer, writeMeetingNote } from "../logic_utils";
+import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
+import * as fs from "fs/promises";
+import * as path from "path";
 
 function isRetryableDeployLaunchFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
 }
 
 function isCommandFailureOutput(output: string): boolean {
-  return /^Command failed with exit code\s+\d+/i.test(String(output || "").trim());
+  return /^Command failed with (exit code\s+\d+|error:)/i.test(String(output || "").trim());
 }
 
 async function launchServiceWithRetry(
@@ -65,7 +67,24 @@ export function getHealthCheckPath(state: JimClawState): string {
   return "/";
 }
 
+function getHealthCheckCandidatePaths(state: JimClawState): string[] {
+  const preferred = getHealthCheckPath(state);
+  const candidates = [
+    preferred,
+    "/api/health",
+    "/health",
+    "/",
+  ];
+  return Array.from(new Set(candidates.filter(Boolean)));
+}
+
 export function getDeployPreconditionFailure(state: JimClawState): string | null {
+  if (state.executionBackend === "host") {
+    if (String(state.lastFailedNode || "") === "infra_setup") {
+      return String(state.lastFailureSummary || "") || "宿主机基础设施尚未成功，禁止继续进入部署验证。";
+    }
+    return null;
+  }
   const currentFailureNode = String(state.lastFailedNode || "");
   const currentFailureSummary = String(state.lastFailureSummary || "");
   if (currentFailureNode === "infra_setup") {
@@ -80,8 +99,170 @@ export function getDeployPreconditionFailure(state: JimClawState): string | null
   return null;
 }
 
-export function buildDeployLaunchCommand(runCmd: string) {
-  const escapedRunCmd = runCmd.replace(/"/g, '\\"');
+function getHostRuntimeArtifactPaths(workspace: string) {
+  return {
+    runtimeDir: path.join(workspace, ".jimclaw"),
+    pidPath: path.join(workspace, ".jimclaw", "server.pid"),
+    logPath: path.join(workspace, ".jimclaw", "server.log"),
+    stdoutLogPath: path.join(workspace, ".jimclaw", "server.stdout.log"),
+    stderrLogPath: path.join(workspace, ".jimclaw", "server.stderr.log"),
+  };
+}
+
+function escapePowerShellSingleQuoted(text: string): string {
+  return String(text || "").replace(/'/g, "''");
+}
+
+function buildHostDeployLaunchCommand(workspace: string, runCmd: string, port: number) {
+  const { pidPath, stdoutLogPath, stderrLogPath } = getHostRuntimeArtifactPaths(workspace);
+  if (process.platform === "win32") {
+    const escapedCmd = escapePowerShellSingleQuoted(runCmd);
+    const escapedPid = escapePowerShellSingleQuoted(pidPath);
+    const escapedStdoutLog = escapePowerShellSingleQuoted(stdoutLogPath);
+    const escapedStderrLog = escapePowerShellSingleQuoted(stderrLogPath);
+    const escapedWorkspace = escapePowerShellSingleQuoted(workspace);
+    return [
+      "powershell -NoProfile -Command ",
+      `"`,
+      `$pidPath='${escapedPid}'; `,
+      `$stdoutLogPath='${escapedStdoutLog}'; `,
+      `$stderrLogPath='${escapedStderrLog}'; `,
+      `New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($pidPath)) | Out-Null; `,
+      `if (Test-Path $pidPath) { $oldPid = Get-Content $pidPath -ErrorAction SilentlyContinue; if ($oldPid) { Stop-Process -Id $oldPid -Force -ErrorAction SilentlyContinue } } `,
+      `$env:PORT='${port}'; $env:HOST='0.0.0.0'; `,
+      `$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','${escapedCmd}' -WorkingDirectory '${escapedWorkspace}' -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath -PassThru; `,
+      `Set-Content -Path $pidPath -Value $p.Id; Write-Output $p.Id`,
+      `"`
+    ].join("");
+  }
+  return [
+    "mkdir -p .jimclaw",
+    "if [ -f .jimclaw/server.pid ]; then kill $(cat .jimclaw/server.pid) 2>/dev/null || true; fi",
+    `PORT=${port} HOST=0.0.0.0 nohup sh -c ${JSON.stringify(runCmd)} > .jimclaw/server.log 2>&1 & echo $! > .jimclaw/server.pid`,
+    "cat .jimclaw/server.pid",
+  ].join("; ");
+}
+
+function unwrapShellOutput(raw: string): string {
+  const text = String(raw || "");
+  const match = text.match(/Output:\n([\s\S]*?)(?:\nErrors:|$)/);
+  return (match ? match[1] : text).trim();
+}
+
+function extractShellErrors(raw: string): string {
+  const text = String(raw || "");
+  const match = text.match(/\nErrors:\n([\s\S]*)$/);
+  return (match ? match[1] : "").trim();
+}
+
+function parseHostLaunchResult(raw: string): { pid: number; errors: string; text: string } {
+  const text = unwrapShellOutput(raw);
+  const errors = extractShellErrors(raw);
+  const pidMatch = text.match(/\b(\d+)\b/g);
+  const pid = pidMatch?.length ? Number(pidMatch[pidMatch.length - 1]) : 0;
+  return { pid, errors, text };
+}
+
+function buildDeployRuntimeFailureArtifacts(
+  state: JimClawState,
+  summary: string,
+  evidence: string[]
+) {
+  const targetFile =
+    state.spec?.entryPoint ||
+    state.executionProtocol?.project?.workspaceLayout?.entryFiles?.[0] ||
+    undefined;
+  const validationReport = buildValidationReport(
+    [
+      {
+        summary,
+        file: targetFile,
+        evidence,
+      },
+    ],
+    { failureType: "runtime_gap", blocking: true }
+  );
+
+  return {
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    protocolFailures: [
+      {
+        type: "runtime_mismatch" as const,
+        node: "deploy",
+        file: targetFile,
+        summary,
+        evidence,
+        blocking: true,
+      },
+    ],
+  };
+}
+
+function classifyDeploymentVerificationFailure(args: {
+  state: JimClawState;
+  targetInternalPort: number;
+  publicUrl: string;
+  healthCheckTarget: string;
+  lastError: string;
+  internalAudit: string;
+  processLog: string;
+  pidInfo: string;
+  logs: string;
+}) {
+  const internalAuditText = unwrapShellOutput(args.internalAudit);
+  const processLogText = unwrapShellOutput(args.processLog);
+  const pidInfoText = unwrapShellOutput(args.pidInfo);
+  const logsText = unwrapShellOutput(args.logs);
+  const runtimeText = [processLogText, logsText].filter(Boolean).join("\n");
+  const actualPortMatch = internalAuditText.match(/:(\d+)\b/);
+  const actualPort = actualPortMatch ? actualPortMatch[1] : "";
+
+  let summary = `部署验证失败：无法访问 ${args.healthCheckTarget}`;
+  let diagnosis = `[部署验证失败] 无法访问 ${args.healthCheckTarget}（对外地址 ${args.publicUrl}）。`;
+
+  if (/EADDRNOTAVAIL/i.test(runtimeText)) {
+    summary = "服务启动崩溃：监听地址不可用（EADDRNOTAVAIL）";
+    diagnosis += `\n[审计结果]: 服务进程在容器内启动失败，日志显示监听地址不可用（EADDRNOTAVAIL）。`;
+  } else if (/EADDRINUSE/i.test(runtimeText)) {
+    summary = "服务启动崩溃：监听端口已被占用（EADDRINUSE）";
+    diagnosis += `\n[审计结果]: 服务进程在容器内启动失败，日志显示监听端口已被占用（EADDRINUSE）。`;
+  } else if (internalAuditText.includes(String(args.targetInternalPort))) {
+    summary = `容器内已监听目标端口 ${args.targetInternalPort}，但健康检查仍不可达`;
+    diagnosis += `\n[审计结果]: 容器内部确实在监听端口 ${args.targetInternalPort}，但外部仍不可访问。可能是端口映射、宿主网络或健康检查路径问题。`;
+  } else if (actualPort) {
+    summary = `端口错配：预期监听 ${args.targetInternalPort}，实际监听 ${actualPort}`;
+    diagnosis += `\n[审计结果]: 端口错配。系统预期监听 ${args.targetInternalPort}，但容器内实际似乎在监听 ${actualPort}。`;
+  } else {
+    summary = `服务未成功监听目标端口 ${args.targetInternalPort}`;
+    diagnosis += `\n[审计结果]: 未发现容器内对目标端口 ${args.targetInternalPort} 的有效监听，服务大概率尚未成功启动。`;
+  }
+
+  const errorMsg = `${diagnosis}\n[错误信息]: ${args.lastError}\n[服务进程PID]:\n${args.pidInfo}\n[服务启动日志]:\n${args.processLog}\n[容器运行日志]:\n${args.logs}`;
+  const evidence = [
+    summary,
+    `healthCheck=${args.healthCheckTarget}`,
+    args.lastError,
+    internalAuditText,
+    processLogText,
+    pidInfoText,
+    logsText,
+  ].filter(Boolean);
+
+  return { summary, diagnosis, errorMsg, evidence };
+}
+
+export function buildDeployLaunchCommand(
+  runCmd: string,
+  options: { port?: number; host?: string } = {}
+) {
+  const runtimeHost = options.host || "0.0.0.0";
+  const runtimePrefix = [
+    options.port ? `PORT=${options.port}` : "",
+    runtimeHost ? `HOST=${runtimeHost}` : "",
+  ].filter(Boolean).join(" ");
+  const effectiveRunCmd = runtimePrefix ? `${runtimePrefix} ${runCmd}` : runCmd;
+  const escapedRunCmd = effectiveRunCmd.replace(/"/g, '\\"');
   return [
     "mkdir -p /tmp/jimclaw",
     "if [ -f /tmp/jimclaw/server.pid ]; then kill $(cat /tmp/jimclaw/server.pid) 2>/dev/null || true; fi",
@@ -104,6 +285,7 @@ export async function deployNode(
   startSpan("deploy");
   emit("phase-change", "System", "deployment");
   const round = state.retryCount || 0;
+  const executionBackend = state.executionBackend || "docker";
   
   // 1. 获取宿主机真实 IP 和端口映射
   const ip = await GetServerIPSkill.config.run({});
@@ -131,7 +313,11 @@ export async function deployNode(
   
   const { publicUrl, healthCheckUrl } = buildDeploymentUrls(ip, hostPort);
   const healthCheckPath = getHealthCheckPath(state);
-  const healthCheckTarget = `${healthCheckUrl}${healthCheckPath === "/" ? "" : healthCheckPath}`;
+  let healthCheckTarget = `${healthCheckUrl}${healthCheckPath === "/" ? "" : healthCheckPath}`;
+  const healthCheckCandidates = getHealthCheckCandidatePaths(state).map((candidatePath) => ({
+    path: candidatePath,
+    target: `${healthCheckUrl}${candidatePath === "/" ? "" : candidatePath}`,
+  }));
   const runCmd = state.spec?.runCommand || "npm start";
   const preconditionFailure = getDeployPreconditionFailure(state);
 
@@ -147,6 +333,7 @@ export async function deployNode(
       `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：跳过\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
     );
     const result = {
+      executionBackend,
       deploymentStatus: { url: publicUrl, status: "failed" as const },
       testResults: `${state.testResults || ""}\n${errorMsg}`.trim(),
       isDone: false,
@@ -161,15 +348,44 @@ export async function deployNode(
   await AuditLogger.log(
     WORKSPACE,
     "Infrastructure",
-    `### [Deployment Start]\n**Public URL:** ${publicUrl}\n**Health Check URL:** ${healthCheckTarget}\n**Command:** ${runCmd}`
+    `### [Deployment Start]\n**Backend:** ${executionBackend}\n**Public URL:** ${publicUrl}\n**Health Check URL:** ${healthCheckTarget}\n**Command:** ${runCmd}`
   );
 
   // 2. 启动服务
-  const launchCommand = buildDeployLaunchCommand(runCmd);
+  const launchCommand = executionBackend === "host"
+    ? buildHostDeployLaunchCommand(WORKSPACE, runCmd, parseInt(hostPort, 10))
+    : buildDeployLaunchCommand(runCmd, { port: targetInternalPort, host: "0.0.0.0" });
   try {
-    await launchServiceWithRetry(WORKSPACE, state.containerId, launchCommand);
+    if (executionBackend === "host") {
+      const launchOut = await ShellExecuteSkill.config.run({
+        command: launchCommand,
+        workDir: WORKSPACE,
+        timeout: 30000,
+      });
+      if (isCommandFailureOutput(launchOut)) {
+        throw new Error(`服务启动失败：${launchOut}`);
+      }
+      const parsedLaunch = parseHostLaunchResult(launchOut);
+      if (parsedLaunch.pid <= 0) {
+        const evidence = [parsedLaunch.text, parsedLaunch.errors].filter(Boolean).join("\n");
+        throw new Error(`服务启动失败：未获得有效进程 PID${evidence ? `\n${evidence}` : ""}`);
+      }
+      const pid = parsedLaunch.pid;
+      const hostArtifacts = getHostRuntimeArtifactPaths(WORKSPACE);
+      await fs.mkdir(hostArtifacts.runtimeDir, { recursive: true });
+      if (pid > 0) {
+        await fs.writeFile(hostArtifacts.pidPath, String(pid), "utf-8");
+      }
+    } else {
+      await launchServiceWithRetry(WORKSPACE, state.containerId, launchCommand);
+    }
   } catch (error: any) {
     const errorMsg = `[部署启动失败] ${error.message || error}`;
+    const runtimeArtifacts = buildDeployRuntimeFailureArtifacts(
+      state,
+      "部署启动失败：容器内服务进程未成功拉起",
+      [String(error.message || error)]
+    );
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Launch Failed\n${errorMsg}`);
     const note = await writeMeetingNote(
       WORKSPACE,
@@ -180,9 +396,11 @@ export async function deployNode(
       `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：失败\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
     );
     const result = {
+      executionBackend,
       deploymentStatus: { url: publicUrl, status: "failed" as const },
       testResults: `${state.testResults || ""}\n${errorMsg}`.trim(),
       isDone: false,
+      ...runtimeArtifacts,
       meetingNotes: [note],
       lastFailedNode: "deploy",
       lastFailureSummary: errorMsg,
@@ -197,20 +415,32 @@ export async function deployNode(
   let lastError = "";
 
   for (let i = 0; i < 10; i++) { // 尝试 10 次，每次间隔 3s
-    try {
-      // 在宿主机执行 curl 探测
-      const curlOut = await ShellExecuteSkill.config.run({ 
-        command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${healthCheckTarget}`,
-        timeout: 5000
-      });
-      const codeMatch = curlOut.match(/\b(200|201|204|301|302|404)\b/);
-      if (codeMatch) {
-        isAccessible = true;
-        break;
+    for (const candidate of healthCheckCandidates) {
+      try {
+        const curlOut = await ShellExecuteSkill.config.run({ 
+          command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${candidate.target}`,
+          timeout: 5000
+        });
+        const codeMatch = curlOut.match(/\b(200|201|204|301|302|404)\b/);
+        if (codeMatch) {
+          isAccessible = true;
+          if (candidate.target !== healthCheckTarget) {
+            await AuditLogger.log(
+              WORKSPACE,
+              "Infrastructure",
+              `**Health Check Fallback:** 主检查路径不可达，改用 ${candidate.path} 成功通过`
+            );
+            healthCheckTarget = candidate.target;
+          }
+          break;
+        }
+        lastError = `HTTP Code: ${curlOut}`;
+      } catch (e: any) {
+        lastError = e.message || String(e);
       }
-      lastError = `HTTP Code: ${curlOut}`;
-    } catch (e: any) {
-      lastError = e.message || String(e);
+    }
+    if (isAccessible) {
+      break;
     }
     await new Promise(resolve => setTimeout(resolve, 3000));
   }
@@ -228,6 +458,7 @@ export async function deployNode(
       `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：成功\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n`
     );
     const result = {
+      executionBackend,
       deploymentStatus: { url: publicUrl, status: "running" as const },
       meetingNotes: [note],
       lastFailedNode: "",
@@ -237,29 +468,59 @@ export async function deployNode(
     return result;
   } else {
     // 【终极审计逻辑】：如果不通，深挖容器内部监听状态
-    const internalAudit = await ShellExecuteSkill.config.run({ 
-      command: `docker exec ${state.containerId} sh -c "netstat -tlnp || ss -tlnp || lsof -i -P -n" 2>/dev/null || echo "无法获取容器内监听状态"` 
-    });
-    
-    const processLog = await ShellExecuteSkill.config.run({
-      command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.log 2>/dev/null || true"`,
-    });
-    const pidInfo = await ShellExecuteSkill.config.run({
-      command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.pid 2>/dev/null || true"`,
-    });
-    const logs = await ShellExecuteSkill.config.run({ command: `docker logs ${state.containerId} --tail 200` });
-    
-    let diagnosis = `[部署验证失败] 无法访问 ${healthCheckTarget}（对外地址 ${publicUrl}）。`;
-    if (internalAudit.includes(String(targetInternalPort))) {
-      diagnosis += `\n[审计结果]: 容器内部确实在监听端口 ${targetInternalPort}，但外部无法访问。可能是宿主机防火墙、Docker 映射延迟或网络隔离问题。`;
-    } else {
-      const actualPortMatch = internalAudit.match(/:(\d+)\s/);
-      const actualPort = actualPortMatch ? actualPortMatch[1] : "未知";
-      diagnosis += `\n[审计结果]: 端口错配！系统预期监听 ${targetInternalPort}，但容器内实际似乎在监听 ${actualPort}。`;
-      diagnosis += `\n[决策建议]: Coder 必须检查源码中的 listen() 调用，确保其严格使用了端口 ${targetInternalPort}。`;
-    }
+    let internalAudit = "";
+    let processLog = "";
+    let pidInfo = "";
+    let logs = "";
 
-    const errorMsg = `${diagnosis}\n[错误信息]: ${lastError}\n[服务进程PID]:\n${pidInfo}\n[服务启动日志]:\n${processLog}\n[容器运行日志]:\n${logs}`;
+    if (executionBackend === "host") {
+      const hostArtifacts = getHostRuntimeArtifactPaths(WORKSPACE);
+      internalAudit = await ShellExecuteSkill.config.run({
+        command: process.platform === "win32"
+          ? `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize"`
+          : `sh -c "ss -tlnp || netstat -tlnp || lsof -i -P -n"`,
+        workDir: WORKSPACE,
+        timeout: 10000,
+      }).catch((error: any) => String(error?.message || error || ""));
+      const stdoutLog = await fs.readFile(hostArtifacts.stdoutLogPath, "utf-8").catch(() => "");
+      const stderrLog = await fs.readFile(hostArtifacts.stderrLogPath, "utf-8").catch(() => "");
+      processLog = [stdoutLog, stderrLog].filter(Boolean).join("\n");
+      if (!processLog) {
+        processLog = await fs.readFile(hostArtifacts.logPath, "utf-8").catch(() => "");
+      }
+      pidInfo = await fs.readFile(hostArtifacts.pidPath, "utf-8").catch(() => "");
+      logs = processLog;
+    } else {
+      internalAudit = await ShellExecuteSkill.config.run({ 
+        command: `docker exec ${state.containerId} sh -c "netstat -tlnp || ss -tlnp || lsof -i -P -n" 2>/dev/null || echo "无法获取容器内监听状态"` 
+      });
+      
+      processLog = await ShellExecuteSkill.config.run({
+        command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.log 2>/dev/null || true"`,
+      });
+      pidInfo = await ShellExecuteSkill.config.run({
+        command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.pid 2>/dev/null || true"`,
+      });
+      logs = await ShellExecuteSkill.config.run({ command: `docker logs ${state.containerId} --tail 200` });
+    }
+    
+    const classifiedFailure = classifyDeploymentVerificationFailure({
+      state,
+      targetInternalPort,
+      publicUrl,
+      healthCheckTarget,
+      lastError,
+      internalAudit,
+      processLog,
+      pidInfo,
+      logs,
+    });
+    const runtimeArtifacts = buildDeployRuntimeFailureArtifacts(
+      state,
+      classifiedFailure.summary,
+      classifiedFailure.evidence
+    );
+    const errorMsg = classifiedFailure.errorMsg;
     console.error(`[System] ${errorMsg}`);
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Failed Verification\n${errorMsg}`);
 
@@ -272,12 +533,14 @@ export async function deployNode(
       `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：失败\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n\n## 错误详情\n\`\`\`text\n${errorMsg}\n\`\`\`\n`
     );
     const result = {
+      executionBackend,
       deploymentStatus: { url: publicUrl, status: "failed" as const },
       testResults: (state.testResults || "") + "\n" + errorMsg,
       isDone: false,
+      ...runtimeArtifacts,
       meetingNotes: [note],
       lastFailedNode: "deploy",
-      lastFailureSummary: diagnosis,
+      lastFailureSummary: classifiedFailure.summary,
     };
     await saveBoulder({ ...state, ...result }, "deploy");
     return result;

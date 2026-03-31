@@ -72,6 +72,19 @@ export function getVerifierNextNode(state: JimClawState): "coder" | "architect" 
   return "qa";
 }
 
+export function getInfraNextNode(state: JimClawState): "terminal" | "qa" {
+  const output = `${state.testResults || ""}\n${state.lastFailureSummary || ""}\n${state.blockedReason || ""}`;
+  if (!state.containerId && /(基础设施|docker|docker-compose|spawn EPERM|spawn ENOENT|EACCES|OCI runtime|容器未成功启动)/i.test(output)) {
+    return "qa";
+  }
+  return "terminal";
+}
+
+function isHostEnvironmentBlocked(state: JimClawState): boolean {
+  const output = `${state.testResults || ""}\n${state.lastFailureSummary || ""}\n${state.blockedReason || ""}`;
+  return /(spawn EPERM|spawn ENOENT|docker(\.exe)? .*not found|docker-compose .*not found|Docker Desktop is not running|permission denied while trying to connect to the Docker daemon|无法连接 Docker|宿主环境阻塞)/i.test(output);
+}
+
 export function getQaNextNode(
   state: JimClawState,
   maxRetries: number
@@ -86,6 +99,9 @@ export function getQaNextNode(
   if (state.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
     if (shouldRequireApproval(state, "deploy")) return "approval";
     return "deploy";
+  }
+  if (failureType === "environment_gap" && isHostEnvironmentBlocked(state)) {
+    return "post_mortem";
   }
   if (failureType === "environment_gap" && (((state.sameFailureCount || 0) >= 2) || ((state.retryCount || 0) >= maxRetries))) {
     return "post_mortem";
@@ -349,8 +365,9 @@ export async function createJimClawGraph(agents: {
     const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
     return hasPending ? "coder" : "infra_setup";
   }), { qa: "qa", coder: "coder", infra_setup: "infra_setup", agent_pending: "agent_pending" });
-  workflow.addConditionalEdges("infra_setup", routeWithAgentPending(() => "terminal"), {
+  workflow.addConditionalEdges("infra_setup", routeWithAgentPending((s) => getInfraNextNode(s)), {
     terminal: "terminal",
+    qa: "qa",
     agent_pending: "agent_pending",
   });
   workflow.addConditionalEdges("terminal", routeWithAgentPending(() => "verifier"), {

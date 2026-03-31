@@ -2,6 +2,7 @@ import { Annotation, StateGraph } from "@langchain/langgraph";
 import { BaseMessage } from "@langchain/core/messages";
 import { z } from "zod";
 import { GenerationStage, FileGenerationState, PhasedGenerationConfig } from "./phased_generation";
+import { ExecutorState } from "../executor/types";
 
 /**
  * 任务契约：PM 下发给团队的标准指令
@@ -288,6 +289,7 @@ export type ProtocolFileRole =
   | "route"
   | "controller"
   | "service"
+  | "repository"
   | "model"
   | "middleware"
   | "test"
@@ -338,6 +340,16 @@ export interface SolutionProtocol {
   };
 }
 
+export type BackendFramework =
+  | "express-typescript"
+  | "fastapi-python"
+  | "gin-go"
+  | "spring-java"
+  | "rust-web"
+  | "unknown";
+
+export type ProjectRuntime = "node" | "python" | "go" | "java" | "rust" | "unknown";
+
 export interface TechnologyDecision {
   version: "v1";
   source: "user" | "architect";
@@ -349,7 +361,7 @@ export interface TechnologyDecision {
   };
   backend: {
     required: boolean;
-    framework: "express-typescript" | "fastapi-python" | "gin-go" | "unknown";
+    framework: BackendFramework;
     entryFiles: string[];
   };
   database: {
@@ -396,7 +408,7 @@ export interface ExecutionProtocol {
   project: {
     language: string;
     framework: string;
-    runtime: "node" | "python" | "go" | "unknown";
+    runtime: ProjectRuntime;
     workspaceLayout: {
       sourceRoots: string[];
       testRoots: string[];
@@ -486,11 +498,13 @@ export interface RuntimeStateSnapshot {
   hostDepsReady: boolean;
   testRuntimeReady: boolean;
   deployRuntimeReady: boolean;
+  executionBackend?: "docker" | "host";
   containerId?: string;
   hostPort?: number;
   containerPort?: number;
   deploymentUrl?: string;
   startupLogPath?: string;
+  runtimePid?: number;
   tokenUsage?: TokenUsageSummary;
 }
 
@@ -653,6 +667,15 @@ export const JimClawState = Annotation.Root({
   containerId: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),
+  executionBackend: Annotation<"docker" | "host" | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  hostRuntimePid: Annotation<number | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  hostRuntimeLogPath: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
   maxRetries: Annotation<number>({
     reducer: (x, y) => y ?? x,
   }),
@@ -678,6 +701,18 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y ?? x,
   }),
   blockedReason: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  validationCheckpointRequested: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  validationCheckpointCompleted: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  validationCheckpointReason: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  resumeAfterValidation: Annotation<boolean>({
     reducer: (x, y) => y ?? x,
   }),
   resumeFromNode: Annotation<string>({
@@ -745,10 +780,22 @@ export const JimClawState = Annotation.Root({
   customerApprovalState: Annotation<CustomerApprovalState | null>({
     reducer: (x, y) => y ?? x,
   }),
+  executorState: Annotation<ExecutorState | null>({
+    reducer: (x, y) => y ?? x,
+  }),
   pendingApprovalStage: Annotation<ApprovalStage | null>({
     reducer: (x, y) => y ?? x,
   }),
   approvalNextNode: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  agentRecoveryPending: Annotation<boolean>({
+    reducer: (x, y) => y ?? x,
+  }),
+  agentRecoveryNode: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  agentRecoveryReason: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),
   protocolFailures: Annotation<ProtocolFailure[]>({

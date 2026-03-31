@@ -1,6 +1,7 @@
 import { JimClawState } from "../graph_types";
 import { execInContainer, extractFailureEvidence, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
+import { ShellExecuteSkill } from "../../skills/shell_exec";
 
 function isRetryableTerminalExecFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
@@ -20,8 +21,38 @@ export async function terminalNode(
   startSpan("terminal");
   emit("phase-change", "System", "verification");
   const testCmd = state.spec?.testCommand || "npm test";
+  const executionBackend = state.executionBackend || "docker";
   
-  await AuditLogger.log(WORKSPACE, "Terminal", `### [Test Execution]\n\n**Command:** ${testCmd}\n**Container:** ${state.containerId}`);
+  await AuditLogger.log(
+    WORKSPACE,
+    "Terminal",
+    `### [Test Execution]\n\n**Command:** ${testCmd}\n**Backend:** ${executionBackend}\n**Container:** ${state.containerId}`
+  );
+
+  if (executionBackend === "host") {
+    const hostResult = await ShellExecuteSkill.config.run({
+      command: testCmd,
+      workDir: WORKSPACE,
+      timeout: 90000,
+    });
+    await AuditLogger.log(WORKSPACE, "Terminal", `**Host Test Output:**\n${hostResult}`);
+    const evidence = extractFailureEvidence(hostResult, state.deploymentStatus, state.blockedReason);
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-terminal-r${state.retryCount || 0}`,
+      "terminal",
+      state.retryCount || 0,
+      evidence.hasBlockingFailure ? `Terminal 第${state.retryCount || 0}轮：宿主机测试失败` : `Terminal 第${state.retryCount || 0}轮：宿主机测试通过`,
+      `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 命令：${testCmd}\n- 后端：host\n- 结论：${evidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${hostResult}\n\`\`\`\n`
+    );
+    return {
+      testResults: hostResult,
+      meetingNotes: [note],
+      blockedReason: "",
+      lastFailedNode: evidence.hasBlockingFailure ? state.lastFailedNode : "",
+      lastFailureSummary: evidence.hasBlockingFailure ? state.lastFailureSummary : "",
+    };
+  }
   
   if (!state.containerId) {
     // 保留 infra_node 写入的构建错误（如 Dockerfile 错误），不用通用信息覆盖
