@@ -87,6 +87,33 @@ function extractContainerId(raw: string): string {
   return "";
 }
 
+function readRuntimeRepairEvidence(state: JimClawState): string {
+  return [
+    state.lastFailureSummary || "",
+    ...(state.repairPlan?.expectedEvidence || []),
+    ...(state.validationReport?.findings || []).flatMap((finding: any) => [
+      finding?.summary || "",
+      ...(finding?.evidence || []),
+    ]),
+  ].filter(Boolean).join("\n");
+}
+
+function shouldReuseAllocatedHostPort(state: JimClawState): boolean {
+  return state.repairPlan?.repairType === "runtime" && Number(state.allocatedHostPort || 0) > 0;
+}
+
+function shouldCleanRuntimeProcess(state: JimClawState): boolean {
+  return /EADDRINUSE/i.test(readRuntimeRepairEvidence(state));
+}
+
+function buildRuntimeCleanupCommand(): string {
+  return [
+    "if [ -f /tmp/jimclaw/server.pid ]; then kill $(cat /tmp/jimclaw/server.pid) 2>/dev/null || true; fi",
+    "rm -f /tmp/jimclaw/server.pid",
+    "pkill -f \"node|npm|tsx|ts-node\" 2>/dev/null || true",
+  ].join("; ");
+}
+
 async function runInfraContainerCommand(
   workspace: string,
   containerId: string,
@@ -139,8 +166,18 @@ export async function infraNode(
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
   
   // 1. 获取宿主机空闲端口
-  let hostPortOut = await FindFreePortSkill.config.run({ start_port: 4000, end_port: 5000 });
-  let hostPort = parseInt(hostPortOut.replace(/\D/g, ""), 10) || 4000;
+  let hostPort = 0;
+  if (shouldReuseAllocatedHostPort(state)) {
+    hostPort = Number(state.allocatedHostPort || 0);
+    await AuditLogger.log(
+      WORKSPACE,
+      "Infrastructure",
+      `**Runtime Recovery:** 复用上一轮宿主机端口 ${hostPort}，避免 runtime 修复阶段端口漂移`
+    );
+  } else {
+    const hostPortOut = await FindFreePortSkill.config.run({ start_port: 4000, end_port: 5000 });
+    hostPort = parseInt(hostPortOut.replace(/\D/g, ""), 10) || 4000;
+  }
   
   // 强力审计：严禁占用系统保留端口 (如 3000)
   const SYSTEM_RESERVED_PORTS = [3000, 3001, 3306, 5432, 6379];
@@ -295,7 +332,7 @@ export async function infraNode(
     }
   } else {
     // 3. 安全清理并启动单容器 (带端口映射)
-    await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` });
+    await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName}` }).catch(() => {});
     let startOut = "";
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
@@ -309,7 +346,7 @@ export async function infraNode(
       }
       if (!isDockerPortConflict(startOut)) {
         if (isRetryableDockerStartupFailure(startOut)) {
-          await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` }).catch(() => {});
+          await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName}` }).catch(() => {});
           await AuditLogger.log(
             WORKSPACE,
             "Infrastructure",
@@ -360,6 +397,27 @@ export async function infraNode(
   } catch {}
 
   try {
+    if (shouldCleanRuntimeProcess(state)) {
+      await AuditLogger.log(
+        WORKSPACE,
+        "Infrastructure",
+        `**Runtime Recovery:** 检测到 EADDRINUSE，先清理容器内残留服务进程`
+      );
+      await runInfraContainerCommand(
+        WORKSPACE,
+        containerId,
+        buildRuntimeCleanupCommand(),
+        "runtime cleanup",
+        30000
+      ).catch(async (error: any) => {
+        await AuditLogger.log(
+          WORKSPACE,
+          "Infrastructure",
+          `**Runtime Recovery Warning:** 清理残留进程失败，继续后续流程\n${String(error?.message || error || "")}`
+        );
+      });
+    }
+
     if (hasPackageJson) {
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (npm install)`);
       const installOut = hasCompose

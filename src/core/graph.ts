@@ -1,12 +1,12 @@
 import { StateGraph, START, END } from "@langchain/langgraph";
-import { BaseAgent } from "./agent";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "./agent";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { ModelManager } from "../utils/models";
 import { JimClawState } from "./graph_types";
 import { getBeijingTime } from "../utils/common";
 import { getTemplateEngine } from "./template_engine";
-import { buildCheckpointMeta, buildTraceIndex, extractFailureEvidence, recordNodeFailure, recoverWorkspaceFromWriteIntents, shouldPersistCheckpoint } from "./logic_utils";
+import { buildCheckpointMeta, buildRepairPlan, buildTraceIndex, buildValidationReport, extractFailureEvidence, recordNodeFailure, recoverWorkspaceFromWriteIntents, shouldPersistCheckpoint } from "./logic_utils";
 import { AuditLogger } from "../utils/audit";
 
 // 导入重构后的节点函数
@@ -31,6 +31,20 @@ function logPrefix(agentName: string = "System"): string {
   return `[${getBeijingTime()}] [${agentName}]`;
 }
 
+function isAgentRecoveryError(error: unknown): error is AgentServiceUnavailableError | AgentResourceExhaustedError | AgentTimeoutError {
+  return error instanceof AgentServiceUnavailableError || error instanceof AgentResourceExhaustedError || error instanceof AgentTimeoutError;
+}
+
+function routeWithAgentPending<T extends string>(
+  resolver: (state: JimClawState) => T,
+  pendingNode: string = "agent_pending"
+) {
+  return (state: JimClawState): T | typeof pendingNode => {
+    if (state.agentRecoveryPending) return pendingNode;
+    return resolver(state);
+  };
+}
+
 type ApprovalDecision = {
   approved: boolean;
   reason?: string;
@@ -43,6 +57,7 @@ type ApprovalRequest = {
 };
 
 export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "infra_setup" | "qa" {
+  if (state.agentRecoveryPending) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
     return "qa";
   }
@@ -57,12 +72,45 @@ export function getVerifierNextNode(state: JimClawState): "coder" | "architect" 
   return "qa";
 }
 
+export function getQaNextNode(
+  state: JimClawState,
+  maxRetries: number
+): "approval" | "deploy" | "architect" | "env_guard" | "infra_setup" | "post_mortem" | "architect_mediation" | "fix_plan" | "coder" {
+  if (state.agentRecoveryPending) return "coder";
+  const openIssues = (state.issueTracker || []).filter((issue: any) => issue.status === "open");
+  const blockingProtocolFailures = (state.protocolFailures || []).filter((failure: any) => failure?.blocking);
+  const failureEvidence = extractFailureEvidence(state.testResults || "", state.deploymentStatus, state.blockedReason);
+  const failureType = state.validationReport?.failureType;
+
+  if (state.resumeAfterValidation) return "coder";
+  if (state.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
+    if (shouldRequireApproval(state, "deploy")) return "approval";
+    return "deploy";
+  }
+  if (failureType === "environment_gap" && (((state.sameFailureCount || 0) >= 2) || ((state.retryCount || 0) >= maxRetries))) {
+    return "post_mortem";
+  }
+  if (failureType === "planning_gap") return "architect";
+  if (failureType === "environment_gap") return "env_guard";
+  if (failureType === "runtime_gap") return "infra_setup";
+  if (state.recoveredEnvironment) return "infra_setup";
+  if ((state.sameFailureCount || 0) >= 2) return "post_mortem";
+  if ((state.retryCount || 0) >= maxRetries) return "post_mortem";
+  if ((state.retryCount || 0) >= 2 && ((state.retryCount || 0) - 2) % 3 === 0) return "architect_mediation";
+  return "fix_plan";
+}
+
+export function getDeployNextNode(state: JimClawState): "qa" | "post_mortem" {
+  if (state.deploymentStatus?.status === "failed" && state.validationReport?.failureType === "runtime_gap") {
+    return "qa";
+  }
+  return "post_mortem";
+}
+
 function shouldRequireApproval(
   state: JimClawState,
-  stage: "requirements" | "solution" | "deploy",
-  requestApproval?: (request: ApprovalRequest) => Promise<ApprovalDecision>
+  stage: "requirements" | "solution" | "deploy"
 ) {
-  if (!requestApproval) return false;
   const checkpoint = state.customerApprovalState?.checkpoints?.find((item) => item.stage === stage);
   return Boolean(checkpoint?.required) && !checkpoint?.approved;
 }
@@ -150,6 +198,29 @@ export async function createJimClawGraph(agents: {
     } catch (error: any) {
       try {
         const { failure, meetingNotes } = await recordNodeFailure(WORKSPACE, state, nodeName, error);
+        if (isAgentRecoveryError(error)) {
+          const validationReport = buildValidationReport(
+            [{
+              summary: `${nodeName} 模型服务暂不可用`,
+              evidence: [error.message || failure.summary],
+            }],
+            { failureType: "environment_gap", blocking: true }
+          );
+          const pendingState = {
+            ...state,
+            meetingNotes,
+            lastFailedNode: failure.node,
+            lastFailureSummary: failure.summary,
+            validationReport,
+            repairPlan: buildRepairPlan(validationReport),
+            agentRecoveryPending: true,
+            agentRecoveryNode: nodeName,
+            agentRecoveryReason: error.message || failure.summary,
+            resumeFromNode: nodeName,
+          } as JimClawState;
+          await saveBoulder(pendingState, "agent_pending");
+          return pendingState;
+        }
         await saveBoulder({
           ...state,
           meetingNotes,
@@ -194,6 +265,8 @@ export async function createJimClawGraph(agents: {
     .addNode("architect", withNodeGuard("architect", (s) => architectNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("contract_sync", withNodeGuard("contract_sync", (s) => contractSyncNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("approval", withNodeGuard("approval", (s) => approvalNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder, options?.requestApproval)))
+    .addNode("approval_pending", async (s: JimClawState) => s)
+    .addNode("agent_pending", async (s: JimClawState) => s)
     .addNode("orchestrator", withNodeGuard("orchestrator", (s) => orchestratorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("coder", withNodeGuard("coder", (s) => coderNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("env_guard", withNodeGuard("env_guard", (s) => envGuardNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -228,74 +301,74 @@ export async function createJimClawGraph(agents: {
     persistence: "persistence",
     architect_mediation: "architect_mediation",
     fix_plan: "fix_plan",
+    approval_pending: "approval_pending",
+    agent_pending: "agent_pending",
   });
-  workflow.addConditionalEdges("pm", (s) => {
-    if (shouldRequireApproval(s, "requirements", options?.requestApproval)) return "approval";
+  workflow.addConditionalEdges("pm", routeWithAgentPending((s) => {
+    if (shouldRequireApproval(s, "requirements")) return "approval";
     return "architect";
-  }, { approval: "approval", architect: "architect" });
-  workflow.addConditionalEdges("architect", (s) => {
-    if (shouldRequireApproval(s, "solution", options?.requestApproval)) return "approval";
+  }), { approval: "approval", architect: "architect", agent_pending: "agent_pending" });
+  workflow.addConditionalEdges("architect", routeWithAgentPending((s) => {
+    if (shouldRequireApproval(s, "solution")) return "approval";
     return "contract_sync";
-  }, { approval: "approval", contract_sync: "contract_sync" });
-  workflow.addEdge("contract_sync", "orchestrator");
-  workflow.addConditionalEdges("approval", (s) => s.approvalNextNode || "orchestrator", {
+  }), { approval: "approval", contract_sync: "contract_sync", agent_pending: "agent_pending" });
+  workflow.addConditionalEdges("contract_sync", routeWithAgentPending(() => "orchestrator"), {
+    orchestrator: "orchestrator",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("approval", routeWithAgentPending((s) => {
+    if (s.requiresApproval) return "approval_pending";
+    return s.approvalNextNode || "orchestrator";
+  }), {
+    approval_pending: "approval_pending",
     architect: "architect",
     contract_sync: "contract_sync",
     orchestrator: "orchestrator",
     deploy: "deploy",
+    agent_pending: "agent_pending",
   });
-  workflow.addEdge("orchestrator", "env_guard");
+  workflow.addEdge("approval_pending", END);
+  workflow.addEdge("agent_pending", END);
+  workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => "env_guard"), {
+    env_guard: "env_guard",
+    agent_pending: "agent_pending",
+  });
   // coder 有 pending 任务时继续循环自身，全部完成后进入 infra。
   // 若环境尚未准备好，则先回到 env_guard。
-  workflow.addConditionalEdges("coder", (s) => {
+  workflow.addConditionalEdges("coder", routeWithAgentPending((s) => {
     if (s.blockedReason) return "qa";
+    if (s.validationCheckpointRequested) return "env_guard";
     const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
     if (hasPending) return "coder";
-    return s.envReady === false ? "env_guard" : "infra_setup";
-  }, { coder: "coder", env_guard: "env_guard", infra_setup: "infra_setup", qa: "qa" });
+    return "env_guard";
+  }), { coder: "coder", env_guard: "env_guard", infra_setup: "infra_setup", qa: "qa", agent_pending: "agent_pending" });
 
-  workflow.addConditionalEdges("env_guard", (s) => {
+  workflow.addConditionalEdges("env_guard", routeWithAgentPending((s) => {
     if (s.envReady === false) return "qa";
+    if (s.validationCheckpointRequested) return "infra_setup";
     const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
     return hasPending ? "coder" : "infra_setup";
-  }, { qa: "qa", coder: "coder", infra_setup: "infra_setup" });
-  workflow.addEdge("infra_setup", "terminal");
-  workflow.addEdge("terminal", "verifier");
+  }), { qa: "qa", coder: "coder", infra_setup: "infra_setup", agent_pending: "agent_pending" });
+  workflow.addConditionalEdges("infra_setup", routeWithAgentPending(() => "terminal"), {
+    terminal: "terminal",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("terminal", routeWithAgentPending(() => "verifier"), {
+    verifier: "verifier",
+    agent_pending: "agent_pending",
+  });
 
   // verifier：文件缺失直回 coder；其他失败按 ValidationReport.failureType 直接分流，减少无效 QA 自旋
-  workflow.addConditionalEdges("verifier", (s) => getVerifierNextNode(s), {
+  workflow.addConditionalEdges("verifier", routeWithAgentPending((s) => getVerifierNextNode(s)), {
     coder: "coder",
     architect: "architect",
     env_guard: "env_guard",
     infra_setup: "infra_setup",
     qa: "qa",
+    agent_pending: "agent_pending",
   });
 
-  workflow.addConditionalEdges("qa", (s) => {
-    const openIssues = (s.issueTracker || []).filter((issue: any) => issue.status === "open");
-    const blockingProtocolFailures = (s.protocolFailures || []).filter((failure: any) => failure?.blocking);
-    const failureEvidence = extractFailureEvidence(s.testResults || "", s.deploymentStatus, s.blockedReason);
-    const failureType = s.validationReport?.failureType;
-    if (s.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
-      if (shouldRequireApproval(s, "deploy", options?.requestApproval)) return "approval";
-      return "deploy";
-    }
-    if (failureType === "planning_gap") return "architect";
-    if (failureType === "environment_gap") return "env_guard";
-    if (failureType === "runtime_gap") return "infra_setup";
-    if (s.recoveredEnvironment) return "infra_setup";
-    if ((s.sameFailureCount || 0) >= 2) return "post_mortem";
-    if (s.retryCount >= maxRetries) return "post_mortem";
-
-    // 每 3 轮失败强制触发一次架构仲裁（retryCount = 2, 5, 8, 11...）
-    // 仲裁后直接去 coder（仲裁指令本身已足够精确，不需要再 fix_plan 协商）
-    if (s.retryCount >= 2 && (s.retryCount - 2) % 3 === 0) {
-      return "architect_mediation";
-    }
-
-    // 其他情况：先走 QA-Coder 协商，确认修复方向后再实现
-    return "fix_plan";
-  }, {
+  workflow.addConditionalEdges("qa", routeWithAgentPending((s) => getQaNextNode(s, maxRetries)), {
     approval: "approval",
     deploy: "deploy",
     architect: "architect",
@@ -304,24 +377,37 @@ export async function createJimClawGraph(agents: {
     post_mortem: "post_mortem",
     architect_mediation: "architect_mediation",
     fix_plan: "fix_plan",
+    coder: "coder",
+    agent_pending: "agent_pending",
   });
 
   // 仲裁完直接去 coder（仲裁指令已够精确）
-  workflow.addEdge("architect_mediation", "coder");
-  workflow.addConditionalEdges("fix_plan", (s) => {
+  workflow.addConditionalEdges("architect_mediation", routeWithAgentPending(() => "coder"), {
+    coder: "coder",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("fix_plan", routeWithAgentPending((s) => {
     const repairType = s.repairPlan?.repairType;
     if (repairType === "planning") return "architect";
     if (repairType === "environment") return "env_guard";
     if (repairType === "runtime") return "infra_setup";
     return "coder";
-  }, {
+  }), {
     architect: "architect",
     env_guard: "env_guard",
     infra_setup: "infra_setup",
     coder: "coder",
+    agent_pending: "agent_pending",
   });
-  workflow.addEdge("deploy", "post_mortem");
-  workflow.addEdge("post_mortem", "persistence");
+  workflow.addConditionalEdges("deploy", routeWithAgentPending((s) => getDeployNextNode(s)), {
+    qa: "qa",
+    post_mortem: "post_mortem",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("post_mortem", routeWithAgentPending(() => "persistence"), {
+    persistence: "persistence",
+    agent_pending: "agent_pending",
+  });
   workflow.addEdge("persistence", END);
 
   return workflow.compile();

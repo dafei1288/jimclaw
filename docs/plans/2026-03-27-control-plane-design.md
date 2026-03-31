@@ -19,6 +19,7 @@
 4. 每个节点只有明确输入、明确输出、明确否决权
 5. 规划错误、实现错误、环境错误、运行错误必须走不同回路
 6. 一旦发现需求覆盖缺失，必须强制重规划，不能继续空转
+7. 简单单体 CRUD 项目必须在架构阶段被压回可执行预算，不能把 20 分钟任务扩成 60+ 文件长链
 
 ## 设计原则
 
@@ -41,6 +42,40 @@
 ### 5. 补丁必须生效
 
 `ProtocolPatch`、`SolutionPatch`、`ExecutionPatch` 不能只记录在 state 里，必须真正改变下一轮的 `SolutionPlan` 或 `ExecutionPlan`。
+
+### 6. 预算先于执行
+
+控制平面不仅要判断“缺不缺文件”，还要判断“任务图是不是已经失控”。
+
+如果是简单单体 CRUD 项目，却被扩成双套前端目录、双套测试框架、同义文件并存的大任务图，那么问题属于 `planning_gap`，必须在 Architect / Orchestrator 阶段被压缩，而不是把 60+ 个文件原样交给 Coder 首轮串行产出。
+
+## 2026-03-31 现状补充
+
+到 2026-03-31 为止，这份设计里已有三类机制被实际代码验证：
+
+1. 恢复入口不再固定回到 `pm`
+   - 当前 workspace 恢复时，会根据真实快照节点决定恢复入口
+   - `coder_task_*` 这类动态节点恢复到 `coder`
+   - `qa` 快照恢复时保留 `testResults/qaFailures/blockedReason`，继续走 `qa_resume_router`
+
+2. 简单 CRUD 场景的确定性骨架继续扩大，但仍保持模板级泛化
+   - `package.json` 在 architect 给空依赖时，会按需求兜底补运行时依赖
+   - `tests/health.test.ts`、`tests/auth.test.ts`、`tests/books.test.ts`、`scripts/verify.ts` 已进入更强的确定性脚手架范围
+   - 目标不是写死“图书管理系统”，而是把高频漂移文件压回模板层
+
+3. `coder -> infra_setup` 之间新增环境收口
+   - 代码文件全部完成后，不再直接进 `infra_setup`
+   - 必须先过一次 `EnvGuard`，避免出现“文件都写完了但 package 依赖仍为空”的伪完成态
+
+当前仍未闭合的一类关键机制：
+
+- QA/FixPlan 发现“文件状态已 completed，但内容其实错误”时，系统还缺少强制重开机制
+- 典型表现：
+  - `package.json` 已写出，但依赖为空
+  - `tests/health.test.ts` 已写出，但导入路径错误
+  - `tests/auth.test.ts` / `tests/books.test.ts` 已写出，但仍是错误的 class-style baseline
+- QA 能识别这些问题，但不会把对应文件重新排回 `coder`
+- 因此旧 run 会停在 `qa`，而不是真正进入“错误文件重写”回路
 
 ## 控制平面对象
 
@@ -166,6 +201,8 @@ type SolutionPlan = {
 - 驱动 Coder
 - 驱动 Verifier
 - 作为唯一任务图
+- 负责文件路径归一化、模板别名去重、测试框架冲突清理
+- 负责复杂度预算与任务图压缩
 
 建议结构：
 
@@ -189,6 +226,22 @@ type ExecutionPlan = {
   acceptanceChecks: string[];
 };
 ```
+
+### ExecutionPlan 预算与归一化规则
+
+`ExecutionPlan` 在进入 Coder 前必须额外满足三条规则：
+
+1. 别名文件必须被折叠成一个规范目标，例如：
+   - `src/public/*` -> `public/*`
+   - `src/routes/book-routes.ts` -> `src/routes/books.ts`
+   - `src/controllers/book-controller.ts` -> `src/controllers/bookController.ts`
+   - `src/services/book-service.ts` -> `src/services/bookService.ts`
+2. 测试基线只能保留一种：
+   - 已选择 `vitest` 时，禁止再混入 `jest.config.* / tests/setup.test.ts`
+   - 已选择 `jest` 时，禁止再混入 `vitest.config.*`
+3. 对“单体 + 前后端 + 1~2 个主业务实体”的简单 CRUD 项目，文件预算必须受限。
+   - 参考预算：24 个文件左右
+   - 超预算时，Orchestrator 必须压缩为最小可执行骨架，而不是把所有模板碎片都下发
 
 ### 5. ValidationReport
 
@@ -354,6 +407,7 @@ type CustomerApprovalState = {
 - `frontendRequired=true` 时，必须规划 ui/entry
 - `testRequired=true` 时，必须规划对应测试文件
 - `deployRequired=true` 时，必须规划部署文件
+- 若出现同义文件、双测试框架、双前端目录或简单 CRUD 超预算，必须先做归一化与压缩，再产出 `ExecutionPlan`
 
 失败分流：
 - 回 Orchestrator 重建任务图
@@ -415,8 +469,8 @@ type CustomerApprovalState = {
 失败分流：
 - `planning_gap` -> Architect/Orchestrator
 - `implementation_bug` -> FixPlan
-- `environment_gap` -> Env/Infra
-- `runtime_gap` -> Deploy/Verifier
+- `environment_gap` -> EnvGuard/Infra
+- `runtime_gap` -> Infra/Deploy 运行时修复回路
 
 ### QA
 
@@ -432,7 +486,10 @@ type CustomerApprovalState = {
 硬闸门：
 - `planning_gap` 禁止通过
 - `environment_gap` 禁止甩给 coder
+- 环境问题必须统一转交 `EnvGuard`，禁止在 QA 节点内直接做临时 shell 修补
 - `runtime_gap` 禁止转实现修复
+- 只要仍有 `pending subTask`，即使当前没有失败证据，也禁止 `done=true`
+- 当阶段验证通过但任务图仍未完成时，QA 只能设置“恢复 coder 继续实现”，不能放行 deploy
 
 失败分流：
 - 必须按 `ValidationReport.failureType`
@@ -483,6 +540,23 @@ type CustomerApprovalState = {
 硬闸门：
 - 任意 blocking failure 存在时禁止 deploy
 - `deploy` checkpoint 未授权且未确认时，禁止部署
+- 启动命令必须显式注入运行时端口与宿主监听配置，例如 `PORT=<manifest.port>` 与 `HOST=0.0.0.0`
+- 健康检查不能只探测单一路径；主路径失败时，允许按候选路径回退探测
+- Deploy 失败时必须产出结构化 `runtime_gap` 证据，并回灌到运行时修复链，而不是直接结束流程
+
+### Agent Runtime
+
+输入：
+- 任意智能体节点的模型调用错误
+
+输出：
+- `agent_pending`
+- `resumeFromNode`
+
+硬闸门：
+- 模型连接失败、请求超时、上游 aborted 不能直接把 run 打崩
+- 必须落盘为可恢复挂起态，并保留原节点作为恢复入口
+- 恢复后必须从原业务节点继续，而不是从头重跑整个图
 
 ## 错误分类和分流
 
@@ -502,7 +576,8 @@ type CustomerApprovalState = {
 
 4. `runtime_gap`
    - 入口、端口、健康检查、启动失败
-   - 去 Deploy / Runtime 修复
+   - 典型证据包括：`EADDRNOTAVAIL`、`EADDRINUSE`、端口错配、容器内已监听但宿主不可达、健康检查路径错配
+   - 去 Infra / Deploy 运行时修复
 
 禁止出现：
 - `planning_gap` 进入 `fix_plan`
@@ -516,8 +591,8 @@ type CustomerApprovalState = {
 系统默认支持两种确认模式：
 
 1. 显式确认
-   - 到达关键阶段时暂停
-   - 等客户确认后继续
+   - 到达关键阶段时发出授权请求，并把状态持久化为待确认
+   - 当前 run 可挂起，后续在收到确认后恢复，不允许在节点内同步长时间阻塞
 
 2. 默认同意授权
    - 客户可预先授权某些阶段自动通过
@@ -533,7 +608,7 @@ type CustomerApprovalState = {
 
 2. 人工确认通过
    - `autoApprove.<stage>=false`
-   - 进入 approval 控制层并暂停
+   - 进入 approval 控制层并挂起待确认
    - 客户明确确认后，记录 `approved=true` 与 `approvedBy=customer`
 
 3. 人工驳回
@@ -566,12 +641,13 @@ type CustomerApprovalState = {
 
 控制要求：
 
-- 未确认且未授权默认通过时，流程必须暂停
+- 未确认且未授权默认通过时，流程必须进入待确认态，并允许后续恢复
 - 已明确驳回时，必须回到对应节点重做
 - 确认记录必须写入 `CustomerApprovalState`
 - 后续节点只能读取已确认版本，不允许继续漂移
 - approval 控制语义不能依赖 UI transport；不能因为没有 `onEvent` 就直接绕过 checkpoint
 - approval 节点不能把“等待客户确认”伪装成 `approvedBy=customer`
+- approval 节点不能在图节点内部无限等待人工点击；必须能显式挂起和恢复
 
 ## 重规划规则
 

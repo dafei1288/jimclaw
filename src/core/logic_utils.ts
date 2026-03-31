@@ -27,6 +27,8 @@ import {
   TechnologyDecision,
   ValidationFailureType,
   ValidationReport,
+  ProjectRuntime,
+  BackendFramework,
 } from "./graph_types";
 import { ShellExecuteSkill } from "../skills/shell_exec";
 import { AuditLogger } from "../utils/audit";
@@ -112,9 +114,11 @@ export function getEntryPoint(state: JimClawState): string {
   const serverFile = allFiles.find(f => /server|app|main|index/i.test(f) && !/test|spec/i.test(f) && !f.endsWith(".html") && !/utils|helper|lib/i.test(f));
   if (serverFile) return serverFile;
 
-  const lang = state.spec?.language?.toLowerCase() || "javascript";
-  if (lang.includes("python")) return "main.py";
-  if (lang.includes("go")) return "main.go";
+  const runtime = detectLanguageFamily(state.spec?.language || "javascript");
+  if (runtime === "python") return "main.py";
+  if (runtime === "go") return "main.go";
+  if (runtime === "java") return "src/main/java/Main.java";
+  if (runtime === "rust") return "src/main.rs";
   return "server.js";
 }
 
@@ -132,42 +136,61 @@ export function getImplementationFile(state: JimClawState): string {
   return implFile || getEntryPoint(state);
 }
 
-function detectProtocolRuntime(language: string): "node" | "python" | "go" | "unknown" {
+function detectLanguageFamily(language: string): ProjectRuntime {
   const normalized = String(language || "").toLowerCase();
   if (/typescript|javascript|node/.test(normalized)) return "node";
   if (/python/.test(normalized)) return "python";
   if (/\bgo\b|golang/.test(normalized)) return "go";
+  if (/\bjava\b|spring/.test(normalized)) return "java";
+  if (/\brust\b|cargo|axum|actix|rocket/.test(normalized)) return "rust";
   return "unknown";
+}
+
+function detectProtocolRuntime(language: string): ProjectRuntime {
+  return detectLanguageFamily(language);
 }
 
 function inferProtocolFileRole(fileTarget: string): ProtocolFileRole {
   const normalized = String(fileTarget || "").replace(/\\/g, "/").toLowerCase();
-  if (/^package\.json$|^tsconfig\.json$|jest\.config\./.test(normalized)) return "config";
+  if (
+    /^package\.json$|^tsconfig\.json$|^pom\.xml$|^cargo\.toml$|^build\.gradle(?:\.kts)?$|^settings\.gradle(?:\.kts)?$|^gradle\.properties$|jest\.config\./.test(normalized)
+  ) return "config";
   if (normalized.endsWith("/dockerfile") || normalized === "dockerfile" || normalized.endsWith("docker-compose.yml")) return "infra";
   if (normalized.includes("/tests/") || normalized.includes("/__tests__/") || /\.test\.[^.]+$/.test(normalized) || /\.spec\.[^.]+$/.test(normalized)) return "test";
   if (normalized.includes("/routes/")) return "route";
   if (normalized.includes("/controllers/")) return "controller";
   if (normalized.includes("/services/")) return "service";
+  if (normalized.includes("/repositories/")) return "repository";
   if (normalized.includes("/models/")) return "model";
   if (normalized.includes("/middleware/")) return "middleware";
-  if (normalized.endsWith("/index.ts") || normalized.endsWith("/index.js") || normalized === "src/index.ts" || normalized === "src/index.js") return "entry";
+  if (
+    normalized.endsWith("/index.ts") ||
+    normalized.endsWith("/index.js") ||
+    normalized === "src/index.ts" ||
+    normalized === "src/index.js" ||
+    normalized === "src/main.rs" ||
+    /src\/main\/java\/.+\/(?:application|main)\.java$/.test(normalized) ||
+    /src\/main\/kotlin\/.+\/(?:application|main)\.kt$/.test(normalized)
+  ) return "entry";
   return "other";
 }
 
 function allowedRolesForProtocolFile(role: ProtocolFileRole): ProtocolFileRole[] {
   switch (role) {
     case "entry":
-      return ["route", "controller", "service", "model", "middleware", "config", "other"];
+      return ["route", "controller", "service", "repository", "model", "middleware", "config", "other"];
     case "route":
-      return ["controller", "service", "middleware", "model", "other"];
+      return ["controller", "service", "repository", "middleware", "model", "other"];
     case "controller":
-      return ["service", "model", "middleware", "other"];
+      return ["service", "repository", "model", "middleware", "other"];
     case "service":
+      return ["repository", "model", "other"];
+    case "repository":
       return ["model", "other"];
     case "middleware":
-      return ["service", "model", "other"];
+      return ["service", "repository", "model", "other"];
     case "test":
-      return ["entry", "route", "controller", "service", "model", "middleware", "other"];
+      return ["entry", "route", "controller", "service", "repository", "model", "middleware", "other"];
     case "infra":
       return ["config", "entry", "other"];
     case "config":
@@ -282,6 +305,294 @@ function getPrimaryCrudResource(state: Pick<JimClawState, "apiContract" | "requi
   return { pluralStem, singularStem, resourcePath, label, title };
 }
 
+function parseStateCodeMap(state: Pick<JimClawState, "code">): Record<string, string> {
+  try {
+    const parsed = JSON.parse(state.code || "{}");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(([key, value]) => typeof key === "string" && typeof value === "string")
+    ) as Record<string, string>;
+  } catch {
+    return {};
+  }
+}
+
+function collectNamedExports(source: string): Set<string> {
+  const exports = new Set<string>();
+  const functionPattern = /export\s+(?:async\s+)?function\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  const valuePattern = /export\s+(?:const|let|var|class)\s+([A-Za-z_][A-Za-z0-9_]*)/g;
+  const namedPattern = /export\s*\{([^}]+)\}/g;
+
+  for (const match of source.matchAll(functionPattern)) {
+    if (match[1]) exports.add(match[1]);
+  }
+  for (const match of source.matchAll(valuePattern)) {
+    if (match[1]) exports.add(match[1]);
+  }
+  for (const match of source.matchAll(namedPattern)) {
+    const block = String(match[1] || "");
+    for (const rawPart of block.split(",")) {
+      const part = rawPart.trim();
+      if (!part) continue;
+      const aliasMatch = part.match(/^(?:([A-Za-z_][A-Za-z0-9_]*)\s+as\s+)?([A-Za-z_][A-Za-z0-9_]*)$/);
+      if (!aliasMatch) continue;
+      const exportedName = aliasMatch[2];
+      if (exportedName) exports.add(exportedName);
+    }
+  }
+  return exports;
+}
+
+function pickExistingExport(existingExports: Set<string>, candidates: string[]): string {
+  return candidates.find((candidate) => existingExports.has(candidate)) || candidates[0];
+}
+
+function toRelativeOwnedRoutePath(endpointPath: string, mountPath: string): string {
+  const normalizedPath = String(endpointPath || "").trim().replace(/\/+$/, "") || "/";
+  const normalizedMount = String(mountPath || "").trim().replace(/\/+$/, "");
+  if (!normalizedMount) return normalizedPath || "/";
+  if (!normalizedPath.startsWith(normalizedMount)) return normalizedPath || "/";
+  const suffix = normalizedPath.slice(normalizedMount.length);
+  return suffix ? (suffix.startsWith("/") ? suffix : `/${suffix}`) : "/";
+}
+
+function buildCrudRouteScaffold(options: {
+  controllerImportPath: string;
+  controllerSource: string;
+  authImportPath: string | null;
+  ownedEndpoints: string[];
+  singularStem: string;
+  pluralStem: string;
+  resourcePath: string;
+}): string {
+  const existingExports = collectNamedExports(options.controllerSource);
+  const singularPascal = toPascalCase(options.singularStem);
+  const pluralPascal = toPascalCase(options.pluralStem);
+  const routeSpecs = options.ownedEndpoints
+    .map((endpoint) => {
+      const [method, ...pathParts] = String(endpoint || "").split(/\s+/);
+      const endpointPath = pathParts.join(" ").trim();
+      const relativePath = toRelativeOwnedRoutePath(endpointPath, options.resourcePath);
+      const signature = `${String(method || "").toUpperCase()} ${relativePath}`;
+      let handlerCandidates: string[] | null = null;
+      switch (signature) {
+        case "GET /":
+          handlerCandidates = [`list${pluralPascal}`, `get${pluralPascal}`];
+          break;
+        case "POST /":
+          handlerCandidates = [`create${singularPascal}`, `add${singularPascal}`];
+          break;
+        case "GET /:id":
+          handlerCandidates = [`get${singularPascal}`, `get${singularPascal}ById`];
+          break;
+        case "PUT /:id":
+        case "PATCH /:id":
+          handlerCandidates = [`update${singularPascal}`, `edit${singularPascal}`];
+          break;
+        case "PATCH /:id/status":
+          handlerCandidates = [`update${singularPascal}Status`, `set${singularPascal}Status`];
+          break;
+        case "DELETE /:id":
+          handlerCandidates = [`delete${singularPascal}`, `remove${singularPascal}`];
+          break;
+        case "POST /:id/borrow":
+          handlerCandidates = [`borrow${singularPascal}`];
+          break;
+        case "POST /:id/return":
+          handlerCandidates = [`return${singularPascal}`];
+          break;
+        case "POST /:id/reservations":
+          handlerCandidates = [`reserve${singularPascal}`, `create${singularPascal}Reservation`];
+          break;
+        default:
+          handlerCandidates = null;
+          break;
+      }
+      if (!handlerCandidates) return null;
+      return {
+        method: String(method || "").toLowerCase(),
+        path: relativePath,
+        handler: pickExistingExport(existingExports, handlerCandidates),
+        needsAuth: String(method || "").toUpperCase() !== "GET",
+      };
+    })
+    .filter((item): item is { method: string; path: string; handler: string; needsAuth: boolean } => Boolean(item));
+
+  const controllerImports = Array.from(new Set(routeSpecs.map((item) => item.handler)));
+  const usesAuth = Boolean(options.authImportPath) && routeSpecs.some((item) => item.needsAuth);
+  const routeLines = routeSpecs.map((item) => {
+    const middlewarePrefix = usesAuth && item.needsAuth ? "authMiddleware, " : "";
+    return `router.${item.method}("${item.path}", ${middlewarePrefix}${item.handler});`;
+  });
+
+  return `import { Router } from "express";
+import { ${controllerImports.join(", ")} } from "${options.controllerImportPath}";
+${usesAuth ? `import { authMiddleware } from "${options.authImportPath}";\n` : ""}
+const router = Router();
+
+${routeLines.join("\n")}
+
+export const ${toCamelCase(options.pluralStem)}RouteBase = "${options.resourcePath}";
+export default router;
+`;
+}
+
+function buildCrudEntityPayloadCode(singularStem: string): string {
+  switch (singularStem) {
+    case "book":
+      return `{
+    title: \`图书-\${suffix}\`,
+    author: "测试作者",
+    category: "测试分类",
+    isbn: \`isbn-\${suffix}\`,
+    totalCopies: 3,
+  }`;
+    case "product":
+      return `{
+    name: \`商品-\${suffix}\`,
+    sku: \`sku-\${suffix}\`,
+    price: 99,
+    stock: 10,
+    status: "active",
+  }`;
+    case "user":
+      return `{
+    username: \`user-\${suffix}\`,
+    password: "Password123!",
+    role: "reader",
+  }`;
+    default:
+      return `{
+    name: \`记录-\${suffix}\`,
+    status: "active",
+  }`;
+  }
+}
+
+function buildCrudApiTestScaffold(
+  state: Pick<JimClawState, "apiContract" | "contract" | "requirementProtocol">,
+  resourceStem: string,
+  declaredFiles: Set<string>
+): string {
+  const normalizedPlural = resourceStem.endsWith("s") ? resourceStem : `${resourceStem}s`;
+  const singularStem = singularizeStem(resourceStem);
+  const singularPascal = toPascalCase(singularStem);
+  const ownedEndpoints = inferOwnedEndpoints(`src/routes/${normalizedPlural}.ts`, state.apiContract);
+  const resourcePath = deriveRouteMountPath(ownedEndpoints, `/api/${normalizedPlural}`);
+  const payloadCode = buildCrudEntityPayloadCode(singularStem);
+
+  return `import request from "supertest";
+import app from "../src/index";
+
+const RESOURCE_PATH = "${resourcePath}";
+
+function buildPayload(suffix = "1") {
+  return ${payloadCode};
+}
+
+describe("${singularPascal} API 基线", () => {
+  it("GET 列表接口返回受控响应", async () => {
+    const response = await request(app).get(RESOURCE_PATH);
+    expect(response.status).toBeLessThan(500);
+  });
+
+  it("未认证写入请求返回受控状态", async () => {
+    const response = await request(app).post(RESOURCE_PATH).send(buildPayload("http"));
+    expect([201, 401, 403]).toContain(response.status);
+  });
+});
+`;
+}
+
+function buildVerifyScriptScaffold(
+  state: Pick<JimClawState, "apiContract" | "contract" | "manifest" | "requirementProtocol">
+): string {
+  const port = state.manifest?.services?.[0]?.port || 8080;
+  const primaryResource = getPrimaryCrudResource(state);
+  const payloadCode = buildCrudEntityPayloadCode(primaryResource.singularStem);
+  return `const baseUrl = process.env.VERIFY_BASE_URL || "http://127.0.0.1:${port}";
+
+type VerifyResult = {
+  name: string;
+  ok: boolean;
+  detail: string;
+};
+
+async function requestJson(path: string, init?: RequestInit): Promise<{ status: number; bodyText: string }> {
+  const response = await fetch(baseUrl + path, init);
+  return {
+    status: response.status,
+    bodyText: await response.text(),
+  };
+}
+
+async function runStep(name: string, fn: () => Promise<void>): Promise<VerifyResult> {
+  try {
+    await fn();
+    return { name, ok: true, detail: "PASS" };
+  } catch (error) {
+    return {
+      name,
+      ok: false,
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+function buildPayload(suffix = "verify") {
+  return ${payloadCode};
+}
+
+async function main(): Promise<void> {
+  const results: VerifyResult[] = [];
+
+  results.push(
+    await runStep("health", async () => {
+      const response = await requestJson("/api/health");
+      if (response.status !== 200) {
+        throw new Error(\`健康检查失败: \${response.status}\`);
+      }
+    })
+  );
+
+  results.push(
+    await runStep("${primaryResource.pluralStem}-list", async () => {
+      const response = await requestJson("${primaryResource.resourcePath}");
+      if (response.status >= 500) {
+        throw new Error(\`列表接口返回 5xx: \${response.status}\`);
+      }
+    })
+  );
+
+  results.push(
+    await runStep("${primaryResource.pluralStem}-write-guard", async () => {
+      const response = await requestJson("${primaryResource.resourcePath}", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(buildPayload()),
+      });
+      if (![201, 401, 403].includes(response.status)) {
+        throw new Error(\`写接口返回了未预期状态: \${response.status}\`);
+      }
+    })
+  );
+
+  results.forEach((result) => {
+    const status = result.ok ? "PASS" : "FAIL";
+    console.log(\`[\${status}] \${result.name} - \${result.detail}\`);
+  });
+
+  const hasFailure = results.some((result) => !result.ok);
+  process.exit(hasFailure ? 1 : 0);
+}
+
+main().catch((error) => {
+  console.error("[FATAL]", error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});
+`;
+}
+
 function hasFrontendFiles(files: string[]): boolean {
   return files.some((file) => {
     const normalized = String(file || "").replace(/\\/g, "/").toLowerCase();
@@ -344,7 +655,13 @@ function getPrimaryEntityStems(requirementProtocol: RequirementProtocol | null |
   singular: string;
   plural: string;
 } {
+  const ignoredSupportEntities = new Set(["auth", "permission", "role", "session", "audit", "log"]);
+  const titleEntities = inferEntities([requirementProtocol?.userIntent?.title || ""])
+    .filter((entity) => !ignoredSupportEntities.has(String(entity || "").toLowerCase()));
   const primary =
+    titleEntities[0] ||
+    requirementProtocol?.capabilities?.crudEntities?.find((entity) => !ignoredSupportEntities.has(String(entity || "").toLowerCase())) ||
+    requirementProtocol?.capabilities?.entities?.find((entity) => !ignoredSupportEntities.has(String(entity || "").toLowerCase())) ||
     requirementProtocol?.capabilities?.crudEntities?.[0] ||
     requirementProtocol?.capabilities?.entities?.[0] ||
     "item";
@@ -403,10 +720,13 @@ export function buildTechnologyDecision(
     files.some((file) => /vue$/i.test(file)) ? "vue" :
     requirementProtocol?.capabilities.frontendRequired ? "vanilla" :
     "none";
-  const backendFramework =
+  const runtime = detectLanguageFamily(language);
+  const backendFramework: BackendFramework =
     /express/.test(framework) || /typescript|javascript/.test(language) ? "express-typescript" :
     /fastapi|python/.test(framework) || /python/.test(language) ? "fastapi-python" :
     /gin|go/.test(framework) || /\bgo\b/.test(language) ? "gin-go" :
+    /spring/.test(framework) || runtime === "java" ? "spring-java" :
+    /axum|actix|rocket/.test(framework) || runtime === "rust" ? "rust-web" :
     "unknown";
 
   return {
@@ -482,6 +802,8 @@ export function ensureRequirementDrivenFiles(
   if (authRequired) {
     ensureFile("src/middleware/auth.ts");
     ensureFile("src/routes/auth.ts");
+    ensureFile("src/controllers/authController.ts");
+    ensureFile("src/services/authService.ts");
     ensureFile("tests/auth.test.ts");
   }
 
@@ -618,8 +940,7 @@ export function buildExecutionProtocol(
   apiContract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined,
   requirementProtocol?: RequirementProtocol | null | undefined
 ): ExecutionProtocol {
-  const requirementDrivenSpec = ensureRequirementDrivenFiles(spec, requirementProtocol);
-  const normalizedSpec = normalizeNodeProjectFileLayout(ensureTypeScriptTestBaseline(requirementDrivenSpec || {}));
+  const normalizedSpec = stabilizeSpecForExecution(spec, requirementProtocol);
   const resolvedRequirementProtocol = requirementProtocol || buildRequirementProtocol(null);
   const solutionProtocol = buildSolutionProtocol(resolvedRequirementProtocol, normalizedSpec, apiContract);
   const preferredHealthCheckPath =
@@ -1067,6 +1388,830 @@ export function applyProtocolPatches(
   return nextProtocol;
 }
 
+function buildErrorModuleScaffold(): string {
+  return `export interface AppErrorOptions {
+  statusCode?: number;
+  code?: string;
+  details?: unknown;
+  cause?: unknown;
+}
+
+export class AppError extends Error {
+  readonly statusCode: number;
+  readonly code: string;
+  readonly details?: unknown;
+
+  constructor(message: string, options: AppErrorOptions = {}) {
+    super(message);
+    this.name = new.target.name;
+    this.statusCode = options.statusCode ?? 500;
+    this.code = options.code ?? "APP_ERROR";
+    this.details = options.details;
+    if (options.cause !== undefined) {
+      (this as Error & { cause?: unknown }).cause = options.cause;
+    }
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(message = "Validation failed", details?: unknown) {
+    super(message, { statusCode: 400, code: "VALIDATION_ERROR", details });
+  }
+}
+
+export class UnauthorizedError extends AppError {
+  constructor(message = "Unauthorized", details?: unknown) {
+    super(message, { statusCode: 401, code: "UNAUTHORIZED", details });
+  }
+}
+
+export class ForbiddenError extends AppError {
+  constructor(message = "Forbidden", details?: unknown) {
+    super(message, { statusCode: 403, code: "FORBIDDEN", details });
+  }
+}
+
+export class NotFoundError extends AppError {
+  constructor(message = "Not found", details?: unknown) {
+    super(message, { statusCode: 404, code: "NOT_FOUND", details });
+  }
+}
+
+export class ConflictError extends AppError {
+  constructor(message = "Conflict", details?: unknown) {
+    super(message, { statusCode: 409, code: "CONFLICT", details });
+  }
+}
+
+export function toErrorResponse(error: unknown): {
+  success: false;
+  error: string;
+  message: string;
+  details?: unknown;
+} {
+  if (error instanceof AppError) {
+    return {
+      success: false,
+      error: error.code,
+      message: error.message,
+      details: error.details,
+    };
+  }
+
+  if (error instanceof Error) {
+    return {
+      success: false,
+      error: "INTERNAL_ERROR",
+      message: error.message,
+    };
+  }
+
+  return {
+    success: false,
+    error: "UNKNOWN_ERROR",
+    message: "Unknown error",
+  };
+}
+`;
+}
+
+function buildAuthSessionServiceScaffold(): string {
+  return `import { UnauthorizedError, ValidationError } from "../errors";
+
+export interface AuthSessionUser {
+  id: string;
+  username: string;
+  role?: string;
+  [key: string]: unknown;
+}
+
+export interface AuthSessionTokenPayload {
+  sub: string;
+  username: string;
+  role?: string;
+  iat: number;
+  exp: number;
+}
+
+export interface AuthSession {
+  token: string;
+  issuedAt: string;
+  expiresAt: string;
+  user: AuthSessionUser;
+}
+
+function encodePayload(payload: AuthSessionTokenPayload): string {
+  return Buffer.from(JSON.stringify(payload), "utf-8").toString("base64url");
+}
+
+export function decodeSessionToken(token: string): AuthSessionTokenPayload {
+  try {
+    const decoded = Buffer.from(token, "base64url").toString("utf-8");
+    return JSON.parse(decoded) as AuthSessionTokenPayload;
+  } catch {
+    throw new UnauthorizedError("无效的会话令牌");
+  }
+}
+
+export function createSession(user: AuthSessionUser, ttlMinutes = 120): AuthSession {
+  if (!user?.id || !user?.username) {
+    throw new ValidationError("创建会话时缺少用户标识");
+  }
+
+  const now = new Date();
+  const issuedAt = Math.floor(now.getTime() / 1000);
+  const expiresAt = issuedAt + ttlMinutes * 60;
+  const payload: AuthSessionTokenPayload = {
+    sub: user.id,
+    username: user.username,
+    role: user.role,
+    iat: issuedAt,
+    exp: expiresAt,
+  };
+
+  return {
+    token: encodePayload(payload),
+    issuedAt: now.toISOString(),
+    expiresAt: new Date(expiresAt * 1000).toISOString(),
+    user,
+  };
+}
+
+export function verifySessionToken(token: string, now: Date = new Date()): AuthSessionTokenPayload {
+  const payload = decodeSessionToken(token);
+  if (payload.exp <= Math.floor(now.getTime() / 1000)) {
+    throw new UnauthorizedError("会话已过期");
+  }
+  return payload;
+}
+
+export function buildSessionUser(payload: AuthSessionTokenPayload): AuthSessionUser {
+  return {
+    id: payload.sub,
+    username: payload.username,
+    role: payload.role,
+  };
+}
+`;
+}
+
+function buildAuthCredentialServiceScaffold(): string {
+  return `import { createHash, randomUUID } from "crypto";
+import { UnauthorizedError, ValidationError } from "../errors";
+
+export interface CredentialHash {
+  algorithm: "sha256";
+  salt: string;
+  digest: string;
+}
+
+export function ensureCredentialStrength(secret: string): void {
+  const normalized = String(secret || "").trim();
+  if (normalized.length < 8) {
+    throw new ValidationError("口令长度至少需要 8 位");
+  }
+  if (!/[A-Za-z]/.test(normalized) || !/\\d/.test(normalized)) {
+    throw new ValidationError("口令必须同时包含字母和数字");
+  }
+}
+
+export function hashCredential(secret: string, salt: string = randomUUID()): CredentialHash {
+  ensureCredentialStrength(secret);
+  return {
+    algorithm: "sha256",
+    salt,
+    digest: createHash("sha256").update(\`\${salt}:\${secret}\`).digest("hex"),
+  };
+}
+
+export function verifyCredential(secret: string, stored: CredentialHash): boolean {
+  const candidate = createHash("sha256")
+    .update(\`\${stored.salt}:\${secret}\`)
+    .digest("hex");
+  return candidate === stored.digest;
+}
+
+export function assertCredential(secret: string, stored: CredentialHash): void {
+  if (!verifyCredential(secret, stored)) {
+    throw new UnauthorizedError("账号或口令错误");
+  }
+}
+`;
+}
+
+function buildAuthAccountPolicyServiceScaffold(): string {
+  return `import { ForbiddenError, ValidationError } from "../errors";
+
+export interface AuthAccountPolicyContext {
+  accountId: string;
+  status?: "active" | "disabled" | "locked" | "pending";
+  roles?: string[];
+  lockedUntil?: string | null;
+  disabledReason?: string;
+}
+
+export function normalizeRoles(roles: string[] = []): string[] {
+  return Array.from(
+    new Set(
+      roles
+        .map((role) => String(role || "").trim().toLowerCase())
+        .filter(Boolean)
+    )
+  );
+}
+
+export function hasRequiredRole(
+  context: Pick<AuthAccountPolicyContext, "roles">,
+  requiredRoles: string[] = []
+): boolean {
+  const normalizedRoles = normalizeRoles(context.roles || []);
+  const normalizedRequired = normalizeRoles(requiredRoles);
+  if (normalizedRequired.length === 0) return true;
+  return normalizedRequired.some((role) => normalizedRoles.includes(role));
+}
+
+export function ensureAccountPolicy(
+  context: AuthAccountPolicyContext,
+  requiredRoles: string[] = []
+): void {
+  if (!context.accountId) {
+    throw new ValidationError("缺少账号标识");
+  }
+
+  if (context.status && context.status !== "active") {
+    throw new ForbiddenError("账号当前不可用", {
+      status: context.status,
+      disabledReason: context.disabledReason,
+    });
+  }
+
+  if (context.lockedUntil && new Date(context.lockedUntil).getTime() > Date.now()) {
+    throw new ForbiddenError("账号仍处于锁定状态", { lockedUntil: context.lockedUntil });
+  }
+
+  if (!hasRequiredRole(context, requiredRoles)) {
+    throw new ForbiddenError("账号缺少访问所需角色", {
+      roles: normalizeRoles(context.roles || []),
+      requiredRoles: normalizeRoles(requiredRoles),
+    });
+  }
+}
+
+export function buildAccountPolicySnapshot(context: AuthAccountPolicyContext): {
+  accountId: string;
+  status: string;
+  roles: string[];
+  locked: boolean;
+} {
+  return {
+    accountId: context.accountId,
+    status: context.status || "active",
+    roles: normalizeRoles(context.roles || []),
+    locked: Boolean(context.lockedUntil && new Date(context.lockedUntil).getTime() > Date.now()),
+  };
+}
+`;
+}
+
+function buildAuthServiceScaffold(loggerImportPath: string): string {
+  return `import { createHash, randomUUID } from "crypto";
+import { ConflictError, NotFoundError, UnauthorizedError, ValidationError } from "../errors";
+import { logEntries } from "${loggerImportPath}";
+
+export type AuthRole = "admin" | "librarian" | "auditor" | "member";
+
+export interface StoredUser {
+  id: string;
+  username: string;
+  passwordHash: string;
+  roles: AuthRole[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PublicUser {
+  id: string;
+  username: string;
+  roles: AuthRole[];
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface AuthSession {
+  token: string;
+  userId: string;
+  createdAt: string;
+  expiresAt: string;
+  endedAt?: string;
+}
+
+export interface AuthServiceState {
+  usersById: Map<string, StoredUser>;
+  userIdByUsername: Map<string, string>;
+  sessionsByToken: Map<string, AuthSession>;
+}
+
+export interface LoginInput {
+  username: string;
+  password: string;
+}
+
+export interface CreateUserInput {
+  username: string;
+  password: string;
+  roles?: AuthRole[];
+  enabled?: boolean;
+}
+
+export interface ActorContext {
+  actorId?: string;
+  source?: string;
+  roles?: AuthRole[];
+}
+
+function getNow(): Date {
+  return new Date();
+}
+
+function normalizeUsername(username: string): string {
+  const normalized = String(username || "").trim().toLowerCase();
+  if (!normalized) {
+    throw new ValidationError("用户名不能为空");
+  }
+  return normalized;
+}
+
+function normalizeRole(role: string): AuthRole {
+  const normalized = String(role || "").trim().toLowerCase();
+  if (normalized === "admin" || normalized === "librarian" || normalized === "auditor" || normalized === "member") {
+    return normalized;
+  }
+  throw new ValidationError("角色不合法", { role });
+}
+
+function ensureRoleList(roles: AuthRole[] = ["member"]): AuthRole[] {
+  const normalizedRoles = Array.from(new Set(roles.map((role) => normalizeRole(role))));
+  if (normalizedRoles.length === 0) {
+    throw new ValidationError("至少需要一个角色");
+  }
+  return normalizedRoles;
+}
+
+function hashPassword(password: string): string {
+  const normalized = String(password || "");
+  if (normalized.length < 8) {
+    throw new ValidationError("密码长度至少为 8 位");
+  }
+  return createHash("sha256").update(normalized).digest("hex");
+}
+
+function verifyPassword(password: string, passwordHash: string): boolean {
+  return hashPassword(password) === passwordHash;
+}
+
+function generateSessionToken(userId: string, createdAt: string): string {
+  return Buffer.from(JSON.stringify({ sub: userId, createdAt }), "utf-8").toString("base64url");
+}
+
+function toPublicUser(user: StoredUser): PublicUser {
+  return {
+    id: user.id,
+    username: user.username,
+    roles: [...user.roles],
+    enabled: user.enabled,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+  };
+}
+
+function buildAuditPayload(
+  event: string,
+  actor: ActorContext,
+  targetId: string,
+  result: "success" | "failure"
+): {
+  actor: string;
+  source: string;
+  timestamp: string;
+  targetId: string;
+  result: "success" | "failure";
+  event: string;
+} {
+  return {
+    actor: actor.actorId || "system",
+    source: actor.source || "auth-service",
+    timestamp: getNow().toISOString(),
+    targetId,
+    result,
+    event,
+  };
+}
+
+function appendAuditLog(payload: ReturnType<typeof buildAuditPayload>): void {
+  logEntries.push({
+    timestamp: payload.timestamp,
+    method: "AUTH",
+    path: \`/audit/\${payload.event}\`,
+    statusCode: payload.result === "success" ? 200 : 400,
+    responseTime: 0,
+    userAgent: payload.actor,
+    ip: payload.source,
+    userId: payload.targetId,
+  });
+}
+
+function findUserByUsername(state: AuthServiceState, username: string): StoredUser | null {
+  const userId = state.userIdByUsername.get(normalizeUsername(username));
+  return userId ? state.usersById.get(userId) || null : null;
+}
+
+function findUserById(state: AuthServiceState, userId: string): StoredUser | null {
+  return state.usersById.get(userId) || null;
+}
+
+function requireUser(state: AuthServiceState, userId: string): StoredUser {
+  const user = findUserById(state, userId);
+  if (!user) {
+    throw new NotFoundError("用户不存在", { userId });
+  }
+  return user;
+}
+
+function requireActorPermission(actor: ActorContext, requiredRoles: AuthRole[]): void {
+  const actorRoles = ensureRoleList(actor.roles || ["admin"]);
+  if (!requiredRoles.some((role) => actorRoles.includes(role))) {
+    throw new UnauthorizedError("权限不足");
+  }
+}
+
+function seedDefaultAdmin(state: AuthServiceState): void {
+  if (state.userIdByUsername.has("admin")) return;
+  const now = getNow().toISOString();
+  const admin: StoredUser = {
+    id: "user-admin",
+    username: "admin",
+    passwordHash: hashPassword("Admin1234"),
+    roles: ["admin"],
+    enabled: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+  state.usersById.set(admin.id, admin);
+  state.userIdByUsername.set(admin.username, admin.id);
+}
+
+/** 创建自包含的认证服务内存态。 */
+export function createAuthServiceState(): AuthServiceState {
+  const state: AuthServiceState = {
+    usersById: new Map<string, StoredUser>(),
+    userIdByUsername: new Map<string, string>(),
+    sessionsByToken: new Map<string, AuthSession>(),
+  };
+  seedDefaultAdmin(state);
+  return state;
+}
+
+/** 断言用户处于启用状态。 */
+export function assertUserActive(user: Pick<StoredUser, "id" | "enabled">, code = "AUTH_USER_DISABLED"): void {
+  if (!user.id) {
+    throw new ValidationError("缺少用户标识");
+  }
+  if (!user.enabled) {
+    throw new UnauthorizedError(code);
+  }
+}
+
+/** 使用用户名和密码登录，返回会话与公开用户信息。 */
+export function login(
+  state: AuthServiceState,
+  input: LoginInput,
+  actor: ActorContext = {}
+): { session: AuthSession; user: PublicUser } {
+  const username = normalizeUsername(input.username);
+  const user = findUserByUsername(state, username);
+  if (!user || !verifyPassword(input.password, user.passwordHash)) {
+    appendAuditLog(buildAuditPayload("login_failure", actor, username, "failure"));
+    throw new UnauthorizedError("账号或密码错误");
+  }
+  assertUserActive(user);
+
+  const createdAt = getNow().toISOString();
+  const session: AuthSession = {
+    token: generateSessionToken(user.id, createdAt),
+    userId: user.id,
+    createdAt,
+    expiresAt: new Date(Date.now() + 2 * 60 * 60 * 1000).toISOString(),
+  };
+  state.sessionsByToken.set(session.token, session);
+  appendAuditLog(buildAuditPayload("login_success", actor, user.id, "success"));
+  return { session, user: toPublicUser(user) };
+}
+
+/** 注销会话。 */
+export function logout(state: AuthServiceState, sessionToken: string, actor: ActorContext = {}): { success: true } {
+  const session = state.sessionsByToken.get(sessionToken);
+  if (!session) {
+    throw new UnauthorizedError("会话不存在");
+  }
+  session.endedAt = getNow().toISOString();
+  appendAuditLog(buildAuditPayload("logout", actor, session.userId, "success"));
+  return { success: true };
+}
+
+/** 创建新用户并保证用户名唯一。 */
+export function createUser(
+  state: AuthServiceState,
+  input: CreateUserInput,
+  actor: ActorContext = {}
+): PublicUser {
+  const username = normalizeUsername(input.username);
+  if (findUserByUsername(state, username)) {
+    throw new ConflictError("用户已存在", { username });
+  }
+  const now = getNow().toISOString();
+  const user: StoredUser = {
+    id: randomUUID(),
+    username,
+    passwordHash: hashPassword(input.password),
+    roles: ensureRoleList(input.roles || ["member"]),
+    enabled: input.enabled !== false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  state.usersById.set(user.id, user);
+  state.userIdByUsername.set(user.username, user.id);
+  appendAuditLog(buildAuditPayload("user_created", actor, user.id, "success"));
+  return toPublicUser(user);
+}
+
+/** 启用或禁用用户。 */
+export function setUserEnabled(
+  state: AuthServiceState,
+  userId: string,
+  enabled: boolean,
+  actor: ActorContext = {}
+): PublicUser {
+  requireActorPermission(actor, ["admin"]);
+  const user = requireUser(state, userId);
+  user.enabled = enabled;
+  user.updatedAt = getNow().toISOString();
+  appendAuditLog(buildAuditPayload(enabled ? "user_enabled" : "user_disabled", actor, user.id, "success"));
+  return toPublicUser(user);
+}
+
+/** 重置用户密码。 */
+export function resetPassword(
+  state: AuthServiceState,
+  userId: string,
+  newPassword: string,
+  actor: ActorContext = {}
+): PublicUser {
+  requireActorPermission(actor, ["admin", "librarian"]);
+  const user = requireUser(state, userId);
+  user.passwordHash = hashPassword(newPassword);
+  user.updatedAt = getNow().toISOString();
+  appendAuditLog(buildAuditPayload("password_reset", actor, user.id, "success"));
+  return toPublicUser(user);
+}
+
+/** 为用户分配角色。 */
+export function assignRoles(
+  state: AuthServiceState,
+  userId: string,
+  roles: AuthRole[],
+  actor: ActorContext = {}
+): PublicUser {
+  requireActorPermission(actor, ["admin"]);
+  const user = requireUser(state, userId);
+  user.roles = ensureRoleList(roles);
+  user.updatedAt = getNow().toISOString();
+  appendAuditLog(buildAuditPayload("role_changed", actor, user.id, "success"));
+  return toPublicUser(user);
+}
+
+export function __resetAuthStore(state: AuthServiceState): void {
+  state.usersById.clear();
+  state.userIdByUsername.clear();
+  state.sessionsByToken.clear();
+  seedDefaultAdmin(state);
+}
+`;
+}
+
+function buildQueryServiceScaffold(entityStem: string): string {
+  const entityPascal = toPascalCase(entityStem) || "Item";
+  return `import { NotFoundError } from "../errors";
+
+export interface ${entityPascal}Record {
+  id: string;
+  title: string;
+  status?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  [key: string]: unknown;
+}
+
+export interface ${entityPascal}QueryOptions {
+  keyword?: string;
+  status?: string;
+  limit?: number;
+}
+
+function matches${entityPascal}Keyword(record: ${entityPascal}Record, keyword: string): boolean {
+  return JSON.stringify(record).toLowerCase().includes(keyword.toLowerCase());
+}
+
+export function list${entityPascal}Records(
+  records: ${entityPascal}Record[],
+  options: ${entityPascal}QueryOptions = {}
+): ${entityPascal}Record[] {
+  let result = [...records];
+  if (options.keyword) {
+    result = result.filter((record) => matches${entityPascal}Keyword(record, options.keyword as string));
+  }
+  if (options.status) {
+    result = result.filter((record) => String(record.status || "").toLowerCase() === String(options.status).toLowerCase());
+  }
+  if (typeof options.limit === "number" && options.limit >= 0) {
+    result = result.slice(0, options.limit);
+  }
+  return result;
+}
+
+export function find${entityPascal}ById(records: ${entityPascal}Record[], id: string): ${entityPascal}Record {
+  const found = records.find((record) => record.id === id);
+  if (!found) {
+    throw new NotFoundError("${entityPascal} 记录不存在", { id });
+  }
+  return found;
+}
+
+export function summarize${entityPascal}Collection(records: ${entityPascal}Record[]): {
+  total: number;
+  active: number;
+} {
+  return {
+    total: records.length,
+    active: records.filter((record) => String(record.status || "active").toLowerCase() !== "archived").length,
+  };
+}
+`;
+}
+
+function buildMutationServiceScaffold(entityStem: string): string {
+  const entityPascal = toPascalCase(entityStem) || "Item";
+  const entityCamel = toCamelCase(entityStem) || "item";
+  return `import { NotFoundError, ValidationError } from "../errors";
+
+export interface ${entityPascal}MutationInput {
+  id?: string;
+  title: string;
+  status?: string;
+  [key: string]: unknown;
+}
+
+export interface ${entityPascal}Record extends ${entityPascal}MutationInput {
+  id: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function build${entityPascal}Id(seed: number): string {
+  return "${entityCamel}-" + String(seed).padStart(4, "0");
+}
+
+export function create${entityPascal}Record(
+  input: ${entityPascal}MutationInput,
+  existing: ${entityPascal}Record[] = []
+): ${entityPascal}Record {
+  const title = String(input.title || "").trim();
+  if (!title) {
+    throw new ValidationError("${entityPascal} 标题不能为空");
+  }
+
+  const now = new Date().toISOString();
+  return {
+    ...input,
+    id: input.id || build${entityPascal}Id(existing.length + 1),
+    title,
+    status: input.status || "active",
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function update${entityPascal}Record(
+  records: ${entityPascal}Record[],
+  id: string,
+  patch: Partial<${entityPascal}MutationInput>
+): ${entityPascal}Record {
+  const index = records.findIndex((record) => record.id === id);
+  if (index < 0) {
+    throw new NotFoundError("${entityPascal} 记录不存在", { id });
+  }
+
+  const nextTitle = patch.title === undefined ? records[index].title : String(patch.title).trim();
+  if (!nextTitle) {
+    throw new ValidationError("${entityPascal} 标题不能为空");
+  }
+
+  const updated: ${entityPascal}Record = {
+    ...records[index],
+    ...patch,
+    title: nextTitle,
+    updatedAt: new Date().toISOString(),
+  };
+  records[index] = updated;
+  return updated;
+}
+
+export function delete${entityPascal}Record(records: ${entityPascal}Record[], id: string): ${entityPascal}Record[] {
+  const exists = records.some((record) => record.id === id);
+  if (!exists) {
+    throw new NotFoundError("${entityPascal} 记录不存在", { id });
+  }
+  return records.filter((record) => record.id !== id);
+}
+`;
+}
+
+function buildInventoryServiceScaffold(entityStem: string): string {
+  const entityPascal = toPascalCase(entityStem) || "Item";
+  return `import { NotFoundError, ValidationError } from "../errors";
+
+export interface ${entityPascal}InventoryRecord {
+  id: string;
+  totalQuantity: number;
+  availableQuantity: number;
+  reservedQuantity: number;
+  status?: string;
+  [key: string]: unknown;
+}
+
+function find${entityPascal}InventoryIndex(records: ${entityPascal}InventoryRecord[], id: string): number {
+  return records.findIndex((record) => record.id === id);
+}
+
+export function adjust${entityPascal}Inventory(
+  records: ${entityPascal}InventoryRecord[],
+  id: string,
+  delta: number
+): ${entityPascal}InventoryRecord {
+  const index = find${entityPascal}InventoryIndex(records, id);
+  if (index < 0) {
+    throw new NotFoundError("${entityPascal} 库存记录不存在", { id });
+  }
+
+  const nextAvailable = records[index].availableQuantity + delta;
+  if (nextAvailable < 0) {
+    throw new ValidationError("${entityPascal} 可用库存不能小于 0", { id, delta });
+  }
+
+  const updated = {
+    ...records[index],
+    availableQuantity: nextAvailable,
+    totalQuantity: Math.max(records[index].totalQuantity, nextAvailable + records[index].reservedQuantity),
+  };
+  records[index] = updated;
+  return updated;
+}
+
+export function mark${entityPascal}Availability(
+  records: ${entityPascal}InventoryRecord[],
+  id: string,
+  status: string
+): ${entityPascal}InventoryRecord {
+  const index = find${entityPascal}InventoryIndex(records, id);
+  if (index < 0) {
+    throw new NotFoundError("${entityPascal} 库存记录不存在", { id });
+  }
+
+  const updated = {
+    ...records[index],
+    status: String(status || "active"),
+  };
+  records[index] = updated;
+  return updated;
+}
+
+export function summarize${entityPascal}Inventory(records: ${entityPascal}InventoryRecord[]): {
+  totalItems: number;
+  totalQuantity: number;
+  availableQuantity: number;
+  lowStockIds: string[];
+} {
+  return {
+    totalItems: records.length,
+    totalQuantity: records.reduce((sum, record) => sum + record.totalQuantity, 0),
+    availableQuantity: records.reduce((sum, record) => sum + record.availableQuantity, 0),
+    lowStockIds: records.filter((record) => record.availableQuantity <= 1).map((record) => record.id),
+  };
+}
+`;
+}
+
 export function getDeterministicTemplateScaffold(
   state: JimClawState,
   fileTarget: string
@@ -1076,6 +2221,7 @@ export function getDeterministicTemplateScaffold(
   const normalizedTarget = fileTarget.replace(/\\/g, "/");
   const port = state.manifest?.services?.[0]?.port || state.consensusCore?.port || 10000;
   const declaredFiles = new Set((state.spec?.filesToCreate || []).map((file) => String(file).replace(/\\/g, "/")));
+  const codeMap = parseStateCodeMap(state);
   const loggerModulePath = declaredFiles.has("src/middleware/logger.ts")
     ? "./middleware/logger"
     : declaredFiles.has("src/logger.ts")
@@ -1115,6 +2261,38 @@ export function getDeterministicTemplateScaffold(
   const devDeps = { ...(state.spec?.devDependencies || {}) };
 
   if (normalizedTarget === "package.json") {
+    const language = String(state.spec?.language || "").toLowerCase();
+    const framework = String(state.spec?.framework || "").toLowerCase();
+    const hasAuthSurface =
+      Boolean(state.requirementProtocol?.capabilities?.authRequired) ||
+      declaredFiles.has("src/middleware/auth.ts") ||
+      declaredFiles.has("src/controllers/authController.ts") ||
+      declaredFiles.has("src/routes/auth.ts") ||
+      declaredFiles.has("tests/auth.test.ts");
+    const isExpressRuntime =
+      /express/.test(framework) ||
+      declaredFiles.has("src/index.ts") ||
+      declaredFiles.has("src/index.js");
+    const isTypeScriptRuntime = /typescript/.test(language);
+    const nextRuntimeDeps = { ...runtimeDeps };
+    const nextDevDeps = { ...devDeps };
+
+    if (isExpressRuntime) {
+      nextRuntimeDeps.express = nextRuntimeDeps.express || "^4.18.2";
+      nextRuntimeDeps.cors = nextRuntimeDeps.cors || "^2.8.5";
+    }
+    if (hasAuthSurface) {
+      nextRuntimeDeps.jsonwebtoken = nextRuntimeDeps.jsonwebtoken || "^9.0.2";
+    }
+    if (isTypeScriptRuntime) {
+      nextDevDeps.typescript = nextDevDeps.typescript || "^5.3.3";
+      nextDevDeps["ts-node"] = nextDevDeps["ts-node"] || "^10.9.2";
+      nextDevDeps["@types/node"] = nextDevDeps["@types/node"] || "^20.10.0";
+      nextDevDeps["@types/express"] = nextDevDeps["@types/express"] || "^5.0.0";
+      if (nextRuntimeDeps.jsonwebtoken) {
+        nextDevDeps["@types/jsonwebtoken"] = nextDevDeps["@types/jsonwebtoken"] || "^9.0.10";
+      }
+    }
     const packageJson = {
       name: projectName,
       version: "1.0.0",
@@ -1126,12 +2304,12 @@ export function getDeterministicTemplateScaffold(
         start: "node dist/src/index.js",
         test: "jest",
       },
-      dependencies: runtimeDeps,
+      dependencies: nextRuntimeDeps,
       devDependencies: {
-        ...devDeps,
-        "@types/cors": devDeps["@types/cors"] || "^2.8.17",
-        supertest: devDeps.supertest || "^7.1.1",
-        "@types/supertest": devDeps["@types/supertest"] || "^6.0.3",
+        ...nextDevDeps,
+        "@types/cors": nextDevDeps["@types/cors"] || "^2.8.17",
+        supertest: nextDevDeps.supertest || "^7.1.1",
+        "@types/supertest": nextDevDeps["@types/supertest"] || "^6.0.3",
       },
     };
     return `${JSON.stringify(packageJson, null, 2)}\n`;
@@ -1182,6 +2360,46 @@ export function getDeterministicTemplateScaffold(
 `;
   }
 
+  if (normalizedTarget === "src/errors.ts") {
+    return buildErrorModuleScaffold();
+  }
+
+  if (/^src\/services\/authSessionService\.(ts|js)$/i.test(normalizedTarget)) {
+    return buildAuthSessionServiceScaffold();
+  }
+
+  if (/^src\/services\/authCredentialService\.(ts|js)$/i.test(normalizedTarget)) {
+    return buildAuthCredentialServiceScaffold();
+  }
+
+  if (/^src\/services\/authAccountPolicyService\.(ts|js)$/i.test(normalizedTarget)) {
+    return buildAuthAccountPolicyServiceScaffold();
+  }
+
+  if (/^src\/services\/authService\.(ts|js)$/i.test(normalizedTarget)) {
+    const authLoggerImportPath = declaredFiles.has("src/logging/logger.ts")
+      ? "../logging/logger"
+      : declaredFiles.has("src/logger.ts")
+        ? "../logger"
+        : "../middleware/logger";
+    return buildAuthServiceScaffold(authLoggerImportPath);
+  }
+
+  const splitServiceMatch = normalizedTarget.match(/^src\/services\/(.+?)(Query|Mutation|Inventory)Service\.(ts|js)$/i);
+  if (splitServiceMatch) {
+    const entityStem = toCamelCase(splitServiceMatch[1]) || "item";
+    const serviceKind = splitServiceMatch[2].toLowerCase();
+    if (serviceKind === "query") {
+      return buildQueryServiceScaffold(entityStem);
+    }
+    if (serviceKind === "mutation") {
+      return buildMutationServiceScaffold(entityStem);
+    }
+    if (serviceKind === "inventory") {
+      return buildInventoryServiceScaffold(entityStem);
+    }
+  }
+
   if (normalizedTarget === "src/errorHandler.ts" || normalizedTarget === "src/utils/errorHandler.ts") {
     return `import { NextFunction, Request, Response } from "express";
 
@@ -1201,7 +2419,11 @@ export function errorHandler(
 `;
   }
 
-  if (normalizedTarget === "src/logger.ts" || normalizedTarget === "src/middleware/logger.ts") {
+  if (
+    normalizedTarget === "src/logger.ts" ||
+    normalizedTarget === "src/middleware/logger.ts" ||
+    normalizedTarget === "src/logging/logger.ts"
+  ) {
     return `import { NextFunction, Request, Response } from "express";
 
 export interface LogEntry {
@@ -1396,8 +2618,6 @@ export function requireRole(...allowedRoles: string[]): RequestHandler {
     const methodSet = new Set(ownedEndpoints.map((item) => item.split(/\s+/, 1)[0]));
     const resourceStem = crudRouteMatch[1].replace(/routes?$/i, "").replace(/route$/i, "");
     const singularStem = singularizeStem(resourceStem);
-    const singularPascal = toPascalCase(singularStem);
-    const pluralPascal = toPascalCase(resourceStem.endsWith("s") ? resourceStem : `${resourceStem}s`);
     const resourcePath = deriveRouteMountPath(ownedEndpoints, `/api/${resourceStem}`);
     const hasCrudShape =
       ownedEndpoints.length > 0 &&
@@ -1407,22 +2627,27 @@ export function requireRole(...allowedRoles: string[]): RequestHandler {
       methodSet.has("DELETE");
 
     if (hasCrudShape) {
-      const hasLoggerMiddleware = declaredFiles.has("src/middleware/logMiddleware.ts");
-      return `import { Router } from "express";
-import { get${pluralPascal}, add${singularPascal}, edit${singularPascal}, delete${singularPascal} } from "../controllers/${singularStem}Controller";
-import { authMiddleware } from "../middleware/authMiddleware";
-${hasLoggerMiddleware ? 'import { logMiddleware } from "../middleware/logMiddleware";\n' : ""}
-
-const router = Router();
-
-${hasLoggerMiddleware ? "router.use(logMiddleware);\n\n" : ""}router.get("/", get${pluralPascal});
-router.post("/", authMiddleware, add${singularPascal});
-router.put("/:id", authMiddleware, edit${singularPascal});
-router.delete("/:id", authMiddleware, delete${singularPascal});
-
-export const ${toIdentifier(resourceStem)}RouteBase = "${resourcePath}";
-export default router;
-`;
+      const controllerPath = `src/controllers/${singularStem}Controller`;
+      const controllerSource =
+        codeMap[`${controllerPath}.ts`] ||
+        codeMap[`${controllerPath}.js`] ||
+        "";
+      const authImportPath = declaredFiles.has("src/middleware/auth.ts")
+        ? "../middleware/auth"
+        : declaredFiles.has("src/middleware/authMiddleware.ts")
+          ? "../middleware/authMiddleware"
+          : declaredFiles.has("src/middleware/authMiddleware.js")
+            ? "../middleware/authMiddleware"
+            : null;
+      return buildCrudRouteScaffold({
+        controllerImportPath: `../controllers/${singularStem}Controller`,
+        controllerSource,
+        authImportPath,
+        ownedEndpoints,
+        singularStem,
+        pluralStem: resourceStem.endsWith("s") ? resourceStem : `${resourceStem}s`,
+        resourcePath,
+      });
     }
   }
 
@@ -1683,10 +2908,11 @@ export default app;
   }
 
   if (normalizedTarget === "tests/health.test.ts") {
-    const loggerImportPath = declaredFiles.has("src/middleware/logger.ts")
-      ? "../src/middleware/logger"
-      : "../src/logger";
-    const hasAuthMiddleware = declaredFiles.has("src/middleware/auth.ts");
+    const loggerImportPath = declaredFiles.has("src/logging/logger.ts")
+      ? "../src/logging/logger"
+      : declaredFiles.has("src/logger.ts")
+        ? "../src/logger"
+        : "../src/middleware/logger";
     return `import request from "supertest";
 import app from "../src/index";
 import { clearLogs, getLogs } from "${loggerImportPath}";
@@ -1696,16 +2922,16 @@ describe("Health API", () => {
     clearLogs();
   });
 
-  it("GET /api/health ${hasAuthMiddleware ? "在无授权时返回 401" : "返回 200"}", async () => {
+  it("GET /api/health 返回 200", async () => {
     const response = await request(app).get("/api/health");
 
-    expect(response.status).toBe(${hasAuthMiddleware ? 401 : 200});
-    expect(response.body).toHaveProperty("success", ${hasAuthMiddleware ? "false" : "true"});
+    expect(response.status).toBe(200);
+    expect(response.body).toHaveProperty("success", true);
   });
 
   it("GET /api/health 在有效请求下返回健康状态", async () => {
     const response = await request(app)
-      .get("/api/health")${hasAuthMiddleware ? '\n      .set("X-API-Key", "test-api-key-12345")' : ""};
+      .get("/api/health");
 
     expect(response.status).toBe(200);
     expect(response.body).toHaveProperty("success", true);
@@ -1717,7 +2943,7 @@ describe("Health API", () => {
 
   it("GET /api/health 会记录完整访问路径", async () => {
     await request(app)
-      .get("/api/health")${hasAuthMiddleware ? '\n      .set("X-API-Key", "test-api-key-12345")' : ""};
+      .get("/api/health");
 
     const logs = getLogs();
     const lastLog = logs[logs.length - 1];
@@ -1742,9 +2968,41 @@ describe("Health API", () => {
 `;
   }
 
+  if (normalizedTarget === "tests/auth.test.ts") {
+    return `import request from "supertest";
+import app from "../src/index";
+
+describe("Auth API 基线", () => {
+  it("POST /api/auth/login 缺少凭据时返回受控状态", async () => {
+    const response = await request(app).post("/api/auth/login").send({});
+
+    expect(response.status).toBeLessThan(500);
+    expect([200, 201, 400, 401]).toContain(response.status);
+  });
+
+  it("GET /api/auth/me 未登录时返回受控状态", async () => {
+    const response = await request(app).get("/api/auth/me");
+
+    expect([200, 401, 403]).toContain(response.status);
+  });
+});
+`;
+  }
+
+  if (normalizedTarget === "scripts/verify.ts") {
+    return buildVerifyScriptScaffold(state);
+  }
+
   const crudTestMatch = normalizedTarget.match(/^tests\/([^/]+)\.test\.(ts|js)$/);
   if (crudTestMatch && !/^(health|user)$/i.test(crudTestMatch[1])) {
     const resourceStem = crudTestMatch[1];
+    const ownedEndpoints = inferOwnedEndpoints(`src/routes/${resourceStem}.ts`, state.apiContract);
+    const hasBoundedCrudApp =
+      declaredFiles.has("src/index.ts") &&
+      ownedEndpoints.some((endpoint) => /^(GET|POST|PUT|PATCH|DELETE)\s+/i.test(endpoint));
+    if (hasBoundedCrudApp) {
+      return buildCrudApiTestScaffold(state, resourceStem, declaredFiles);
+    }
     const singularStem = singularizeStem(resourceStem);
     const singularPascal = toPascalCase(singularStem);
     const pluralPascal = toPascalCase(resourceStem.endsWith("s") ? resourceStem : `${resourceStem}s`);
@@ -2139,12 +3397,295 @@ export function getDependencyRules(language: string, serverFile?: string, filesC
   return "";
 }
 
+function isInfraOwnedArtifactFile(file: string): boolean {
+  const normalized = String(file || "").replace(/\\/g, "/").trim().toLowerCase();
+  if (!normalized) return false;
+
+  if (
+    normalized === "package-lock.json" ||
+    normalized === "npm-shrinkwrap.json" ||
+    normalized === "pnpm-lock.yaml" ||
+    normalized === "yarn.lock" ||
+    normalized === "bun.lockb" ||
+    normalized === "cargo.lock" ||
+    normalized === "gradle.lockfile"
+  ) {
+    return true;
+  }
+
+  if (
+    /(?:^|\/)(?:node_modules|dist|build|coverage|\.next|\.turbo|out|target|\.gradle)(?:\/|$)/.test(normalized) ||
+    /\.tsbuildinfo$/i.test(normalized)
+  ) {
+    return true;
+  }
+
+  return false;
+}
+
+function getFallbackTaskPriority(file: string): number {
+  const normalized = String(file || "").replace(/\\/g, "/").toLowerCase();
+  if (!normalized) return 999;
+  if (/^(package\.json|pom\.xml|cargo\.toml)$/.test(normalized)) return 0;
+  if (/^(tsconfig\.json|jest\.config\.[^.]+|vitest\.config\.[^.]+|eslint\.config\.[^.]+|\.env(?:\..+)?|prisma\/schema\.prisma)$/.test(normalized)) return 5;
+  if (/^src\/models\//.test(normalized)) return 10;
+  if (/^src\/repositories\//.test(normalized)) return 20;
+  if (/^src\/services\//.test(normalized)) return 30;
+  if (/^src\/controllers\//.test(normalized)) return 40;
+  if (/^src\/middlewares?\//.test(normalized)) return 50;
+  if (/^src\/routes\//.test(normalized)) return 60;
+  if (/^src\/(app|index|main)\./.test(normalized) || normalized === "src/main.rs") return 70;
+  if (/^public\/.+|\.html$|\.css$|\.jsx?$|\.tsx?$/.test(normalized)) return 80;
+  if (/^tests?\//.test(normalized) || /\.test\.[^.]+$/.test(normalized) || /\.spec\.[^.]+$/.test(normalized)) return 90;
+  if (/^scripts\//.test(normalized)) return 100;
+  if (/^(dockerfile|docker-compose\.ya?ml|\.dockerignore)$/.test(normalized)) return 110;
+  if (/^readme\.md$|^docs\//.test(normalized)) return 120;
+  return 95;
+}
+
+function getFallbackStem(file: string): string {
+  return getExecutionDependencyStem(file);
+}
+
+function stripExecutionCapabilitySuffix(stem: string): string {
+  const normalized = String(stem || "").toLowerCase();
+  const suffixes = [
+    "accountpolicy",
+    "credential",
+    "session",
+    "inventory",
+    "mutation",
+    "query",
+    "status",
+  ];
+  for (const suffix of suffixes) {
+    if (normalized.endsWith(suffix) && normalized.length > suffix.length) {
+      return normalized.slice(0, -suffix.length);
+    }
+  }
+  return normalized;
+}
+
+export function getExecutionDependencyStem(file: string): string {
+  const normalized = String(file || "").replace(/\\/g, "/");
+  const base = path.posix.basename(normalized, path.posix.extname(normalized)).toLowerCase();
+  return singularizeStem(
+    stripExecutionCapabilitySuffix(
+      base
+      .replace(/controller$/, "")
+      .replace(/service$/, "")
+      .replace(/repository$/, "")
+      .replace(/routes?$/, "")
+      .replace(/middleware$/, "")
+      .replace(/validator$/, "")
+      .replace(/model$/, "")
+      .replace(/test$/, "")
+      .replace(/spec$/, "")
+    )
+  );
+}
+
+export function isAggregateExecutionServiceFile(file: string): boolean {
+  const normalized = String(file || "").replace(/\\/g, "/").toLowerCase();
+  if (!/^src\/services\//i.test(normalized)) return false;
+  const base = path.posix.basename(normalized, path.posix.extname(normalized)).toLowerCase();
+  if (!base.endsWith("service")) return false;
+  const rawStem = base.replace(/service$/, "");
+  return stripExecutionCapabilitySuffix(rawStem) === rawStem;
+}
+
+function isCrossCuttingExecutionFile(file: string): boolean {
+  const stem = getExecutionDependencyStem(file);
+  return ["auth", "permission", "rbac", "logger", "logging", "error", "audit"].includes(stem);
+}
+
+function getFallbackCandidatesByPattern(files: string[], currentFile: string, patterns: RegExp[]): string[] {
+  const normalizedCurrent = String(currentFile || "").replace(/\\/g, "/").toLowerCase();
+  return files.filter((file) => {
+    const normalized = String(file || "").replace(/\\/g, "/").toLowerCase();
+    return normalized !== normalizedCurrent && patterns.some((pattern) => pattern.test(normalized));
+  });
+}
+
+function pickPreferredFallbackServiceDependency(files: string[], currentFile: string, stem: string): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  const candidates = getFallbackCandidatesByPattern(files, currentFile, [/^src\/services\//i]);
+  if (!normalizedStem) return candidates.length > 0 ? [candidates[0]] : [];
+  const sameStem = candidates.filter((file) => getExecutionDependencyStem(file) === normalizedStem);
+  if (sameStem.length === 0) return [];
+  const aggregate = sameStem.find((file) => isAggregateExecutionServiceFile(file));
+  return [aggregate || sameStem[0]];
+}
+
+function pickPreferredFallbackControllerDependency(files: string[], currentFile: string, stem: string): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  const candidates = getFallbackCandidatesByPattern(files, currentFile, [/^src\/controllers\//i]);
+  if (!normalizedStem) return candidates.length > 0 ? [candidates[0]] : [];
+  const sameStem = candidates.filter((file) => getExecutionDependencyStem(file) === normalizedStem);
+  return sameStem.length > 0 ? [sameStem[0]] : [];
+}
+
+function pickPreferredFallbackMiddlewareDependencies(files: string[], currentFile: string, stem: string): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  const candidates = getFallbackCandidatesByPattern(files, currentFile, [/^src\/middlewares?\//i]);
+  const sameStem = normalizedStem
+    ? candidates.filter((file) => getExecutionDependencyStem(file) === normalizedStem)
+    : [];
+  const crossCutting = candidates.filter((file) => isCrossCuttingExecutionFile(file));
+  return Array.from(new Set([...sameStem, ...crossCutting]));
+}
+
+function pickSplitFallbackServiceDependencies(files: string[], currentFile: string, stem: string): string[] {
+  const normalizedStem = String(stem || "").toLowerCase();
+  if (!normalizedStem || !isAggregateExecutionServiceFile(currentFile)) return [];
+  return getFallbackCandidatesByPattern(files, currentFile, [/^src\/services\//i])
+    .filter((file) => getExecutionDependencyStem(file) === normalizedStem)
+    .filter((file) => !isAggregateExecutionServiceFile(file));
+}
+
+function pickFallbackDependencyByPattern(
+  files: string[],
+  currentFile: string,
+  patterns: RegExp[],
+  stem?: string,
+  strictStem = false
+): string[] {
+  const normalizedCurrent = String(currentFile || "").replace(/\\/g, "/").toLowerCase();
+  const normalizedStem = String(stem || "").toLowerCase();
+  const candidates = files.filter((file) => {
+    const normalized = String(file || "").replace(/\\/g, "/").toLowerCase();
+    return normalized !== normalizedCurrent && patterns.some((pattern) => pattern.test(normalized));
+  });
+
+  if (candidates.length === 0) return [];
+  if (!normalizedStem) return [candidates[0]];
+
+  const preferred = candidates.find((file) => getFallbackStem(file) === normalizedStem);
+  if (preferred) return [preferred];
+  return strictStem ? [] : [candidates[0]];
+}
+
+function inferFallbackDependencies(file: string, files: string[], runtime: ProjectRuntime): string[] {
+  const normalized = String(file || "").replace(/\\/g, "/");
+  const lower = normalized.toLowerCase();
+  const stem = getFallbackStem(normalized);
+  const deps = new Set<string>();
+  const add = (items: string[]) => items.filter(Boolean).forEach((item) => deps.add(item));
+  const hasPackageJson = files.includes("package.json");
+
+  if (/^(package\.json|pom\.xml|cargo\.toml|readme\.md|\.env(?:\..+)?)$/i.test(normalized)) {
+    return [];
+  }
+
+  if (/^(tsconfig\.json|jest\.config\.[^.]+|vitest\.config\.[^.]+|eslint\.config\.[^.]+)$/i.test(normalized)) {
+    return hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (/^dockerfile$/i.test(normalized)) {
+    return hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (/^docker-compose\.ya?ml$/i.test(normalized)) {
+    if (files.includes("Dockerfile")) return ["Dockerfile"];
+    return hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (/^\.dockerignore$/i.test(normalized)) {
+    return [];
+  }
+
+  if (/^prisma\/schema\.prisma$/i.test(normalized)) {
+    return hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (/^prisma\/.+/i.test(normalized)) {
+    return files.includes("prisma/schema.prisma") ? ["prisma/schema.prisma"] : hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (/^src\/models\//i.test(normalized)) {
+    return [];
+  }
+
+  if (/^src\/repositories\//i.test(normalized)) {
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/models\//i], stem));
+    return Array.from(deps);
+  }
+
+  if (/^src\/services\//i.test(normalized)) {
+    add(pickSplitFallbackServiceDependencies(files, normalized, stem));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/repositories\//i], stem, true));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/models\//i], stem, true));
+    return Array.from(deps);
+  }
+
+  if (/^src\/controllers\//i.test(normalized)) {
+    add(pickPreferredFallbackServiceDependency(files, normalized, stem));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/models\//i], stem, true));
+    return Array.from(deps);
+  }
+
+  if (/^src\/middlewares?\//i.test(normalized)) {
+    add(pickPreferredFallbackServiceDependency(files, normalized, stem));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/models\//i], stem, true));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/config\//i, /^src\/utils\//i, /^src\/logging\//i]));
+    return Array.from(deps);
+  }
+
+  if (/^src\/routes\//i.test(normalized)) {
+    add(pickPreferredFallbackControllerDependency(files, normalized, stem));
+    add(pickPreferredFallbackMiddlewareDependencies(files, normalized, stem));
+    return Array.from(deps);
+  }
+
+  if (/^src\/(app|index)\./i.test(normalized) || lower === "src/main.rs" || /^src\/main\/java\//i.test(normalized)) {
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/routes\//i]));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/middlewares?\//i]));
+    if (deps.size === 0 && hasPackageJson && runtime === "node") deps.add("package.json");
+    return Array.from(deps);
+  }
+
+  if (/^public\/.+|\.html$/i.test(normalized)) {
+    if (files.includes("src/index.ts")) return ["src/index.ts"];
+    if (files.includes("src/index.js")) return ["src/index.js"];
+    return [];
+  }
+
+  if (/^tests?\//i.test(normalized) || /\.test\.[^.]+$/i.test(normalized) || /\.spec\.[^.]+$/i.test(normalized)) {
+    if (/setup\.test\.[^.]+$/i.test(normalized)) {
+      add(hasPackageJson ? ["package.json"] : []);
+      add(pickFallbackDependencyByPattern(files, normalized, [/^jest\.config\.[^.]+$/i, /^vitest\.config\.[^.]+$/i]));
+      return Array.from(deps);
+    }
+
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/(app|index)\./i, /^src\/main\.rs$/i, /^src\/main\/java\//i]));
+    add(pickFallbackDependencyByPattern(files, normalized, [/^src\/routes\//i], stem));
+    return Array.from(deps);
+  }
+
+  if (/^scripts\//i.test(normalized)) {
+    return hasPackageJson ? ["package.json"] : [];
+  }
+
+  if (runtime === "node" && /^src\/.+\.(ts|js|tsx|jsx)$/i.test(normalized) && hasPackageJson) {
+    return ["package.json"];
+  }
+
+  return [];
+}
+
 /**
  * Fallback 子任务生成：当模型拆解失败时，基于 TechSpec 的 filesToCreate 动态生成任务链
  */
 export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
   const language = spec?.language || "TypeScript";
-  const filesToCreate = spec?.filesToCreate || [];
+  const runtime = detectLanguageFamily(language);
+  const filesToCreate = (spec?.filesToCreate || [])
+    .map((file: string) => String(file).replace(/\\/g, "/"))
+    .filter((file: string) => !isInfraOwnedArtifactFile(file))
+    .sort((left: string, right: string) => {
+      const priorityDelta = getFallbackTaskPriority(left) - getFallbackTaskPriority(right);
+      return priorityDelta !== 0 ? priorityDelta : left.localeCompare(right);
+    });
   const tasks: any[] = [];
 
   // 1. 识别必需的基础文件（如果是 TS/JS 项目且没有在 filesToCreate 中显式包含 package.json）
@@ -2161,13 +3702,13 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
     });
   }
 
+  const taskFiles = tasks.map((task) => task.fileTarget).concat(filesToCreate);
+
   // 2. 遍历 filesToCreate 动态生成任务
   filesToCreate.forEach((file: string, index: number) => {
     // 跳过重复的 package.json
     if (file.includes("package.json") && tasks.some(t => t.fileTarget === "package.json")) return;
-
-    // 建立简单的依赖链（后续文件依赖前续文件，虽然不严谨但能保证顺序）
-    const dependencies = index > 0 ? [`fallback_task_${index - 1}`] : (tasks.length > 0 ? [tasks[tasks.length - 1].id] : []);
+    const dependencies = inferFallbackDependencies(file, taskFiles, runtime);
 
     tasks.push({
       id: `fallback_task_${index}`,
@@ -2194,10 +3735,36 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
   return tasks;
 }
 
+function detectNodeTestFramework(spec: any): "vitest" | "jest" | "unknown" {
+  const files = (spec?.filesToCreate || []).map((file: string) => String(file).replace(/\\/g, "/").toLowerCase());
+  const testCommand = String(spec?.testCommand || "").toLowerCase();
+  const dependencies = {
+    ...(spec?.dependencies || {}),
+    ...(spec?.devDependencies || {}),
+  } as Record<string, string>;
+  const depNames = Object.keys(dependencies).map((name) => name.toLowerCase());
+  const hasVitestSignal =
+    /vitest/.test(testCommand) ||
+    files.some((file: string) => /^vitest\.config\./.test(path.posix.basename(file))) ||
+    depNames.includes("vitest");
+  if (hasVitestSignal) return "vitest";
+
+  const hasJestSignal =
+    /jest|ts-jest/.test(testCommand) ||
+    files.some((file: string) => /^jest\.config\./.test(path.posix.basename(file))) ||
+    depNames.includes("jest") ||
+    depNames.includes("ts-jest") ||
+    depNames.includes("@types/jest");
+  if (hasJestSignal) return "jest";
+
+  return "unknown";
+}
+
 export function ensureTypeScriptTestBaseline(spec: any): any {
   const language = String(spec?.language || "").toLowerCase();
   const testCommand = String(spec?.testCommand || "").toLowerCase();
   if (!language.includes("typescript")) return spec;
+  if (detectNodeTestFramework(spec) === "vitest") return spec;
   if (!/(npm test|jest|ts-jest)/.test(testCommand)) return spec;
 
   const filesToCreate = new Set(
@@ -2248,6 +3815,269 @@ export function normalizeNodeProjectFileLayout(spec: any): any {
   };
 }
 
+function canonicalizeExecutionFilePath(fileTarget: string, requirementProtocol: RequirementProtocol | null | undefined, spec?: any): string {
+  const normalized = normalizeNodeJestTestFilePath(String(fileTarget || "").replace(/\\/g, "/"));
+  const ext = path.posix.extname(normalized) || (/typescript/i.test(String(spec?.language || "")) ? ".ts" : ".js");
+  const stem = ext ? normalized.slice(0, -ext.length) : normalized;
+  const { singular, plural } = getPrimaryEntityStems(requirementProtocol);
+  const camelSingular = toCamelCase(singular) || singular || "item";
+
+  if (/^src\/public\//i.test(normalized)) {
+    return normalized.replace(/^src\/public\//i, "public/");
+  }
+
+  if (/^src\/scripts\//i.test(normalized)) {
+    return normalized.replace(/^src\/scripts\//i, "scripts/");
+  }
+
+  if (
+    new RegExp(`^src/routes/${singular}(?:s)?(?:[-_]?routes?)?$`, "i").test(stem) ||
+    new RegExp(`^src/routes/${plural}(?:[-_]?routes?)?$`, "i").test(stem)
+  ) {
+    return `src/routes/${plural}${ext}`;
+  }
+
+  if (
+    new RegExp(`^src/controllers/${singular}(?:[-_]?controller)?$`, "i").test(stem) ||
+    new RegExp(`^src/controllers/${camelSingular}controller$`, "i").test(stem)
+  ) {
+    return `src/controllers/${camelSingular}Controller${ext}`;
+  }
+
+  if (
+    new RegExp(`^src/services/${singular}(?:[-_]?service)?$`, "i").test(stem) ||
+    new RegExp(`^src/services/${camelSingular}service$`, "i").test(stem)
+  ) {
+    return `src/services/${camelSingular}Service${ext}`;
+  }
+
+  if (
+    new RegExp(`^src/repositories/${singular}(?:[-_]?repository)?$`, "i").test(stem) ||
+    new RegExp(`^src/repositories/${camelSingular}repository$`, "i").test(stem)
+  ) {
+    return `src/repositories/${camelSingular}Repository${ext}`;
+  }
+
+  if (/^src\/middleware\/authenticate$/i.test(stem) || /^src\/middleware\/require[-_]?admin$/i.test(stem)) {
+    return `src/middleware/auth${ext}`;
+  }
+
+  if (/^scripts\/verify\.(ps1|sh)$/i.test(normalized)) {
+    return `scripts/verify${/typescript/i.test(String(spec?.language || "")) ? ".ts" : ".js"}`;
+  }
+
+  return normalized;
+}
+
+function orderFilesByPreferredSequence(files: string[]): string[] {
+  const preferredOrder = [
+    "package.json",
+    "tsconfig.json",
+    ".env.example",
+    "README.md",
+    "Dockerfile",
+    "docker-compose.yml",
+  ];
+  return [...files].sort((left, right) => {
+    const leftIndex = preferredOrder.indexOf(left);
+    const rightIndex = preferredOrder.indexOf(right);
+    if (leftIndex !== -1 || rightIndex !== -1) {
+      return (leftIndex === -1 ? preferredOrder.length : leftIndex) - (rightIndex === -1 ? preferredOrder.length : rightIndex);
+    }
+    return left.localeCompare(right);
+  });
+}
+
+function removeConflictingNodeTestFiles(spec: any): any {
+  const framework = detectNodeTestFramework(spec);
+  const filesToCreate = (spec?.filesToCreate || []).map((file: string) => String(file).replace(/\\/g, "/"));
+  const devDependencies = { ...(spec?.devDependencies || {}) } as Record<string, string>;
+
+  if (framework === "vitest") {
+    const filteredFiles = filesToCreate.filter((file: string) => !/^jest\.config\./i.test(file) && file !== "tests/setup.test.ts");
+    delete devDependencies.jest;
+    delete devDependencies["ts-jest"];
+    delete devDependencies["@types/jest"];
+    return {
+      ...spec,
+      filesToCreate: filteredFiles,
+      devDependencies,
+    };
+  }
+
+  if (framework === "jest") {
+    const filteredFiles = filesToCreate.filter((file: string) => !/^vitest\.config\./i.test(file));
+    delete devDependencies.vitest;
+    return {
+      ...spec,
+      filesToCreate: filteredFiles,
+      devDependencies,
+    };
+  }
+
+  return spec;
+}
+
+function isSimpleCrudExecutionTarget(spec: any, requirementProtocol: RequirementProtocol | null | undefined): boolean {
+  const language = String(spec?.language || "").toLowerCase();
+  if (!/typescript|javascript|node/.test(language)) return false;
+  if (!requirementProtocol?.capabilities?.backendRequired) return false;
+  const entities = (requirementProtocol?.capabilities?.crudEntities || requirementProtocol?.capabilities?.entities || [])
+    .filter((entity) => !["log", "permission"].includes(String(entity || "").toLowerCase()));
+  return entities.length <= 2;
+}
+
+function requiresDomainQuerySplit(requirementProtocol: RequirementProtocol | null | undefined): boolean {
+  const requirementText = joinedRequirementText(requirementProtocol);
+  return (
+    (requirementProtocol?.capabilities?.crudEntities?.length || 0) > 0 &&
+    (
+      /(查询|检索|搜索|筛选|过滤|排序|分页|query|search|filter|sort|page)/i.test(requirementText) ||
+      (requirementProtocol?.capabilities?.uiCapabilities?.length || 0) >= 2
+    )
+  );
+}
+
+function requiresDomainLifecycleSplit(requirementProtocol: RequirementProtocol | null | undefined): boolean {
+  const requirementText = joinedRequirementText(requirementProtocol);
+  return /(库存|馆藏|借阅|归还|预约|上下架|状态|inventory|stock|borrow|return|reserve|status)/i.test(requirementText);
+}
+
+function shouldUseBoundedCrudPlan(spec: any, requirementProtocol: RequirementProtocol | null | undefined): boolean {
+  if (!isSimpleCrudExecutionTarget(spec, requirementProtocol)) return false;
+  if ((spec?.filesToCreate?.length || 0) > 24) return true;
+  if (requirementProtocol?.capabilities?.authRequired) return true;
+  if (requiresDomainQuerySplit(requirementProtocol)) return true;
+  if (requiresDomainLifecycleSplit(requirementProtocol)) return true;
+  return false;
+}
+
+function pickFirstExisting(files: string[], patterns: RegExp[], fallback?: string): string | null {
+  for (const pattern of patterns) {
+    const match = files.find((file) => pattern.test(file));
+    if (match) return match;
+  }
+  return fallback || null;
+}
+
+function buildBoundedCrudFilePlan(spec: any, requirementProtocol: RequirementProtocol | null | undefined): string[] {
+  const normalizedFiles = (spec?.filesToCreate || []).map((file: string) => String(file).replace(/\\/g, "/"));
+  const language = String(spec?.language || "").toLowerCase();
+  const ext = /typescript/.test(language) ? ".ts" : ".js";
+  const framework = detectNodeTestFramework(spec);
+  const { singular, plural } = getPrimaryEntityStems(requirementProtocol);
+  const camelSingular = toCamelCase(singular) || singular || "item";
+  const auditRequired = Boolean(requirementProtocol?.capabilities?.auditLogRequired || requiresStructuredLogging(requirementProtocol));
+  const hasVerifyScript =
+    normalizedFiles.some((file: string) => /(^|\/)verify\./i.test(path.posix.basename(file))) ||
+    requiresVerifyScript(requirementProtocol);
+  const boundedFiles = new Set<string>();
+  const push = (value: string | null | undefined) => {
+    if (value) boundedFiles.add(value);
+  };
+
+  push("package.json");
+  if (/typescript/.test(language)) push("tsconfig.json");
+  push(".env.example");
+  push("README.md");
+
+  if (requirementProtocol?.capabilities?.dockerRequired) {
+    push("Dockerfile");
+    push("docker-compose.yml");
+  }
+
+  if (framework === "vitest") {
+    push(pickFirstExisting(normalizedFiles, [/^vitest\.config\./i], `vitest.config${ext}`));
+  } else if (framework === "jest") {
+    push(pickFirstExisting(normalizedFiles, [/^jest\.config\./i], "jest.config.cjs"));
+  }
+
+  push(pickFirstExisting(normalizedFiles, [/^src\/index\./i], `src/index${ext}`));
+  push(pickFirstExisting(normalizedFiles, [/^src\/config\/env\./i]));
+  push(`src/routes/${plural}${ext}`);
+  push(`src/controllers/${camelSingular}Controller${ext}`);
+  push(`src/models/${singular}${ext}`);
+  if (requiresDomainQuerySplit(requirementProtocol)) {
+    push(`src/services/${camelSingular}QueryService${ext}`);
+    push(`src/services/${camelSingular}MutationService${ext}`);
+  }
+  if (requiresDomainLifecycleSplit(requirementProtocol)) {
+    push(`src/services/${camelSingular}InventoryService${ext}`);
+  }
+  push(`src/services/${camelSingular}Service${ext}`);
+
+  if (requirementProtocol?.capabilities?.authRequired) {
+    push(`src/middleware/auth${ext}`);
+    push(`src/routes/auth${ext}`);
+    push(`src/controllers/authController${ext}`);
+    push(`src/services/authSessionService${ext}`);
+    push(`src/services/authCredentialService${ext}`);
+    push(`src/services/authAccountPolicyService${ext}`);
+    push(`src/services/authService${ext}`);
+  }
+
+  if (requirementProtocol?.capabilities?.authRequired || auditRequired) {
+    push(`src/errors${ext}`);
+  }
+  if (auditRequired) {
+    push(`src/logging/logger${ext}`);
+  }
+
+  if (requirementProtocol?.capabilities?.frontendRequired) {
+    push("public/index.html");
+  }
+
+  push(`tests/health.test${ext}`);
+  push(`tests/${plural}.test${ext}`);
+  if (requirementProtocol?.capabilities?.authRequired) {
+    push(`tests/auth.test${ext}`);
+  }
+
+  if (hasVerifyScript) {
+    push(`scripts/verify${ext}`);
+  }
+
+  return orderFilesByPreferredSequence(Array.from(boundedFiles));
+}
+
+export function stabilizeSpecForExecution(
+  spec: any,
+  requirementProtocol: RequirementProtocol | null | undefined
+): any {
+  const requirementDrivenSpec = ensureRequirementDrivenFiles(spec, requirementProtocol);
+  const normalizedFiles = Array.from<string>(
+    new Set(
+      (requirementDrivenSpec?.filesToCreate || [])
+        .map((file: string) => canonicalizeExecutionFilePath(file, requirementProtocol, requirementDrivenSpec))
+        .filter((file: string) => !isInfraOwnedArtifactFile(file))
+    )
+  );
+  let nextSpec = {
+    ...(requirementDrivenSpec || {}),
+    filesToCreate: orderFilesByPreferredSequence(normalizedFiles),
+  };
+  nextSpec = removeConflictingNodeTestFiles(nextSpec);
+  nextSpec = ensureTypeScriptTestBaseline(nextSpec);
+  nextSpec = normalizeNodeProjectFileLayout(nextSpec);
+
+  if (shouldUseBoundedCrudPlan(nextSpec, requirementProtocol)) {
+    nextSpec = {
+      ...nextSpec,
+      filesToCreate: buildBoundedCrudFilePlan(nextSpec, requirementProtocol),
+    };
+  }
+
+  nextSpec.filesToCreate = orderFilesByPreferredSequence(
+    Array.from<string>(
+      new Set(
+        (nextSpec.filesToCreate || []).map((file: string) => canonicalizeExecutionFilePath(file, requirementProtocol, nextSpec))
+          .filter((file: string) => !isInfraOwnedArtifactFile(file))
+      )
+    )
+  );
+  return removeConflictingNodeTestFiles(nextSpec);
+}
+
 export function getExpectedJestRoots(spec: any): string[] {
   if (!isNodeJestProject(spec)) return [];
 
@@ -2270,23 +4100,53 @@ export function getDeclaredBusinessTestFiles(spec: any): string[] {
     .filter((file: string) => path.posix.basename(file) !== "setup.test.ts");
 }
 
+function normalizeRouteContractPath(rawPath: string): string {
+  const normalized = String(rawPath || "").trim().replace(/\\/g, "/");
+  if (!normalized) return "/";
+  const withLeadingSlash = normalized.startsWith("/") ? normalized : `/${normalized}`;
+  const compact = withLeadingSlash.replace(/\/{2,}/g, "/");
+  if (compact !== "/" && compact.endsWith("/")) {
+    return compact.slice(0, -1);
+  }
+  return compact;
+}
+
+function mergeMountPathWithRoutePath(mountPath: string, routePath: string): string {
+  const normalizedMount = normalizeRouteContractPath(mountPath);
+  const normalizedRoute = normalizeRouteContractPath(routePath);
+  if (normalizedRoute === "/") return normalizedMount;
+  return normalizeRouteContractPath(`${normalizedMount}/${normalizedRoute.replace(/^\/+/, "")}`);
+}
+
 export function findContractRouteDrift(
   routeContent: string,
   contract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined,
+  options?: { ownedEndpoints?: string[] | null },
 ): string[] {
   const endpoints = contract?.endpoints || [];
   if (endpoints.length === 0) return [];
 
+  const scopedOwnedEndpoints = (options?.ownedEndpoints || []).filter(Boolean);
+  const allowedEndpointEntries = scopedOwnedEndpoints.length > 0
+    ? scopedOwnedEndpoints
+    : endpoints.map((ep) => `${String(ep.method || "").toUpperCase()} ${String(ep.path || "").trim()}`);
   const allowed = new Set(
-    endpoints.map((ep) => `${String(ep.method || "").toUpperCase()} ${String(ep.path || "").trim()}`)
+    allowedEndpointEntries.map((entry) => {
+      const [method, ...pathParts] = String(entry || "").trim().split(/\s+/);
+      return `${String(method || "").toUpperCase()} ${normalizeRouteContractPath(pathParts.join(" "))}`;
+    })
   );
+  const mountPath = scopedOwnedEndpoints.length > 0 ? deriveRouteMountPath(scopedOwnedEndpoints, "") : "";
 
   const routeRegex = /router\.(get|post|put|delete|patch)\s*\(\s*["'`](.+?)["'`]/gi;
   const drifts: string[] = [];
   let match: RegExpExecArray | null;
   while ((match = routeRegex.exec(routeContent)) !== null) {
-    const actual = `${match[1].toUpperCase()} ${match[2]}`;
-    if (!allowed.has(actual)) {
+    const method = match[1].toUpperCase();
+    const directPath = normalizeRouteContractPath(match[2]);
+    const actual = `${method} ${directPath}`;
+    const mounted = mountPath ? `${method} ${mergeMountPathWithRoutePath(mountPath, directPath)}` : actual;
+    if (!allowed.has(actual) && !allowed.has(mounted)) {
       drifts.push(`路由 ${actual} 未在 ApiContract 中声明`);
     }
   }
@@ -2442,6 +4302,81 @@ export function buildSystemContext(state: JimClawState): string[] {
       lines.push(`• [${note.id}] ${note.summary}`);
     }
     lines.push("（需要详情？调用 read_meeting_note(note_id)）");
+  }
+
+  return lines;
+}
+
+export function buildCoderExecutionContext(
+  state: JimClawState,
+  currentTask?: { fileTarget?: string; dependencies?: string[]; contextRequirement?: string } | null
+): string[] {
+  const core = state.consensusCore;
+  const protocol = state.executionProtocol;
+  const requirementProtocol = state.requirementProtocol || protocol?.requirements || null;
+  const lines: string[] = [];
+
+  lines.push("[Coder 执行上下文]");
+  if (core?.projectTitle) {
+    lines.push(`• 项目：${core.projectTitle}`);
+  }
+  if (core?.techStack) {
+    lines.push(`• 技术栈：${core.techStack}`);
+  } else if (state.spec?.language || state.spec?.framework) {
+    lines.push(`• 技术栈：${[state.spec?.language, state.spec?.framework].filter(Boolean).join(" + ")}`);
+  }
+  if (core?.framework || state.spec?.framework) {
+    lines.push(`• 主框架：${core?.framework || state.spec?.framework}`);
+  }
+  if (core?.port || protocol?.runtime?.listenPort) {
+    lines.push(`• 统一端口：${core?.port || protocol?.runtime?.listenPort}`);
+  }
+  lines.push(
+    `• 执行阶段：${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
+  );
+
+  if (requirementProtocol) {
+    const flags = [
+      requirementProtocol.capabilities.frontendRequired ? "frontend" : "",
+      requirementProtocol.capabilities.backendRequired ? "backend" : "",
+      requirementProtocol.capabilities.authRequired ? "auth" : "",
+      requirementProtocol.capabilities.auditLogRequired ? "audit" : "",
+    ].filter(Boolean);
+    if (flags.length > 0) {
+      lines.push(`• 需求能力：${flags.join(", ")}`);
+    }
+  }
+
+  if (protocol) {
+    lines.push(`• runtime：${protocol.project.runtime}`);
+    lines.push(`• entry：${(protocol.project.workspaceLayout.entryFiles || []).join(", ") || "无"}`);
+    lines.push(`• testRoots：${(protocol.project.workspaceLayout.testRoots || []).join(", ") || "无"}`);
+    lines.push(`• healthCheckPath：${protocol.runtime.healthCheckPath || "无"}`);
+  }
+
+  if (currentTask?.fileTarget) {
+    const fileTarget = String(currentTask.fileTarget || "").replace(/\\/g, "/");
+    const fileContract = protocol?.contracts?.files?.[fileTarget];
+    const dependencyLabels = (currentTask.dependencies || [])
+      .map((dependency) => {
+        const normalizedDependency = String(dependency || "").replace(/\\/g, "/");
+        const dependencyTask = (state.subTasks || []).find((task) => task.id === normalizedDependency || task.fileTarget === normalizedDependency);
+        return dependencyTask?.fileTarget || (/[/\\.]/.test(normalizedDependency) ? normalizedDependency : "");
+      })
+      .filter(Boolean);
+    lines.push("");
+    lines.push("[当前任务]");
+    lines.push(`• file：${fileTarget}`);
+    lines.push(`• role：${fileContract?.role || "other"}`);
+    if (dependencyLabels.length > 0) {
+      lines.push(`• directDependencies：${dependencyLabels.join(", ")}`);
+    }
+    if (currentTask.contextRequirement) {
+      lines.push(`• contextRequirement：${currentTask.contextRequirement}`);
+    }
+    if (fileContract?.ownedEndpoints?.length) {
+      lines.push(`• ownedEndpoints：${fileContract.ownedEndpoints.join(", ")}`);
+    }
   }
 
   return lines;
@@ -2853,30 +4788,43 @@ export async function validateWorkspaceArtifacts(workspace: string): Promise<{ o
   return { ok: errors.length === 0, errors };
 }
 
-export function buildReplayStateFromSnapshot(snapshotState: Partial<JimClawState>): Partial<JimClawState> {
+export function buildReplayStateFromSnapshot(
+  snapshotState: Partial<JimClawState>,
+  options: { preserveFailureEvidence?: boolean } = {}
+): Partial<JimClawState> {
+  const preserveFailureEvidence = Boolean(options.preserveFailureEvidence);
   return {
     ...snapshotState,
     messages: [],
     teamChatLog: [],
     requiresApproval: false,
-    deploymentStatus: { status: "none" },
-    qaFailures: null,
-    testResults: "",
-    lastFailedNode: "",
-    lastFailureSummary: "",
-    blockedReason: "",
+    deploymentStatus: preserveFailureEvidence ? (snapshotState.deploymentStatus || { status: "none" }) : { status: "none" },
+    qaFailures: preserveFailureEvidence ? (snapshotState.qaFailures || null) : null,
+    testResults: preserveFailureEvidence ? (snapshotState.testResults || "") : "",
+    lastFailedNode: preserveFailureEvidence ? (snapshotState.lastFailedNode || "") : "",
+    lastFailureSummary: preserveFailureEvidence ? (snapshotState.lastFailureSummary || "") : "",
+    blockedReason: preserveFailureEvidence ? (snapshotState.blockedReason || "") : "",
+    agentRecoveryPending: false,
+    agentRecoveryNode: "",
+    agentRecoveryReason: "",
     recoveredEnvironment: false,
     envReady: null,
     resumeFromNode: "",
-    containerId: "",
-    allocatedHostPort: null,
-    failureFingerprint: "",
-    sameFailureCount: 0,
+    containerId: preserveFailureEvidence ? (snapshotState.containerId || "") : "",
+    allocatedHostPort: preserveFailureEvidence ? (snapshotState.allocatedHostPort ?? null) : null,
+    failureFingerprint: preserveFailureEvidence ? (snapshotState.failureFingerprint || "") : "",
+    sameFailureCount: preserveFailureEvidence ? (snapshotState.sameFailureCount || 0) : 0,
   };
 }
 
 export function getResumeNodeFromCheckpoint(nodeName: string): string {
+  if (/^coder_task_/i.test(String(nodeName || ""))) {
+    return "coder";
+  }
   switch (nodeName) {
+    case "approval":
+    case "approval_pending":
+      return "approval";
     case "orchestrator":
       return "coder";
     case "coder_final":
@@ -2892,8 +4840,33 @@ export function getResumeNodeFromCheckpoint(nodeName: string): string {
   }
 }
 
+export function buildResumeStateFromCurrentSnapshot(snapshot: { node: string; state?: Partial<JimClawState> }): Partial<JimClawState> {
+  const snapshotState = snapshot.state || {};
+  const rawNode = String(snapshot.node || "").trim();
+  const preserveFailureEvidence = ["qa", "approval", "approval_pending"].includes(rawNode);
+  const replayState = buildReplayStateFromSnapshot(snapshotState, { preserveFailureEvidence });
+  const strippedCrashNode = rawNode.replace(/_crash$/i, "");
+
+  const resumeFromNode =
+    rawNode === "agent_pending"
+      ? String(snapshotState.agentRecoveryNode || snapshotState.resumeFromNode || "pm")
+      : rawNode === "approval_pending"
+        ? "approval"
+        : /^coder_task_/i.test(rawNode)
+          ? "coder"
+          : /_crash$/i.test(rawNode)
+            ? (strippedCrashNode || "pm")
+            : getResumeNodeFromCheckpoint(rawNode);
+
+  return {
+    ...replayState,
+    resumeFromNode: resumeFromNode || "pm",
+  };
+}
+
 export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state?: Partial<JimClawState> }): Partial<JimClawState> {
-  const replayState = buildReplayStateFromSnapshot(snapshot.state || {});
+  const preserveFailureEvidence = ["qa", "approval", "approval_pending"].includes(snapshot.node);
+  const replayState = buildReplayStateFromSnapshot(snapshot.state || {}, { preserveFailureEvidence });
   replayState.resumeFromNode = getResumeNodeFromCheckpoint(snapshot.node);
   return replayState;
 }

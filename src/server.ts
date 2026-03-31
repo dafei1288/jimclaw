@@ -3,8 +3,9 @@ import { createServer } from "http";
 import { Server } from "socket.io";
 import { Team } from "./agents/team";
 import { createJimClawGraph } from "./core/graph";
-import { buildReplayStateFromSnapshot, loadCheckpointSnapshot, loadTraceIndex, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
+import { buildReplayStateFromSnapshot, buildResumeStateFromCurrentSnapshot, loadCheckpointSnapshot, loadTraceIndex, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
 import { ModelManager } from "./utils/models";
+import { ApprovalAutoApprove, createBaseGraphState, createServerInitialSession } from "./server_state";
 import path from "path";
 import * as fs from "fs/promises";
 import { AuditLogger } from "./utils/audit";
@@ -44,6 +45,38 @@ function buildProgressMetrics(subTasks: any[] = []) {
   const pending = Math.max(0, total - completed - failed);
   const percent = total > 0 ? Math.round((completed / total) * 100) : 0;
   return { total, completed, failed, pending, percent };
+}
+
+async function loadLatestGraphState(workspacePath?: string | null) {
+  if (!workspacePath) {
+    throw new Error("当前会话没有可恢复的 workspace。");
+  }
+  const raw = await fs.readFile(path.join(workspacePath, "boulder.json"), "utf-8");
+  const snapshot = JSON.parse(raw);
+  return buildResumeStateFromCurrentSnapshot(snapshot);
+}
+
+function markApprovalCheckpointApproved(state: any, stage: string) {
+  const customerApprovalState = state?.customerApprovalState;
+  if (!customerApprovalState?.checkpoints) return state;
+  return {
+    ...state,
+    requiresApproval: false,
+    pendingApprovalStage: stage,
+    customerApprovalState: {
+      ...customerApprovalState,
+      checkpoints: customerApprovalState.checkpoints.map((checkpoint: any) =>
+        checkpoint.stage === stage
+          ? {
+              ...checkpoint,
+              approved: true,
+              approvedBy: "customer",
+              timestamp: new Date().toLocaleString("zh-CN"),
+            }
+          : checkpoint
+      ),
+    },
+  };
 }
 
 async function loadWorkspaceMetrics(workspacePath?: string | null, subTasks: any[] = []) {
@@ -155,8 +188,12 @@ let currentSession: any = {
   protocolFailures: [],
   protocolPatches: [],
   customerApprovalState: null,
+  requiresApproval: false,
   pendingApprovalStage: null,
   approvalNextNode: "",
+  agentRecoveryPending: false,
+  agentRecoveryNode: "",
+  agentRecoveryReason: "",
   metrics: {
     tokenUsage: createEmptyTokenUsage(),
     progress: buildProgressMetrics([]),
@@ -178,34 +215,6 @@ io.on("connection", (socket) => {
 
   // 握手：立即同步当前所有进度
   socket.emit("session-sync", currentSession);
-
-  const createBaseGraphState = (userGoal: string, maxRetries: number) => ({
-    userGoal,
-    messages: [],
-    teamChatLog: [],
-    retryCount: 0,
-    maxRetries,
-    isDone: false,
-    contract: null,
-    spec: null,
-    manifest: null,
-    subTasks: [],
-    code: "",
-    testResults: "",
-    qaFailures: null,
-    issueTracker: [],
-    mediationDirectives: null,
-    fixPlan: null,
-    projectBrief: [],
-    codeLog: [],
-    packageJsonHash: "",
-    executionProtocol: null,
-    protocolFailures: [],
-    protocolPatches: [],
-    customerApprovalState: null,
-    pendingApprovalStage: null,
-    approvalNextNode: "",
-  });
 
   const runGraphSession = async (
     latestTeam: any[],
@@ -254,15 +263,7 @@ io.on("connection", (socket) => {
           currentSession.pendingApprovalStage = stage;
           currentSession.approvalNextNode = nextNode;
           io.emit("state-update", currentSession);
-
-          return await new Promise<{ approved: boolean; reason?: string }>((resolve) => {
-            socket.once("approve-task", () => {
-              currentSession.requiresApproval = false;
-              currentSession.pendingApprovalStage = null;
-              io.emit("state-update", currentSession);
-              resolve({ approved: true });
-            });
-          });
+          return { approved: false, reason: summary };
         },
       });
 
@@ -322,6 +323,9 @@ io.on("connection", (socket) => {
         if (stateUpdate.customerApprovalState !== undefined) currentSession.customerApprovalState = stateUpdate.customerApprovalState;
         if (stateUpdate.pendingApprovalStage !== undefined) currentSession.pendingApprovalStage = stateUpdate.pendingApprovalStage;
         if (stateUpdate.approvalNextNode !== undefined) currentSession.approvalNextNode = stateUpdate.approvalNextNode;
+        if (stateUpdate.agentRecoveryPending !== undefined) currentSession.agentRecoveryPending = stateUpdate.agentRecoveryPending;
+        if (stateUpdate.agentRecoveryNode !== undefined) currentSession.agentRecoveryNode = stateUpdate.agentRecoveryNode;
+        if (stateUpdate.agentRecoveryReason !== undefined) currentSession.agentRecoveryReason = stateUpdate.agentRecoveryReason;
         currentSession.metrics = await loadWorkspaceMetrics(currentSession.workspacePath, currentSession.subTasks);
         currentSession.metrics.protocol = {
           failureCount: Array.isArray(currentSession.protocolFailures) ? currentSession.protocolFailures.length : 0,
@@ -364,19 +368,56 @@ io.on("connection", (socket) => {
         currentSession.phaseData[finalPhase].status = "completed";
       }
 
-      currentSession.status = "Finished";
-      await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
-        type: "task-finished",
-        sender: "System",
-        content: "任务执行完成",
-        timestamp: new Date().toLocaleString("zh-CN"),
-        metadata: {
-          currentNode: currentSession.currentNode,
-          retryCount: currentSession.retryCount,
-          deploymentStatus: currentSession.deployment?.status,
-        },
-      });
-      io.emit("task-finished", { success: true });
+      if (currentSession.requiresApproval) {
+        currentSession.status = "Waiting Approval";
+        await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+          type: "task-paused",
+          sender: "System",
+          content: `等待客户确认：${currentSession.pendingApprovalStage || "unknown"}`,
+          timestamp: new Date().toLocaleString("zh-CN"),
+          metadata: {
+            currentNode: currentSession.currentNode,
+            pendingApprovalStage: currentSession.pendingApprovalStage || undefined,
+            approvalNextNode: currentSession.approvalNextNode || undefined,
+          },
+        });
+        io.emit("task-paused", {
+          stage: currentSession.pendingApprovalStage,
+          nextNode: currentSession.approvalNextNode,
+        });
+      } else if (currentSession.agentRecoveryPending) {
+        currentSession.status = "Waiting Recovery";
+        await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+          type: "task-paused",
+          sender: "System",
+          content: `等待模型服务恢复：${currentSession.agentRecoveryNode || "unknown"}`,
+          timestamp: new Date().toLocaleString("zh-CN"),
+          metadata: {
+            currentNode: currentSession.currentNode,
+            agentRecoveryNode: currentSession.agentRecoveryNode || undefined,
+            agentRecoveryReason: currentSession.agentRecoveryReason || undefined,
+          },
+        });
+        io.emit("task-paused", {
+          stage: "agent_recovery",
+          nextNode: currentSession.agentRecoveryNode,
+          reason: currentSession.agentRecoveryReason,
+        });
+      } else {
+        currentSession.status = "Finished";
+        await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
+          type: "task-finished",
+          sender: "System",
+          content: "任务执行完成",
+          timestamp: new Date().toLocaleString("zh-CN"),
+          metadata: {
+            currentNode: currentSession.currentNode,
+            retryCount: currentSession.retryCount,
+            deploymentStatus: currentSession.deployment?.status,
+          },
+        });
+        io.emit("task-finished", { success: true });
+      }
     } catch (error: any) {
       console.error("[Server] 任务执行失败:", error);
       if (error?.jimclawFailure) {
@@ -414,59 +455,98 @@ io.on("connection", (socket) => {
     }
   };
 
-  socket.on("run-task", async (data: { userGoal: string }) => {
-    const { userGoal } = data;
+  socket.on("run-task", async (data: { userGoal: string; autoApprove?: ApprovalAutoApprove }) => {
+    const { userGoal, autoApprove } = data;
     const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
     console.log(
       `Starting task for client ${socket.id}: ${userGoal} | maxRetries: ${globalMaxRetries}`
     );
     const latestTeam = getTeamInfo();
+    const initialSession = {
+      ...createServerInitialSession(userGoal, globalMaxRetries, autoApprove),
+      metrics: {
+        tokenUsage: createEmptyTokenUsage(),
+        progress: buildProgressMetrics([]),
+        protocol: createEmptyProtocolMetrics(),
+      },
+      team: latestTeam,
+    };
     await runGraphSession(
       latestTeam,
-      {
-        userGoal,
-        status: "Running",
-        currentPhase: "requirement",
-        phaseData: {
-          requirement: { startTime: Date.now(), status: "active" },
-        },
-        currentNode: "-",
-        retryCount: 0,
-        maxRetries: globalMaxRetries,
-        logs: [],
-        events: [],
-        deployment: { status: "none", url: null },
-        contract: null,
-        spec: null,
-        subTasks: [],
-        testResults: "",
-        qaFailures: null,
-        issueTracker: [],
-        mediationDirectives: null,
-        fixPlan: null,
-        projectBrief: [],
-        codeLog: [],
-        consensusCore: null,
-        consensusProgress: null,
-        meetingNotes: [],
-        lastFailedNode: "",
-        lastFailureSummary: "",
-        executionProtocol: null,
-        protocolFailures: [],
-        protocolPatches: [],
-        customerApprovalState: null,
-        pendingApprovalStage: null,
-        approvalNextNode: "",
-        workspacePath: null,
-        metrics: {
-          tokenUsage: createEmptyTokenUsage(),
-          progress: buildProgressMetrics([]),
-          protocol: createEmptyProtocolMetrics(),
-        },
-        team: latestTeam,
-      },
-      createBaseGraphState(userGoal, globalMaxRetries)
+      initialSession,
+      createBaseGraphState(userGoal, globalMaxRetries, autoApprove)
     );
+  });
+
+  socket.on("approve-task", async () => {
+    try {
+      if (!currentSession.pendingApprovalStage) {
+        throw new Error("当前没有待确认的审批节点。");
+      }
+
+      const latestTeam = getTeamInfo();
+      const stage = currentSession.pendingApprovalStage;
+      const resumeState = markApprovalCheckpointApproved(
+        {
+          ...(await loadLatestGraphState(currentSession.workspacePath)),
+          approvalNextNode: currentSession.approvalNextNode || "",
+          pendingApprovalStage: stage,
+          resumeFromNode: "approval",
+        },
+        stage
+      );
+
+      await runGraphSession(
+        latestTeam,
+        {
+          ...currentSession,
+          status: "Running",
+          requiresApproval: false,
+          currentPhase: "approval",
+        },
+        resumeState,
+        { workspacePath: currentSession.workspacePath }
+      );
+    } catch (error: any) {
+      io.emit("task-error", {
+        message: error.message || "审批恢复失败",
+      });
+    }
+  });
+
+  socket.on("resume-task", async () => {
+    try {
+      if (!currentSession.agentRecoveryPending) {
+        throw new Error("当前没有待恢复的模型服务挂起任务。");
+      }
+
+      const latestTeam = getTeamInfo();
+      const latestState = await loadLatestGraphState(currentSession.workspacePath);
+      const resumeState = {
+        ...latestState,
+        agentRecoveryPending: false,
+        agentRecoveryNode: "",
+        agentRecoveryReason: "",
+      };
+
+      await runGraphSession(
+        latestTeam,
+        {
+          ...currentSession,
+          status: "Running",
+          currentPhase: "recovery",
+          agentRecoveryPending: false,
+          agentRecoveryNode: "",
+          agentRecoveryReason: "",
+        },
+        resumeState,
+        { workspacePath: currentSession.workspacePath }
+      );
+    } catch (error: any) {
+      io.emit("task-error", {
+        message: error.message || "恢复任务失败",
+      });
+    }
   });
 
   socket.on("replay-task", async (data: { checkpointId: string }) => {
@@ -521,6 +601,9 @@ io.on("connection", (socket) => {
           customerApprovalState: replayState.customerApprovalState || null,
           pendingApprovalStage: replayState.pendingApprovalStage || null,
           approvalNextNode: replayState.approvalNextNode || "",
+          agentRecoveryPending: replayState.agentRecoveryPending || false,
+          agentRecoveryNode: replayState.agentRecoveryNode || "",
+          agentRecoveryReason: replayState.agentRecoveryReason || "",
           workspacePath: wsPath,
           metrics: await loadWorkspaceMetrics(wsPath, replayState.subTasks || []),
           replaySourceCheckpoint: checkpointId,
@@ -650,7 +733,7 @@ app.get("/api/workspace/checkpoint", async (req, res) => {
 
   try {
     const snapshot = await loadCheckpointSnapshot(wsPath, checkpointId);
-    const replayState = buildReplayStateFromSnapshot(snapshot.state || {});
+    const replayState = buildResumeStateFromCurrentSnapshot(snapshot);
     const subTasks = Array.isArray(replayState.subTasks) ? replayState.subTasks : [];
     const completedFiles = subTasks.filter((task: any) => task.status === "completed").map((task: any) => task.fileTarget);
     const pendingFiles = subTasks.filter((task: any) => task.status !== "completed").map((task: any) => task.fileTarget);

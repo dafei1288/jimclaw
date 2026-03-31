@@ -4,7 +4,7 @@
 
 **Goal:** 把 JimClaw 从“观测协议”升级成“控制协议”，让需求、技术栈、方案、任务图、验证、修复和客户确认成为真正的执行控制平面。
 
-**Architecture:** 先在 state 中正式引入 `TechnologyDecision`、`ValidationReport`、`RepairPlan`、`CustomerApprovalState`，再把 `architect -> orchestrator -> verifier -> fix_plan -> graph route` 接到这些对象上。第一批不追求一次性替换全部旧字段，而是优先建立“规划错误强制重规划、实现错误才进 fix_plan、客户可默认授权确认、未授权才暂停等待”的硬闸门。
+**Architecture:** 先在 state 中正式引入 `TechnologyDecision`、`ValidationReport`、`RepairPlan`、`CustomerApprovalState`，再把 `architect -> orchestrator -> verifier -> fix_plan -> graph route` 接到这些对象上。第一批不追求一次性替换全部旧字段，而是优先建立“规划错误强制重规划、实现错误才进 fix_plan、客户可默认授权确认、未授权则挂起待确认而不是同步阻塞”的硬闸门。第二批补上“简单 CRUD 预算、文件别名归一化、测试框架冲突清理”，避免 Architect/Orchestrator 在首轮就把任务图膨胀到无法执行。
 
 **Tech Stack:** TypeScript, LangGraph.js, Node.js, Jest(node test), JimClaw existing graph/node architecture
 
@@ -308,9 +308,9 @@ git commit -m "feat: trigger replanning after control-plane patches"
 
 新增测试：
 - 开启 `autoApprove` 时自动通过并记录 `approvedBy=default-authorization`
-- 关闭 `autoApprove` 时，approval 节点必须发出等待确认事件，不能直接伪装成 `approvedBy=customer`
+- 关闭 `autoApprove` 时，approval 节点必须发出确认事件并持久化待确认态，不能直接伪装成 `approvedBy=customer`
 - 收到人工批准后，才记录 `approvedBy=customer`
-- 没有审批通道且未默认授权时，必须报错或中止，不能静默绕过
+- 没有审批通道且未默认授权时，必须进入待确认/挂起态或显式报错，不能静默绕过
 
 **Step 2: Run test to verify it fails**
 
@@ -322,6 +322,7 @@ Expected: 客户确认控制测试失败
 引入 `CustomerApprovalState`：
 - graph 路由识别关键 checkpoint
 - approval 节点区分“默认授权自动通过”和“人工确认后通过”
+- approval 节点先落盘 `approval_pending`，再决定是立即恢复还是等待外部恢复，不在节点内无限等待
 - server/dashboard 展示当前确认状态
 - 默认同意授权可配置
 - 不再由 UI 外层伪造 `approvedBy=customer`
@@ -375,6 +376,144 @@ git commit -m "test: lock planning-gap replay behavior"
 
 ### Task 10: 跑一次真实端到端任务
 
+### Task 10: 抑制任务图膨胀与技术漂移
+
+**Files:**
+- Modify: `src/core/logic_utils.ts`
+- Modify: `src/core/nodes/architect_node.ts`
+- Modify: `src/core/nodes/orchestrator_node.ts`
+- Test: `tests/core/execution-protocol.test.js`
+- Test: `tests/core/orchestrator-node.test.js`
+
+**Step 1: Write the failing test**
+
+新增测试验证：
+- `vitest` 主线项目不会再自动注入 `jest.config.cjs / tests/setup.test.ts`
+- 简单图书管理系统样例中的别名文件会被折叠
+- 简单 CRUD 文件计划会被压到预算内
+- Orchestrator 接收到别名任务图时，会回到收缩后的规范任务图，而不是继续放大
+
+**Step 2: Run test to verify it fails**
+
+Run: `node --test tests/core/execution-protocol.test.js tests/core/orchestrator-node.test.js`
+Expected: 预算/别名收缩测试失败
+
+**Step 3: Write minimal implementation**
+
+在 `logic_utils.ts` 添加：
+- `stabilizeSpecForExecution(...)`
+- Node/TS 简单 CRUD 预算器
+- 文件路径别名归一化
+- `vitest/jest` 冲突清理
+
+在 `architect_node.ts` / `orchestrator_node.ts`：
+- 统一使用收缩后的 spec 继续后续流程
+- 禁止把原始胖规范直接传给 `ExecutionPlan`
+
+**Step 4: Run test to verify it passes**
+
+Run: `node --test tests/core/execution-protocol.test.js tests/core/orchestrator-node.test.js`
+Expected: 预算与归一化测试通过
+
+**Step 5: Commit**
+
+```bash
+git add src/core/logic_utils.ts src/core/nodes/architect_node.ts src/core/nodes/orchestrator_node.ts tests/core/execution-protocol.test.js tests/core/orchestrator-node.test.js
+git commit -m "fix: compact bloated execution plans before coding"
+```
+
+### Task 11: 建立运行时修复回路
+
+**Files:**
+- Modify: `src/core/nodes/deploy_node.ts`
+- Modify: `src/core/nodes/infra_node.ts`
+- Modify: `src/core/graph.ts`
+- Test: `tests/core/deploy-node.test.js`
+- Test: `tests/core/infra-node.test.js`
+- Test: `tests/core/workflow-replay.test.js`
+
+**Step 1: Write the failing test**
+
+新增测试验证：
+- deploy 失败时输出结构化 `runtime_gap`，而不是只拼接原始文本
+- `deploy` 失败后不会直接 `post_mortem`，而是回到 QA/Infra 运行时修复链
+- runtime 修复轮次复用已分配宿主机端口，避免端口漂移
+- 当证据显示 `EADDRINUSE` 时，infra 会先清理容器内残留运行进程
+- 健康检查主路径失败时，会回退探测 `/api/health`、`/health`、`/`
+
+**Step 2: Run test to verify it fails**
+
+Run: `node --test tests/core/infra-node.test.js tests/core/deploy-node.test.js tests/core/workflow-replay.test.js`
+Expected: runtime 修复闭环相关测试失败
+
+**Step 3: Write minimal implementation**
+
+在 `deploy_node.ts`：
+- 显式注入 `PORT/HOST`
+- 产出 `validationReport.failureType = "runtime_gap"`
+- 产出 `repairPlan.repairType = "runtime"`
+- 健康检查支持 fallback 候选路径
+
+在 `infra_node.ts`：
+- runtime 修复重试时复用 `allocatedHostPort`
+- 根据运行时证据决定是否清理残留服务进程
+
+在 `graph.ts`：
+- deploy 失败且 `runtime_gap` 时，回到 QA/Infra 修复链而不是直接结束
+
+**Step 4: Run test to verify it passes**
+
+Run: `node --test tests/core/infra-node.test.js tests/core/deploy-node.test.js tests/core/workflow-replay.test.js`
+Expected: runtime 修复闭环测试通过
+
+**Step 5: Commit**
+
+```bash
+git add src/core/nodes/deploy_node.ts src/core/nodes/infra_node.ts src/core/graph.ts tests/core/deploy-node.test.js tests/core/infra-node.test.js tests/core/workflow-replay.test.js
+git commit -m "fix: close runtime repair loop for deploy failures"
+```
+
+### Task 12: 把审批改成挂起/恢复，而不是同步阻塞
+
+**Files:**
+- Modify: `src/core/nodes/approval_node.ts`
+- Modify: `src/core/graph.ts`
+- Modify: `src/server.ts`
+- Test: `tests/core/approval-node.test.js`
+
+**Step 1: Write the failing test**
+
+新增测试验证：
+- 需要人工确认时，approval 节点先持久化 `approval_pending`
+- 图执行不会因为等待前端点击而长期卡住在同一个 Promise
+- 收到确认事件后，系统能从待确认态恢复并继续到 `approvalNextNode`
+
+**Step 2: Run test to verify it fails**
+
+Run: `node --test tests/core/approval-node.test.js`
+Expected: 审批挂起/恢复测试失败
+
+**Step 3: Write minimal implementation**
+
+在 `approval_node.ts` / `graph.ts` / `server.ts`：
+- 把审批改成显式 pending 状态机
+- 区分“发起审批请求”和“恢复审批结果”两个动作
+- 默认授权仍即时通过；人工审批改为挂起后恢复，不在节点里同步等待
+
+**Step 4: Run test to verify it passes**
+
+Run: `node --test tests/core/approval-node.test.js`
+Expected: 审批挂起/恢复测试通过
+
+**Step 5: Commit**
+
+```bash
+git add src/core/nodes/approval_node.ts src/core/graph.ts src/server.ts tests/core/approval-node.test.js
+git commit -m "feat: make approval resumable instead of blocking"
+```
+
+### Task 13: 跑一次真实端到端任务
+
 **Files:**
 - None
 
@@ -400,9 +539,94 @@ npx tsc --noEmit
 npm run test:core
 ```
 
+### 2026-03-29 补充修正：QA 完成态必须检查 pending subTask
+
+**问题：**
+- 真实 run `workspace/run_1774772178144` 的 `qa-r3` 虽然仍有 `Dockerfile`、`docker-compose.yml` 等 pending subTask，但因为没有新的失败证据、open issue 也已清空，QA 直接写出 `isDone=true`
+- 结果是图从 `qa` 错误进入 `deploy`，replay 也会复现同样误路由
+
+**修改：**
+- 在 `src/core/nodes/qa_node.ts` 增加“任务完成闸门”：
+  - `hasPendingTasks=true` 时，即使 `failureEvidence=false` 且 `openIssues=0`，也不能 `isDone=true`
+  - 这类场景统一产出 `resumeAfterValidation=true`，恢复 `coder` 继续完成剩余文件
+- 新增回归测试 `tests/core/qa-node.test.js`
+  - 锁定“无失败证据但仍有 pending subTask 时，QA 不得放行 deploy”
+
+**验证：**
+- `node --test tests/core/qa-node.test.js`
+- 真实 replay：
+  - `npx ts-node src/index.ts --replay "D:\\working\\mycode\\jimclaw\\workspace\\run_1774772178144" qa-r3`
+  - 修复后路径已从 `qa -> coder`，不再错误直冲 `deploy`
+
+### 2026-03-29 补充修正：模型不可用改为可恢复挂起，环境修复统一收口到 EnvGuard
+
+**问题：**
+- `APIConnectionError`、连接拒绝、请求超时、`Request was aborted` 这类模型调用问题，之前只会落 `*_crash` 然后直接打断 run
+- 缺依赖、缺类型声明、端口占用这类环境问题，修复逻辑分散在 QA 与 EnvGuard，行为不一致
+
+**修改：**
+- 在 `src/core/agent.ts`：
+  - 重试链耗尽后，抛出结构化 `AgentServiceUnavailableError`
+  - 把 `Connection error`、`ABORT_ERR`、`Request was aborted` 等纳入可恢复服务不可用
+- 在 `src/core/graph.ts`：
+  - 新增 `agent_pending` 挂起节点
+  - 任意节点遇到 `AgentServiceUnavailableError / AgentTimeoutError`，不再 crash，而是落盘为：
+    - `agentRecoveryPending=true`
+    - `agentRecoveryNode=<原节点>`
+    - `resumeFromNode=<原节点>`
+- 在 `src/index.ts` / `src/server.ts`：
+  - CLI 与 Web 会把该状态显示为待恢复
+  - CLI 支持 `--resume <workspacePath>` 从挂起节点继续
+- 在 `src/core/nodes/qa_node.ts`：
+  - 环境问题不再由 QA 现场散修，而是统一产出 `environment_gap` 转交 `EnvGuard`
+- 在 `src/core/nodes/env_guard_node.ts`：
+  - 统一收口缺依赖、缺类型声明、端口占用修复
+  - 新增类型依赖补齐和跨平台端口释放
+
+**验证：**
+- `node --test tests/core/agent-fallback.test.js tests/core/workflow-replay.test.js tests/core/index-cli.test.js tests/core/env-guard-node.test.js tests/core/qa-node.test.js`
+- `npx tsc --noEmit`
+
 Expected:
 - 通过
 - 最新 run 的 `ValidationReport` 与 `ExecutionPlan` 一致
+
+### 2026-03-31 进展总结
+
+以下项已经完成，并有回归或真实 run 证据：
+
+1. 恢复机制修正
+   - `--resume` 不再默认回到 `pm`
+   - `coder_task_*` 动态节点恢复到 `coder`
+   - `qa` 当前快照恢复时保留失败证据，继续交给 `qa_resume_router`
+
+2. 确定性骨架补强
+   - `scripts/verify.ts`
+   - `tests/health.test.ts`
+   - `tests/auth.test.ts`
+   - `tests/books.test.ts`
+   - `package.json` 依赖兜底
+
+3. 执行链收口
+   - `coder` 全部完成后，统一先过 `EnvGuard` 再进 `Infra`
+   - `infra_setup` 的 Docker 清理命令已改成更稳的跨环境写法
+
+4. 已确认越过的真实自旋点
+   - `scripts/verify.ts` 单文件超时自旋
+   - 真实续跑已能从 `coder` 正确接上，不再被恢复逻辑打回 `pm`
+
+### 2026-03-31 仍未闭合的机制缺口
+
+当前还缺一条关键控制机制：
+
+- 当 QA/FixPlan 发现“状态已 completed，但内容其实错误”的文件时，必须把对应文件重新排回执行图
+
+旧 run 当前卡住的本质不是“系统看不见错误”，而是：
+- 错误文件已经被 QA 看见
+- 但这些文件仍保留为 `completed`
+- replay 只能继续分析，不能触发文件重写
+
+这也是当前系统离“初步可用”还差的主要剩余机制。
 
 **Step 3: Commit**
 

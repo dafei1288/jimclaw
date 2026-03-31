@@ -1,6 +1,6 @@
 import { Team } from "./agents/team";
 import { createJimClawGraph } from "./core/graph";
-import { loadCheckpointSnapshot, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
+import { buildCustomerApprovalState, buildReplayStateFromSnapshot, buildResumeStateFromCurrentSnapshot, loadCheckpointSnapshot, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -25,22 +25,78 @@ async function cleanWorkspace() {
 }
 
 export function computeSessionExitCode(finalState: any): number {
+  if (finalState?.requiresApproval || finalState?.pendingApprovalStage) {
+    return 2;
+  }
+  if (finalState?.agentRecoveryPending) {
+    return 3;
+  }
   const deploymentFailed = finalState?.deploymentStatus?.status === "failed";
   const hasRecordedFailure = Boolean(finalState?.lastFailedNode || finalState?.lastFailureSummary);
   const incomplete = finalState?.isDone === false && deploymentFailed;
   return deploymentFailed || hasRecordedFailure || incomplete ? 1 : 0;
 }
 
+export function parseAutoApproveArg(raw?: string | null) {
+  const normalized = String(raw || "").trim().toLowerCase();
+  const result = { requirements: false, solution: false, deploy: false };
+  if (!normalized) return result;
+  if (normalized === "all") {
+    return { requirements: true, solution: true, deploy: true };
+  }
+
+  for (const token of normalized.split(",").map((item) => item.trim()).filter(Boolean)) {
+    if (token === "requirements") result.requirements = true;
+    if (token === "solution") result.solution = true;
+    if (token === "deploy") result.deploy = true;
+  }
+  return result;
+}
+
+function markApprovalApprovedForResume(state: any, stage: "requirements" | "solution" | "deploy") {
+  const customerApprovalState = state?.customerApprovalState;
+  if (!customerApprovalState?.checkpoints) {
+    throw new Error("当前 run 缺少 customerApprovalState，无法恢复审批。");
+  }
+  return {
+    ...state,
+    requiresApproval: false,
+    pendingApprovalStage: stage,
+    resumeFromNode: "approval",
+    customerApprovalState: {
+      ...customerApprovalState,
+      checkpoints: customerApprovalState.checkpoints.map((checkpoint: any) =>
+        checkpoint.stage === stage
+          ? {
+              ...checkpoint,
+              approved: true,
+              approvedBy: "customer",
+              timestamp: new Date().toLocaleString("zh-CN"),
+            }
+          : checkpoint
+      ),
+    },
+  };
+}
+
+async function loadCurrentWorkspaceState(workspacePath: string) {
+  const raw = await fs.readFile(path.join(workspacePath, "boulder.json"), "utf-8");
+  const snapshot = JSON.parse(raw);
+  return snapshot;
+}
+
 async function main() {
+  const args = process.argv.slice(2);
+
   // 改进 7：支持 --clean flag 仅清理不跑任务
-  if (process.argv[2] === "--clean") {
+  if (args[0] === "--clean") {
     await cleanWorkspace();
     return;
   }
 
-  if (process.argv[2] === "--replay") {
-    const workspacePath = process.argv[3];
-    const checkpointId = process.argv[4];
+  if (args[0] === "--replay") {
+    const workspacePath = args[1];
+    const checkpointId = args[2];
     if (!workspacePath || !checkpointId) {
       throw new Error("用法: npx ts-node src/index.ts --replay <workspacePath> <checkpointId>");
     }
@@ -63,11 +119,70 @@ async function main() {
     return;
   }
 
-  const userGoal = process.argv[2] || "a simple Counter app with increment and decrement";
+  if (args[0] === "--approve") {
+    const workspacePath = args[1];
+    if (!workspacePath) {
+      throw new Error("用法: npx ts-node src/index.ts --approve <workspacePath>");
+    }
+
+    const snapshot = await loadCurrentWorkspaceState(workspacePath);
+    const replayState = buildReplayStateFromSnapshot(snapshot.state || {});
+    const stage = replayState.pendingApprovalStage;
+    if (!stage) {
+      throw new Error("当前 run 没有待确认的审批阶段。");
+    }
+
+    const resumedState = markApprovalApprovedForResume(replayState, stage);
+    console.log(`🚀 Resuming approval for stage: ${stage}`);
+    const app = await createJimClawGraph(Team, undefined, {
+      workspacePath,
+      traceId: snapshot.traceId,
+    });
+    const finalState = await app.invoke(resumedState, { recursionLimit: 500 });
+    console.log(`\n--- Approval Resume Completed ---`);
+    console.log("Final Code Content:", finalState.code);
+    process.exitCode = computeSessionExitCode(finalState);
+    return;
+  }
+
+  if (args[0] === "--resume") {
+    const workspacePath = args[1];
+    if (!workspacePath) {
+      throw new Error("用法: npx ts-node src/index.ts --resume <workspacePath>");
+    }
+
+    const snapshot = await loadCurrentWorkspaceState(workspacePath);
+    const resumedState = {
+      ...buildResumeStateFromCurrentSnapshot(snapshot),
+      agentRecoveryPending: false,
+      agentRecoveryReason: "",
+      agentRecoveryNode: "",
+    };
+    console.log(`🚀 Resuming session from node: ${resumedState.resumeFromNode}`);
+    const app = await createJimClawGraph(Team, undefined, {
+      workspacePath,
+      traceId: snapshot.traceId,
+    });
+    const finalState = await app.invoke(resumedState, { recursionLimit: 500 });
+    console.log(`\n--- Resume Completed ---`);
+    console.log("Final Code Content:", finalState.code);
+    process.exitCode = computeSessionExitCode(finalState);
+    return;
+  }
+
+  let autoApprove = { requirements: false, solution: false, deploy: false };
+  const autoApproveIndex = args.indexOf("--auto-approve");
+  if (autoApproveIndex >= 0) {
+    autoApprove = parseAutoApproveArg(args[autoApproveIndex + 1] || "all");
+    args.splice(autoApproveIndex, Math.min(2, args.length - autoApproveIndex));
+  }
+
+  const userGoal = args[0] || "a simple Counter app with increment and decrement";
   console.log(`🚀 Starting JimClaw: Multi-Agent Collaboration Session for goal: "${userGoal}"`);
+  const workspacePath = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
 
   // 1. 初始化协作图
-  const app = await createJimClawGraph(Team);
+  const app = await createJimClawGraph(Team, undefined, { workspacePath });
 
   // 2. 运行图
   const finalState = await app.invoke(
@@ -83,6 +198,7 @@ async function main() {
       testResults: "",
       qaFailures: null,
       packageJsonHash: "",
+      customerApprovalState: buildCustomerApprovalState({ autoApprove }),
     },
     { recursionLimit: 500 }
   );
@@ -93,6 +209,18 @@ async function main() {
   finalState.teamChatLog.forEach((log: any) => {
     console.log(`[${log.sender}]: ${log.content}`);
   });
+  if (finalState.requiresApproval && finalState.pendingApprovalStage) {
+    console.log(`\nSession Paused: 等待 ${finalState.pendingApprovalStage} 阶段确认`);
+    console.log(`Workspace: ${workspacePath}`);
+    console.log(`Resume Command: npx ts-node src/index.ts --approve "${workspacePath}"`);
+  }
+  if (finalState.agentRecoveryPending) {
+    console.log(`\nSession Paused: 等待模型服务恢复`);
+    console.log(`Node: ${finalState.agentRecoveryNode || "unknown"}`);
+    console.log(`Reason: ${finalState.agentRecoveryReason || finalState.lastFailureSummary || "模型服务暂不可用"}`);
+    console.log(`Workspace: ${workspacePath}`);
+    console.log(`Resume Command: npx ts-node src/index.ts --resume "${workspacePath}"`);
+  }
   process.exitCode = computeSessionExitCode(finalState);
 }
 

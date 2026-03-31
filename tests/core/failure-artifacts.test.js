@@ -15,6 +15,7 @@ const {
   loadTraceIndex,
   loadCheckpointSnapshot,
   buildReplayStateFromSnapshot,
+  buildResumeStateFromCurrentSnapshot,
   getResumeNodeFromCheckpoint,
   prepareReplayStateFromCheckpoint,
   persistWriteRecoveryIntent,
@@ -185,6 +186,7 @@ test("checkpoint loader returns snapshot and sanitized replay state", async () =
 
 test("checkpoint resume mapping targets the next executable node", () => {
   assert.equal(getResumeNodeFromCheckpoint("orchestrator"), "coder");
+  assert.equal(getResumeNodeFromCheckpoint("coder_task_task-001"), "coder");
   assert.equal(getResumeNodeFromCheckpoint("coder_final"), "env_guard");
   assert.equal(getResumeNodeFromCheckpoint("verifier"), "qa");
   assert.equal(getResumeNodeFromCheckpoint("qa"), "qa_resume_router");
@@ -201,6 +203,82 @@ test("checkpoint replay state includes resume target", () => {
   assert.equal(replayState.retryCount, 3);
   assert.equal(replayState.resumeFromNode, "env_guard");
   assert.equal(replayState.subTasks[0].status, "completed");
+});
+
+test("dynamic coder task checkpoint replays back into coder instead of restarting from pm", () => {
+  const replayState = prepareReplayStateFromCheckpoint({
+    node: "coder_task_T002",
+    state: createBaseState({
+      retryCount: 12,
+      blockedReason: "Coder 阻塞失败: scripts/verify.ts -> 单文件生成超时",
+      subTasks: [{ id: "T002", description: "verify", fileTarget: "scripts/verify.ts", dependencies: ["src/index.ts"], contextRequirement: "", status: "pending" }],
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "coder");
+  assert.equal(replayState.subTasks[0].fileTarget, "scripts/verify.ts");
+});
+
+test("current workspace snapshot resumes dynamic coder task from coder", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "coder_task_T002",
+    state: createBaseState({
+      retryCount: 12,
+      resumeFromNode: "pm",
+      blockedReason: "Coder 阻塞失败: scripts/verify.ts -> 单文件生成超时",
+      subTasks: [{ id: "T002", description: "verify", fileTarget: "scripts/verify.ts", dependencies: ["src/index.ts"], contextRequirement: "", status: "pending" }],
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "coder");
+  assert.equal(replayState.blockedReason, "");
+});
+
+test("current workspace qa snapshot keeps failure evidence for qa resume routing", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "qa",
+    state: createBaseState({
+      retryCount: 15,
+      testResults: "[Terminal 测试失败]\nsrc/controllers/authController.ts(10,17): error TS2307: Cannot find module 'jsonwebtoken'",
+      qaFailures: {
+        failedFiles: ["src/controllers/authController.ts"],
+        testErrors: ["Cannot find module 'jsonwebtoken'"],
+        failedTestNames: [],
+      },
+      blockedReason: "缺少 jsonwebtoken 运行时依赖",
+      subTasks: [{ id: "t1", description: "pkg", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" }],
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "qa_resume_router");
+  assert.match(replayState.testResults, /jsonwebtoken/);
+  assert.equal(replayState.qaFailures.failedFiles[0], "src/controllers/authController.ts");
+  assert.match(replayState.blockedReason, /jsonwebtoken/);
+});
+
+test("qa checkpoint replay preserves failure evidence for decision replay", () => {
+  const replayState = prepareReplayStateFromCheckpoint({
+    node: "qa",
+    state: createBaseState({
+      retryCount: 3,
+      testResults: "[Coder 阻塞失败]\nCoder 阻塞失败: tests/books.test.ts -> 未检测到合法的 Markdown 代码块",
+      qaFailures: {
+        failedFiles: ["tests/books.test.ts"],
+        testErrors: ["未检测到合法的 Markdown 代码块"],
+        failedTestNames: [],
+      },
+      blockedReason: "Coder 阻塞失败: tests/books.test.ts -> 未检测到合法的 Markdown 代码块",
+      lastFailedNode: "coder",
+      lastFailureSummary: "Coder 阻塞失败: tests/books.test.ts -> 未检测到合法的 Markdown 代码块",
+      subTasks: [{ id: "t1", description: "x", fileTarget: "tests/books.test.ts", dependencies: [], contextRequirement: "", status: "pending" }],
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "qa_resume_router");
+  assert.match(replayState.testResults, /tests\/books\.test\.ts/);
+  assert.equal(replayState.qaFailures.failedFiles[0], "tests/books.test.ts");
+  assert.match(replayState.blockedReason, /Markdown 代码块/);
+  assert.equal(replayState.lastFailedNode, "coder");
 });
 
 test("failure evidence detection catches verifier, deploy and coder-block markers", () => {
