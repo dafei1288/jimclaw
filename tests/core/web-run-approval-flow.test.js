@@ -136,12 +136,9 @@ test("web run startup no longer stalls at requirements approval and can continue
       { workspacePath: workspace, traceId: "trace_web_run_approval" }
     );
 
-    await assert.rejects(
-      () => graph.invoke(createBaseGraphState("图书管理系统", 5), {
-        recursionLimit: 50,
-      }),
-      /coder reached/
-    );
+    const finalState = await graph.invoke(createBaseGraphState("图书管理系统", 5), {
+      recursionLimit: 50,
+    });
 
     const boulder = JSON.parse(await fs.readFile(`${workspace}/boulder.json`, "utf-8"));
     assert.notEqual(boulder.node, "approval_pending");
@@ -152,6 +149,10 @@ test("web run startup no longer stalls at requirements approval and can continue
       traceIndex.timeline.some((item) => item.node === "orchestrator"),
       true
     );
+    assert.equal(boulder.node, "persistence");
+    assert.equal(finalState.pendingApprovalStage || null, null);
+    assert.equal(finalState.agentRecoveryPending || false, false);
+    assert.match(finalState.lastFailureSummary || "", /宿主环境阻塞/);
     const checkpoints = boulder.state.customerApprovalState.checkpoints;
     assert.equal(
       checkpoints.find((item) => item.stage === "requirements")?.approved,
