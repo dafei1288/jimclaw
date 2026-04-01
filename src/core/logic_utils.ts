@@ -5249,6 +5249,14 @@ export function buildReplayStateFromSnapshot(
   };
 }
 
+function shouldPreserveFailureEvidenceForNode(nodeName: string): boolean {
+  const rawNode = String(nodeName || "").trim();
+  if (!rawNode) return false;
+  if (["qa", "approval", "approval_pending", "deploy"].includes(rawNode)) return true;
+  if (/^env_guard/i.test(rawNode)) return true;
+  return false;
+}
+
 export function getResumeNodeFromCheckpoint(nodeName: string): string {
   if (/^coder_task_/i.test(String(nodeName || ""))) {
     return "coder";
@@ -5275,7 +5283,7 @@ export function getResumeNodeFromCheckpoint(nodeName: string): string {
 export function buildResumeStateFromCurrentSnapshot(snapshot: { node: string; state?: Partial<JimClawState> }): Partial<JimClawState> {
   const snapshotState = snapshot.state || {};
   const rawNode = String(snapshot.node || "").trim();
-  const preserveFailureEvidence = ["qa", "approval", "approval_pending"].includes(rawNode);
+  const preserveFailureEvidence = shouldPreserveFailureEvidenceForNode(rawNode);
   const replayState = buildReplayStateFromSnapshot(snapshotState, { preserveFailureEvidence });
   const strippedCrashNode = rawNode.replace(/_crash$/i, "");
 
@@ -5297,7 +5305,7 @@ export function buildResumeStateFromCurrentSnapshot(snapshot: { node: string; st
 }
 
 export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state?: Partial<JimClawState> }): Partial<JimClawState> {
-  const preserveFailureEvidence = ["qa", "approval", "approval_pending"].includes(snapshot.node);
+  const preserveFailureEvidence = shouldPreserveFailureEvidenceForNode(snapshot.node);
   const replayState = buildReplayStateFromSnapshot(snapshot.state || {}, { preserveFailureEvidence });
   replayState.resumeFromNode = getResumeNodeFromCheckpoint(snapshot.node);
   return replayState;

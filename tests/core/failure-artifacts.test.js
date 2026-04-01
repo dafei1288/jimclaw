@@ -256,6 +256,89 @@ test("current workspace qa snapshot keeps failure evidence for qa resume routing
   assert.match(replayState.blockedReason, /jsonwebtoken/);
 });
 
+test("current workspace env_guard host-blocked snapshot keeps executor environment evidence", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "env_guard_host_blocked",
+    state: createBaseState({
+      retryCount: 4,
+      testResults: "[EnvGuard] 宿主环境阻塞：docker daemon unreachable | local_shell: spawn EPERM",
+      blockedReason: "[EnvGuard] 宿主环境阻塞：docker daemon unreachable | local_shell: spawn EPERM",
+      lastFailedNode: "env_guard",
+      lastFailureSummary: "[EnvGuard] 宿主环境阻塞：docker daemon unreachable | local_shell: spawn EPERM",
+      validationReport: {
+        version: "v1",
+        status: "fail",
+        failureType: "environment_gap",
+        blocking: true,
+        findings: [{ type: "environment_gap", summary: "宿主环境阻塞", evidence: ["docker daemon unreachable", "spawn EPERM"] }],
+      },
+      executorState: {
+        version: "v1",
+        approvalTickets: [],
+        runtimeHandles: [],
+        lastExecutorResult: {
+          ok: false,
+          backend: null,
+          stdout: "",
+          stderr: "spawn EPERM",
+          retryable: false,
+          requiresApproval: false,
+          blocked: true,
+          blockedReason: "docker daemon unreachable",
+          failureType: "executor_unavailable",
+        },
+      },
+    }),
+  });
+
+  assert.match(replayState.testResults, /宿主环境阻塞/);
+  assert.match(replayState.blockedReason, /spawn EPERM/);
+  assert.equal(replayState.validationReport?.failureType, "environment_gap");
+  assert.equal(replayState.executorState?.lastExecutorResult?.failureType, "executor_unavailable");
+});
+
+test("current workspace deploy launch-failed snapshot keeps deploy-stage failure evidence", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "deploy",
+    state: createBaseState({
+      retryCount: 2,
+      testResults: "[部署启动失败] spawn EPERM",
+      blockedReason: "[部署启动失败] spawn EPERM",
+      lastFailedNode: "deploy",
+      lastFailureSummary: "[部署启动失败] spawn EPERM",
+      deploymentStatus: { status: "failed", url: "http://127.0.0.1:4000" },
+      validationReport: {
+        version: "v1",
+        status: "fail",
+        failureType: "environment_gap",
+        blocking: true,
+        findings: [{ type: "environment_gap", summary: "[部署启动失败] spawn EPERM", file: "src/index.ts", evidence: ["spawn EPERM"] }],
+      },
+      executorState: {
+        version: "v1",
+        approvalTickets: [],
+        runtimeHandles: [],
+        lastExecutorResult: {
+          ok: false,
+          backend: null,
+          stdout: "",
+          stderr: "spawn EPERM",
+          retryable: false,
+          requiresApproval: false,
+          blocked: true,
+          blockedReason: "no backend available",
+          failureType: "executor_unavailable",
+        },
+      },
+    }),
+  });
+
+  assert.match(replayState.testResults, /部署启动失败/);
+  assert.equal(replayState.lastFailedNode, "deploy");
+  assert.equal(replayState.validationReport?.failureType, "environment_gap");
+  assert.equal(replayState.executorState?.lastExecutorResult?.failureType, "executor_unavailable");
+});
+
 test("qa checkpoint replay preserves failure evidence for decision replay", () => {
   const replayState = prepareReplayStateFromCheckpoint({
     node: "qa",

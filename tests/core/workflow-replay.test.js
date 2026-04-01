@@ -198,6 +198,39 @@ test("deploy routing sends failed deployments back to qa runtime repair loop", (
   })), "post_mortem");
 });
 
+test("deploy routing sends early executor startup environment failures to post_mortem instead of qa runtime loop", () => {
+  const { getDeployNextNode } = require("../../src/core/graph");
+
+  assert.equal(getDeployNextNode(createBaseState({
+    deploymentStatus: { status: "failed", url: "http://127.0.0.1:4000" },
+    lastFailedNode: "deploy",
+    lastFailureSummary: "[部署启动失败] spawn EPERM",
+    validationReport: {
+      version: "v1",
+      status: "fail",
+      failureType: "environment_gap",
+      blocking: true,
+      findings: [{ type: "environment_gap", summary: "[部署启动失败] spawn EPERM", file: "src/index.ts", evidence: ["spawn EPERM"] }],
+    },
+    executorState: {
+      version: "v1",
+      approvalTickets: [],
+      runtimeHandles: [],
+      lastExecutorResult: {
+        ok: false,
+        backend: null,
+        stdout: "",
+        stderr: "spawn EPERM",
+        retryable: false,
+        requiresApproval: false,
+        blocked: true,
+        blockedReason: "no backend available",
+        failureType: "executor_unavailable",
+      },
+    },
+  })), "post_mortem");
+});
+
 test("verifier routing keeps implementation bugs flowing to qa analysis", () => {
   const next = getVerifierNextNode(createBaseState({
     testResults: "[Verifier 预检失败]\n语法错误(src/routes/books.ts:L1:C23): Expression expected",
