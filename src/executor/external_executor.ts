@@ -1,18 +1,23 @@
 import { CapabilitySnapshot, ExecutionIntent, ExecutorResult } from "./types";
 
+import axios from "axios";
+
 type FetchLike = (input: string, init?: any) => Promise<any>;
 
 type ExternalExecutorOptions = {
   baseUrl?: string;
   token?: string;
   fetchImpl?: FetchLike;
+  timeoutMs?: number;
 };
 
 function resolveExternalExecutorConfig(options: ExternalExecutorOptions = {}) {
+  const timeoutMs = Number(options.timeoutMs || process.env.JIMCLAW_EXTERNAL_EXECUTOR_TIMEOUT_MS || 900000);
   return {
     baseUrl: String(options.baseUrl || process.env.JIMCLAW_EXTERNAL_EXECUTOR_URL || "").trim().replace(/\/+$/, ""),
     token: String(options.token || process.env.JIMCLAW_EXTERNAL_EXECUTOR_TOKEN || "").trim(),
-    fetchImpl: options.fetchImpl || (typeof fetch === "function" ? fetch.bind(globalThis) : null),
+    fetchImpl: options.fetchImpl || null,
+    timeoutMs: Number.isFinite(timeoutMs) && timeoutMs > 0 ? timeoutMs : 900000,
   };
 }
 
@@ -49,7 +54,7 @@ export function createExternalExecutorAdapter(options: ExternalExecutorOptions =
     ): Promise<ExecutorResult> {
       const config = resolveExternalExecutorConfig(options);
       const baseUrl = config.baseUrl || String(context.capabilitySnapshot.externalExecutor?.baseUrl || "").trim();
-      if (!baseUrl || !config.fetchImpl) {
+      if (!baseUrl) {
         return {
           ok: false,
           backend: "external_executor",
@@ -58,18 +63,48 @@ export function createExternalExecutorAdapter(options: ExternalExecutorOptions =
           retryable: false,
           requiresApproval: false,
           blocked: true,
-          blockedReason: !baseUrl ? "external executor not configured" : "fetch unavailable",
+          blockedReason: "external executor not configured",
           failureType: "executor_unavailable",
         };
       }
 
       try {
-        const response = await config.fetchImpl(`${baseUrl}/execute`, {
-          method: "POST",
-          headers: buildHeaders(config.token),
-          body: JSON.stringify({ intent }),
-        });
-        if (!response?.ok) {
+        if (config.fetchImpl) {
+          const response = await config.fetchImpl(`${baseUrl}/execute`, {
+            method: "POST",
+            headers: buildHeaders(config.token),
+            body: JSON.stringify({ intent }),
+            signal: typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+              ? AbortSignal.timeout(config.timeoutMs)
+              : undefined,
+          });
+          if (!response?.ok) {
+            return {
+              ok: false,
+              backend: "external_executor",
+              stdout: "",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: true,
+              blockedReason: `external executor http ${response?.status || "unknown"}`,
+              failureType: "executor_unavailable",
+            };
+          }
+          const payload = await response.json();
+          return normalizeExecutorResult(payload);
+        }
+        const response = await axios.post(
+          `${baseUrl}/execute`,
+          { intent },
+          {
+            headers: buildHeaders(config.token),
+            timeout: config.timeoutMs,
+            responseType: "json",
+            validateStatus: () => true,
+          }
+        );
+        if (response.status < 200 || response.status >= 300) {
           return {
             ok: false,
             backend: "external_executor",
@@ -78,11 +113,11 @@ export function createExternalExecutorAdapter(options: ExternalExecutorOptions =
             retryable: false,
             requiresApproval: false,
             blocked: true,
-            blockedReason: `external executor http ${response?.status || "unknown"}`,
+            blockedReason: `external executor http ${response.status}`,
             failureType: "executor_unavailable",
           };
         }
-        const payload = await response.json();
+        const payload = response.data;
         return normalizeExecutorResult(payload);
       } catch (error) {
         return {

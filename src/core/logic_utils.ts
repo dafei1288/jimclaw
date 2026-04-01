@@ -5317,12 +5317,12 @@ export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state
 export async function execInContainer(containerId: string, command: string, opts: { timeout?: number; background?: boolean } = {}): Promise<string> {
   if (opts.background) {
     return ShellExecuteSkill.config.run({
-      command: `docker exec -d ${containerId} sh -c ${JSON.stringify(command)}`,
+      command: `docker exec -d -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
       timeout: 10000,
     });
   }
   return ShellExecuteSkill.config.run({
-    command: `docker exec ${containerId} sh -c ${JSON.stringify(command)}`,
+    command: `docker exec -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
     timeout: opts.timeout ?? 90000,
   });
 }

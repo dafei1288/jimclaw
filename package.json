@@ -6,6 +6,8 @@
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
     "test:core": "node --experimental-test-isolation=none --test tests/core/*.test.js",
+    "executor:sidecar": "powershell.exe -ExecutionPolicy Bypass -File scripts/executor-sidecar.ps1",
+    "executor:sidecar:node": "npx ts-node src/executor/sidecar.ts",
     "clean:workspace": "node -e \"const fs=require('fs');const dirs=fs.readdirSync('./workspace').filter(d=>d.startsWith('run_')).sort();dirs.slice(0,-10).forEach(d=>fs.rmSync('./workspace/'+d,{recursive:true,force:true}));console.log('保留最新10个run，已清理'+Math.max(0,dirs.length-10)+'个')\"",
     "clean:all": "node -e \"const fs=require('fs');const path=require('path');const dirs=fs.readdirSync('./workspace').filter(d=>d.startsWith('run_'));dirs.forEach(d=>fs.rmSync(path.join('./workspace',d),{recursive:true,force:true}));console.log('已清理'+dirs.length+'个run目录')\""
   },

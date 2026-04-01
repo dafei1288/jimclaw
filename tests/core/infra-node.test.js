@@ -141,7 +141,7 @@ test("infra setup retries transient install exec failure before escalating", asy
     if (command.startsWith("docker run -d")) {
       return "Output:\nabc123def456\nErrors:\n";
     }
-    if (command.includes('docker exec abc123def456 sh -c "npm install --silent"')) {
+    if (command.includes('docker exec -w /app abc123def456 sh -c "npm install --silent"')) {
       installCalls += 1;
       if (installCalls === 1) {
         return [
@@ -154,7 +154,7 @@ test("infra setup retries transient install exec failure before escalating", asy
       }
       return "Output:\ninstalled\nErrors:\n";
     }
-    if (command.includes('docker exec abc123def456 sh -c "npm run build"')) {
+    if (command.includes('docker exec -w /app abc123def456 sh -c "npm run build"')) {
       buildCalls += 1;
       return "Output:\nbuilt\nErrors:\n";
     }
@@ -182,6 +182,93 @@ test("infra setup retries transient install exec failure before escalating", asy
     assert.equal(result.containerId, "abc123def456");
     assert.equal(result.testResults, "");
     assert.equal(result.lastFailedNode, "");
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    FindFreePortSkill.config.run = originalFindPort;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("infra setup executes compose container commands from /app explicitly", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalFindPort = FindFreePortSkill.config.run;
+  const commands = [];
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      scripts: { build: "tsc" },
+    }, null, 2),
+    "utf-8"
+  );
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "docker-compose.yml"),
+    [
+      "version: '3.8'",
+      "",
+      "services:",
+      "  health-check-service:",
+      "    build:",
+      "      context: .",
+      "    ports:",
+      "      - \"4000:10000\"",
+    ].join("\n"),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    commands.push(command);
+    if (command.includes("docker-compose down")) {
+      return "Output:\ndown\nErrors:\n";
+    }
+    if (command.includes("docker-compose rm")) {
+      return "Output:\nremoved\nErrors:\n";
+    }
+    if (command.includes("docker-compose build health-check-service")) {
+      return "Output:\nbuilt\nErrors:\n";
+    }
+    if (command.includes('docker-compose run -d --service-ports health-check-service sh -c "tail -f /dev/null"')) {
+      return "Output:\nabc123def456\nErrors:\n";
+    }
+    if (command.includes('docker exec -w /app abc123def456 sh -c "NODE_ENV=development npm install --include=dev --silent"')) {
+      return "Output:\ninstalled\nErrors:\n";
+    }
+    if (command.includes('docker exec -w /app abc123def456 sh -c "npm run build"')) {
+      return "Output:\nbuilt\nErrors:\n";
+    }
+    throw new Error(`unexpected command: ${command}`);
+  };
+
+  try {
+    const result = await infraNode(
+      createBaseState({
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.containerId, "abc123def456");
+    assert.equal(result.testResults, "");
+    assert.equal(
+      commands.some((command) => command.includes('docker exec -w /app abc123def456 sh -c "NODE_ENV=development npm install --include=dev --silent"')),
+      true
+    );
+    assert.equal(
+      commands.some((command) => command.includes('docker exec -w /app abc123def456 sh -c "npm run build"')),
+      true
+    );
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
     FindFreePortSkill.config.run = originalFindPort;
@@ -273,10 +360,10 @@ test("infra setup cleans stale runtime process before install when deploy eviden
     if (command.startsWith("docker run -d")) {
       return "Output:\nabc123def456\nErrors:\n";
     }
-    if (command.includes('docker exec abc123def456 sh -c "if [ -f /tmp/jimclaw/server.pid ]')) {
+    if (command.includes('docker exec -w /app abc123def456 sh -c "if [ -f /tmp/jimclaw/server.pid ]')) {
       return "Output:\ncleaned\nErrors:\n";
     }
-    if (command.includes('docker exec abc123def456 sh -c "npm install --silent"')) {
+    if (command.includes('docker exec -w /app abc123def456 sh -c "npm install --silent"')) {
       return "Output:\ninstalled\nErrors:\n";
     }
     throw new Error(`unexpected command: ${command}`);
@@ -314,8 +401,8 @@ test("infra setup cleans stale runtime process before install when deploy eviden
     );
 
     assert.equal(result.containerId, "abc123def456");
-    assert.equal(commands.some((command) => command.includes('docker exec abc123def456 sh -c "if [ -f /tmp/jimclaw/server.pid ]')), true);
-    assert.equal(commands.some((command) => command.includes('docker exec abc123def456 sh -c "npm install --silent"')), true);
+    assert.equal(commands.some((command) => command.includes('docker exec -w /app abc123def456 sh -c "if [ -f /tmp/jimclaw/server.pid ]')), true);
+    assert.equal(commands.some((command) => command.includes('docker exec -w /app abc123def456 sh -c "npm install --silent"')), true);
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
     FindFreePortSkill.config.run = originalFindPort;

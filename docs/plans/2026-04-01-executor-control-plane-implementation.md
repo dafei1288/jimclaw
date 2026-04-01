@@ -8,7 +8,27 @@
 
 **Tech Stack:** TypeScript, Node.js, LangGraph.js, existing JimClaw node graph, node:test/Jest-style repo tests
 
-**Status (2026-04-01):** Task 1-13 已完成，且已额外补上 `external_executor` 接口层。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。graph/server 现已识别 executor approval ticket：票据会写入 state，挂起时区分“等待授权”与“等待恢复”，恢复时会先提交票据再从原业务节点继续。Task 12 锁定了真实失败样本回放语义：`env_guard_host_blocked` 与 `deploy` 的失败快照在 resume/replay 时不再丢失 `executorState / testResults / blockedReason / lastFailedNode / lastFailureSummary / deploymentStatus` 等关键证据，避免真实环境阻塞或早期启动失败被“洗白”为普通重跑。最新一轮真实图书管理系统样例证明：系统现在能正确在 `env_guard` 暴露“当前 Node 进程无可用 backend”这一根因，不再伪装成 `npm install` 失败或在 `deploy`/QA 中空转；同时已新增 `external_executor` 探测、解析与运行时 fallback，作为下一步 sidecar executor 落地的接入面。当前剩余缺口：仓库内还没有 bundled sidecar executor 服务本体，因此在 `spawn EPERM` 环境下仍需外部 executor 进程才能真正继续执行。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/capability-probe.test.js')"`、`node -e "require('./tests/core/backend-resolver.test.js')"`、`node -e "require('./tests/core/command-executor.test.js')"`、`node -e "require('./tests/core/env-guard-node.test.js')"`、`node -e "require('./tests/core/infra-node.test.js')"`、`node -e "require('./tests/core/terminal-node.test.js')"`、`node -e "require('./tests/core/deploy-node.test.js')"`、`npm run test:core` 全部通过。
+**Status (2026-04-01):** Task 1-13 已完成，且已额外补上 `external_executor` 接口层。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。graph/server 现已识别 executor approval ticket：票据会写入 state，挂起时区分“等待授权”与“等待恢复”，恢复时会先提交票据再从原业务节点继续。Task 12 锁定了真实失败样本回放语义：`env_guard_host_blocked` 与 `deploy` 的失败快照在 resume/replay 时不再丢失 `executorState / testResults / blockedReason / lastFailedNode / lastFailureSummary / deploymentStatus` 等关键证据，避免真实环境阻塞或早期启动失败被“洗白”为普通重跑。后续已完成两项关键补强：一是 `external_executor` 客户端不再被 `fetch unavailable` 短路，已改为在无 `fetchImpl` 时明确回退到 `axios`；二是所有 `docker exec` 统一显式带 `-w /app`，避免 `docker-compose run` 后续容器因工作目录漂移把 `npm run build` 执行成裸 `tsc` 帮助页。仓库内现已包含两种 sidecar 形态：Node 版与 PowerShell 版，默认脚本指向 PowerShell 版，以覆盖当前 Windows `spawn EPERM` 场景。最新真实验证显示：图书管理系统样例已连续两次从 `pm -> architect -> contract_sync -> orchestrator -> env_guard -> coder -> infra_setup -> terminal -> verifier -> qa -> deploy -> persistence` 全链路跑通，并成功部署到 `http://100.74.126.56:4001` 与 `http://100.74.126.56:4003`；宿主机健康检查 `GET /api/health` 返回 200。当前剩余缺口已从“执行链卡死”下降为“模板/模型质量仍可能触发业务层降级骨架”，即控制面可用性已经初步闭合，但生成质量上限仍需后续继续收敛。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/external-executor.test.js')"`、`node -e "require('./tests/core/executor-sidecar.test.js')"`、`node -e "require('./tests/core/command-executor.test.js')"`、`node -e "require('./tests/core/infra-node.test.js')"`、`node -e "require('./tests/core/terminal-node.test.js')"`、`node -e "require('./tests/core/deploy-node.test.js')"` 均通过；真实 `npx ts-node src/index.ts --auto-approve all "图书管理系统"` 回放也已通过。
+
+## 2026-04-01 实证补充
+
+### 1. 已确认根因
+
+- `external_executor.ts` 在切到 `axios` 后，仍保留了 `!config.fetchImpl` 直接返回 `"fetch unavailable"` 的旧门禁。
+- 这会导致真实运行根本进不到 `axios` 分支，表面像“sidecar 不稳定”，实际是客户端逻辑短路。
+- 对应回归测试已补到 `tests/core/external-executor.test.js`。
+
+### 2. 已确认次级问题
+
+- `docker-compose run` 拉起测试容器后，后续 `docker exec` 原先没有显式指定工作目录。
+- 在该路径下，`npm run build` 可能退化成裸 `tsc`，从而只打印 TypeScript 帮助页。
+- 现已在公共入口 `execInContainer()` 统一改为 `docker exec -w /app ...`，并通过 `tests/core/infra-node.test.js` 锁定。
+
+### 3. 当前可用性结论
+
+- “缺依赖/端口占用/构建失败” 这类常规问题，已经不再因为执行器控制面本身失真而卡死在 `env_guard_host_blocked`。
+- 客户确认节点仍保持“可授权确认，但不阻塞等待人工点击”的语义，未被回退。
+- 以图书管理系统为例，当前执行链已达到“可真实跑通并完成部署”的初步可用状态。
 
 ---
 
