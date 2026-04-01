@@ -1,6 +1,7 @@
 import { createApprovalTicket } from "./approval_tickets";
 import { probeExecutionCapabilities } from "./capability_probe";
 import { resolveBackendForIntent } from "./backend_resolver";
+import { createExternalExecutorAdapter } from "./external_executor";
 import {
   ApprovalStage,
   ApprovalTicket,
@@ -45,7 +46,10 @@ export function createCommandExecutor(deps: CommandExecutorDeps = {}) {
   const probeCapabilities = deps.probeCapabilities || probeExecutionCapabilities;
   const resolveBackend = deps.resolveBackend || resolveBackendForIntent;
   const approvalTicketFactory = deps.createApprovalTicket || createApprovalTicket;
-  const adapters = deps.adapters || {};
+  const adapters = {
+    external_executor: createExternalExecutorAdapter(),
+    ...(deps.adapters || {}),
+  };
 
   return {
     async probeCapabilities(workspace: string) {

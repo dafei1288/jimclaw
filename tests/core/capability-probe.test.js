@@ -5,6 +5,7 @@ const childProcess = require("child_process");
 let {
   probeLocalShellCapability,
   probeDockerCapability,
+  probeExternalExecutorCapability,
   probeExecutionCapabilities,
 } = require("../../src/executor/capability_probe");
 
@@ -34,7 +35,12 @@ test("default runner also converts synchronous spawn errors into unavailable loc
   } finally {
     childProcess.spawn = originalSpawn;
     delete require.cache[require.resolve("../../src/executor/capability_probe")];
-    ({ probeLocalShellCapability, probeDockerCapability, probeExecutionCapabilities } = require("../../src/executor/capability_probe"));
+    ({
+      probeLocalShellCapability,
+      probeDockerCapability,
+      probeExternalExecutorCapability,
+      probeExecutionCapabilities,
+    } = require("../../src/executor/capability_probe"));
   }
 });
 
@@ -69,4 +75,19 @@ test("execution capability returns default placeholders for network/background f
   assert.equal(probe.docker.daemonReachable, true);
   assert.equal(probe.network.outboundAllowed, true);
   assert.equal(probe.backgroundProcess.available, true);
+});
+
+test("external executor capability reports available when executor endpoint is configured", async () => {
+  const external = await probeExternalExecutorCapability({
+    externalExecutorUrl: "http://127.0.0.1:4318",
+    fetchImpl: async () => ({
+      ok: true,
+      async json() {
+        return { available: true, name: "sidecar-executor" };
+      },
+    }),
+  });
+
+  assert.equal(external.available, true);
+  assert.equal(external.baseUrl, "http://127.0.0.1:4318");
 });

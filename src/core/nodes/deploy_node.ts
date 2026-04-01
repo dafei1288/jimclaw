@@ -1,6 +1,7 @@
 import { JimClawState } from "../graph_types";
 import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
 import { createCommandExecutor } from "../../executor/command_executor";
+import { resolvePreferredBackend } from "../../executor/backend_resolver";
 import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
 import { ExecutorResult } from "../../executor/types";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
@@ -62,27 +63,11 @@ function createDockerRuntimeAdapter(containerId: string) {
 function createDeployExecutor(state: JimClawState) {
   const preferredBackend = state.executionBackend === "host" ? "local_shell" : "docker";
   return createCommandExecutor({
-    resolveBackend: async (_intent, snapshot) => {
-      if (preferredBackend === "local_shell") {
-        return {
-          selected: snapshot.localShell.available ? "local_shell" : null,
-          candidates: snapshot.localShell.available ? ["local_shell"] : [],
-          blocked: !snapshot.localShell.available,
-          blockedReason: snapshot.localShell.available ? undefined : (snapshot.localShell.reason || "local shell unavailable"),
-          requiresApproval: false,
-        };
-      }
-      return {
-        selected: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? "docker" : null,
-        candidates: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? ["docker"] : [],
-        blocked: !(snapshot.docker.cliAvailable && snapshot.docker.daemonReachable),
-        blockedReason:
-          snapshot.docker.cliAvailable && snapshot.docker.daemonReachable
-            ? undefined
-            : (snapshot.docker.reason || "docker unavailable"),
-        requiresApproval: false,
-      };
-    },
+    resolveBackend: async (_intent, snapshot) =>
+      resolvePreferredBackend(
+        state.executorState?.selectedBackend === "external_executor" ? "local_shell" : preferredBackend,
+        snapshot
+      ),
     adapters: {
       local_shell: createLocalShellAdapter(),
       docker: createDockerRuntimeAdapter(state.containerId || ""),

@@ -60,6 +60,11 @@ function mapErrorReason(error?: Error): string | undefined {
   return error.message;
 }
 
+type ExternalExecutorProbeOptions = {
+  externalExecutorUrl?: string;
+  fetchImpl?: (input: string, init?: any) => Promise<any>;
+};
+
 export async function probeLocalShellCapability(
   workspace: string,
   runner: CommandRunner = defaultRunner
@@ -129,16 +134,68 @@ export async function probeDockerCapability(
   };
 }
 
+export async function probeExternalExecutorCapability(
+  options: ExternalExecutorProbeOptions = {}
+): Promise<NonNullable<CapabilitySnapshot["externalExecutor"]>> {
+  const baseUrl = String(
+    options.externalExecutorUrl || process.env.JIMCLAW_EXTERNAL_EXECUTOR_URL || ""
+  ).trim().replace(/\/+$/, "");
+  if (!baseUrl) {
+    return {
+      available: false,
+      reason: "not configured",
+    };
+  }
+
+  const fetchImpl = options.fetchImpl || (typeof fetch === "function" ? fetch.bind(globalThis) : null);
+  if (!fetchImpl) {
+    return {
+      available: false,
+      baseUrl,
+      reason: "fetch unavailable",
+    };
+  }
+
+  try {
+    const response = await fetchImpl(`${baseUrl}/capabilities`, {
+      method: "GET",
+      headers: { accept: "application/json" },
+    });
+    if (!response?.ok) {
+      return {
+        available: false,
+        baseUrl,
+        reason: `http ${response?.status || "unknown"}`,
+      };
+    }
+    const payload = await response.json().catch(() => ({}));
+    return {
+      available: payload?.available !== false,
+      baseUrl,
+      reason: typeof payload?.reason === "string" ? payload.reason : undefined,
+    };
+  } catch (error) {
+    return {
+      available: false,
+      baseUrl,
+      reason: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 export async function probeExecutionCapabilities(
   workspace: string,
-  runner: CommandRunner = defaultRunner
+  runner: CommandRunner = defaultRunner,
+  options: ExternalExecutorProbeOptions = {}
 ): Promise<CapabilitySnapshot> {
   const local = await probeLocalShellCapability(workspace, runner);
   const docker = await probeDockerCapability(workspace, runner);
+  const externalExecutor = await probeExternalExecutorCapability(options);
   return {
     version: "v1",
     localShell: local,
     docker,
+    externalExecutor,
     network: {
       outboundAllowed: true,
     },

@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Node.js, LangGraph.js, existing JimClaw node graph, node:test/Jest-style repo tests
 
-**Status (2026-04-01):** Task 1-11 已完成。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。graph/server 现已识别 executor approval ticket：票据会写入 state，挂起时区分“等待授权”与“等待恢复”，恢复时会先提交票据再从原业务节点继续。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/workflow-replay.test.js')"`、`node -e "require('./tests/core/approval-node.test.js')"`、`npm run test:core` 全部通过。
+**Status (2026-04-01):** Task 1-13 已完成，且已额外补上 `external_executor` 接口层。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。graph/server 现已识别 executor approval ticket：票据会写入 state，挂起时区分“等待授权”与“等待恢复”，恢复时会先提交票据再从原业务节点继续。Task 12 锁定了真实失败样本回放语义：`env_guard_host_blocked` 与 `deploy` 的失败快照在 resume/replay 时不再丢失 `executorState / testResults / blockedReason / lastFailedNode / lastFailureSummary / deploymentStatus` 等关键证据，避免真实环境阻塞或早期启动失败被“洗白”为普通重跑。最新一轮真实图书管理系统样例证明：系统现在能正确在 `env_guard` 暴露“当前 Node 进程无可用 backend”这一根因，不再伪装成 `npm install` 失败或在 `deploy`/QA 中空转；同时已新增 `external_executor` 探测、解析与运行时 fallback，作为下一步 sidecar executor 落地的接入面。当前剩余缺口：仓库内还没有 bundled sidecar executor 服务本体，因此在 `spawn EPERM` 环境下仍需外部 executor 进程才能真正继续执行。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/capability-probe.test.js')"`、`node -e "require('./tests/core/backend-resolver.test.js')"`、`node -e "require('./tests/core/command-executor.test.js')"`、`node -e "require('./tests/core/env-guard-node.test.js')"`、`node -e "require('./tests/core/infra-node.test.js')"`、`node -e "require('./tests/core/terminal-node.test.js')"`、`node -e "require('./tests/core/deploy-node.test.js')"`、`npm run test:core` 全部通过。
 
 ---
 
@@ -555,6 +555,16 @@ git add tests/core/workflow-replay.test.js tests/core/failure-artifacts.test.js
 git commit -m "test: lock executor control plane replay behavior"
 ```
 
+**Completion Notes (2026-04-01):**
+
+- 已新增当前工作区失败样本覆盖：
+  - `env_guard` 宿主环境阻塞快照会保留 executor 环境证据
+  - `deploy` 早期启动失败快照会保留部署阶段失败证据
+- 已修正回放/恢复语义：
+  - `buildResumeStateFromCurrentSnapshot()` 与 `prepareReplayStateFromCheckpoint()` 不再在 `env_guard*` / `deploy` 场景清空失败证据
+  - `deploy` 早期 executor 启动失败会直接路由到 `post_mortem`，不再误入 QA 运行时修复循环
+- 对应提交：`c73d3f0 test: lock executor control plane replay behavior`
+
 ### Task 13: 统一编译与核心回归
 
 **Files:**
@@ -593,9 +603,26 @@ Expected: 通过
 **Step 3: Commit**
 
 ```bash
-git add .
+git add <explicit verified files>
 git commit -m "test: verify executor control plane core regression suite"
 ```
+
+**Completion Notes (2026-04-01):**
+
+- 已完成编译与核心回归：
+  - `npx tsc --noEmit`
+  - `npm run test:core`
+- 已追加 external executor 定向验证：
+  - `node -e "require('./tests/core/capability-probe.test.js')"`
+  - `node -e "require('./tests/core/backend-resolver.test.js')"`
+  - `node -e "require('./tests/core/command-executor.test.js')"`
+  - `node -e "require('./tests/core/env-guard-node.test.js')"`
+  - `node -e "require('./tests/core/infra-node.test.js')"`
+  - `node -e "require('./tests/core/terminal-node.test.js')"`
+  - `node -e "require('./tests/core/deploy-node.test.js')"`
+- 真实图书管理系统样例结论：
+  - 当前控制面已经能正确把 `spawn EPERM` 识别为“执行器不可用”
+  - 当前仓内实现还缺少外部 sidecar executor 服务本体，因此只能停在 `env_guard_host_blocked`，不能自愈继续
 
 ### Task 14: 跑一次真实图书管理系统样例
 

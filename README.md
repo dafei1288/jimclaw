@@ -85,6 +85,23 @@ cp .env.example .env
 npm install
 ```
 
+### 2.1 可选：配置外部执行器 sidecar
+
+当当前 Node 进程内 `child_process.spawn` 被宿主环境限制时，JimClaw 现在支持把执行面切到外部 executor：
+
+```bash
+JIMCLAW_EXTERNAL_EXECUTOR_URL=http://127.0.0.1:4318
+JIMCLAW_EXTERNAL_EXECUTOR_TOKEN=your_optional_token
+```
+
+当前仓库已经支持：
+
+- 探测 `GET /capabilities`
+- 调用 `POST /execute`
+- 在 `env_guard / infra_setup / terminal / deploy` 中把 `external_executor` 当作正式 backend
+
+但仓库内暂时还没有 bundled sidecar 服务本体，所以如果你所在环境会出现 `spawn EPERM`，仍需要外部启动一个 executor 进程供 JimClaw 连接。
+
 ### 3. 运行
 
 ```bash

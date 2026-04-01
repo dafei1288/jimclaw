@@ -11,6 +11,7 @@ function buildCapabilitySnapshot(overrides = {}) {
     version: "v1",
     localShell: { available: false, ...(overrides.localShell || {}) },
     docker: { cliAvailable: false, daemonReachable: false, ...(overrides.docker || {}) },
+    externalExecutor: { available: false, ...(overrides.externalExecutor || {}) },
     network: { outboundAllowed: true, ...(overrides.network || {}) },
     backgroundProcess: { available: false, ...(overrides.backgroundProcess || {}) },
   };
@@ -234,6 +235,44 @@ test("command executor delegates to selected backend adapter", async () => {
   assert.equal(result.ok, true);
   assert.equal(result.backend, "local_shell");
   assert.equal(result.stdout, "echo hi");
+});
+
+test("command executor delegates to external executor backend when selected", async () => {
+  const executor = createCommandExecutor({
+    probeCapabilities: async () =>
+      buildCapabilitySnapshot({
+        externalExecutor: { available: true, baseUrl: "http://127.0.0.1:4318" },
+      }),
+    resolveBackend: async () => ({
+      selected: "external_executor",
+      candidates: ["external_executor"],
+      blocked: false,
+      requiresApproval: false,
+    }),
+    adapters: {
+      external_executor: {
+        execute: async (intent) => ({
+          ok: true,
+          backend: "external_executor",
+          stdout: `external:${intent.command || intent.kind}`,
+          stderr: "",
+          retryable: false,
+          requiresApproval: false,
+          blocked: false,
+        }),
+      },
+    },
+  });
+
+  const result = await executor.executeIntent({
+    kind: "exec_shell",
+    workspace: process.cwd(),
+    command: "npm install",
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.backend, "external_executor");
+  assert.equal(result.stdout, "external:npm install");
 });
 
 test("shell exec exposes a local shell adapter facade", async () => {

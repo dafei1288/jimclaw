@@ -1,13 +1,14 @@
 require("ts-node/register/transpile-only");
 const assert = require("node:assert/strict");
 const { test } = require("node:test");
-const { resolveBackendForIntent } = require("../../src/executor/backend_resolver");
+const { resolveBackendForIntent, resolvePreferredBackend } = require("../../src/executor/backend_resolver");
 
-function buildSnapshot({ docker, local, network }) {
+function buildSnapshot({ docker, local, network, externalExecutor }) {
   return {
     version: "v1",
     localShell: local ?? { available: false },
     docker: docker ?? { cliAvailable: false, daemonReachable: false },
+    externalExecutor: externalExecutor ?? { available: false },
     network: network ?? { outboundAllowed: true },
     backgroundProcess: { available: local?.available || false },
   };
@@ -83,4 +84,33 @@ test("blocked no-backend state must not be turned into approval-required", async
   assert.equal(resolution.selected, null);
   assert.equal(resolution.requiresApproval, false);
   assert.equal(resolution.approvalScope, undefined);
+});
+
+test("install_deps falls back to external_executor when docker and local shell are unavailable", async () => {
+  const resolution = await resolveBackendForIntent(
+    { kind: "install_deps" },
+    buildSnapshot({
+      docker: { cliAvailable: false, daemonReachable: false, reason: "spawn EPERM" },
+      local: { available: false, reason: "spawn EPERM" },
+      externalExecutor: { available: true, baseUrl: "http://127.0.0.1:4318" },
+    })
+  );
+
+  assert.equal(resolution.selected, "external_executor");
+  assert.deepEqual(resolution.candidates, ["external_executor"]);
+  assert.equal(resolution.blocked, false);
+});
+
+test("host-preferred runtime backend falls back to external_executor when local shell is unavailable", async () => {
+  const resolution = await resolvePreferredBackend(
+    "local_shell",
+    buildSnapshot({
+      local: { available: false, reason: "spawn EPERM" },
+      externalExecutor: { available: true, baseUrl: "http://127.0.0.1:4318" },
+    })
+  );
+
+  assert.equal(resolution.selected, "external_executor");
+  assert.deepEqual(resolution.candidates, ["external_executor"]);
+  assert.equal(resolution.blocked, false);
 });

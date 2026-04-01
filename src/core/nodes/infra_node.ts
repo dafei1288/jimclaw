@@ -2,6 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState } from "../graph_types";
 import { createCommandExecutor } from "../../executor/command_executor";
+import { resolvePreferredBackend } from "../../executor/backend_resolver";
 import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
 import { ExecutorResult } from "../../executor/types";
 import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
@@ -220,28 +221,7 @@ function createDockerCliAdapter() {
 
 function createInfraExecutor(preferredBackend: "local_shell" | "docker") {
   return createCommandExecutor({
-    resolveBackend: async (_intent, snapshot) => {
-      if (preferredBackend === "local_shell") {
-        return {
-          selected: snapshot.localShell.available ? "local_shell" : null,
-          candidates: snapshot.localShell.available ? ["local_shell"] : [],
-          blocked: !snapshot.localShell.available,
-          blockedReason: snapshot.localShell.available ? undefined : (snapshot.localShell.reason || "local shell unavailable"),
-          requiresApproval: false,
-        };
-      }
-
-      return {
-        selected: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? "docker" : null,
-        candidates: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? ["docker"] : [],
-        blocked: !(snapshot.docker.cliAvailable && snapshot.docker.daemonReachable),
-        blockedReason:
-          snapshot.docker.cliAvailable && snapshot.docker.daemonReachable
-            ? undefined
-            : (snapshot.docker.reason || "docker unavailable"),
-        requiresApproval: false,
-      };
-    },
+    resolveBackend: async (_intent, snapshot) => resolvePreferredBackend(preferredBackend, snapshot),
     adapters: {
       local_shell: createLocalShellAdapter(),
       docker: createDockerCliAdapter(),
@@ -322,7 +302,11 @@ export async function infraNode(
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
   const commandExecutor =
     deps?.commandExecutor ||
-    createInfraExecutor(state.executionBackend === "host" ? "local_shell" : "docker");
+    createInfraExecutor(
+      state.executorState?.selectedBackend === "external_executor"
+        ? "local_shell"
+        : (state.executionBackend === "host" ? "local_shell" : "docker")
+    );
   
   // 1. 获取宿主机空闲端口
   let hostPort = 0;

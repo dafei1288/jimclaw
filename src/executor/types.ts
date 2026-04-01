@@ -30,6 +30,7 @@ export interface CapabilitySnapshot {
   version: "v1";
   localShell: { available: boolean; reason?: string };
   docker: { cliAvailable: boolean; daemonReachable: boolean; reason?: string };
+  externalExecutor?: { available: boolean; baseUrl?: string; reason?: string };
   network: { outboundAllowed: boolean; reason?: string };
   backgroundProcess: { available: boolean; reason?: string };
 }
