@@ -614,6 +614,7 @@ export async function envGuardNode(
           agentRecoveryPending: true,
           agentRecoveryNode: "env_guard",
           agentRecoveryReason: approvalReason,
+          pendingApprovalTicketId: resolvedIntent.approvalTicket?.id || "",
         },
         "env_guard_approval_required"
       );
@@ -629,6 +630,7 @@ export async function envGuardNode(
         agentRecoveryPending: true,
         agentRecoveryNode: "env_guard",
         agentRecoveryReason: approvalReason,
+        pendingApprovalTicketId: resolvedIntent.approvalTicket?.id || "",
         testResults: `${state.testResults || ""}\n${approvalReason}`.trim(),
       };
     }

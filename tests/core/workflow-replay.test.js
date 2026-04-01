@@ -7,11 +7,11 @@ const {
   createBaseState,
   createSnapshotRecorder,
 } = require("./test-helpers");
-const { createJimClawGraph, getVerifierNextNode, getQaNextNode, getInfraNextNode } = require("../../src/core/graph");
+const { createJimClawGraph, getVerifierNextNode, getQaNextNode, getInfraNextNode, hasPendingExecutorApproval } = require("../../src/core/graph");
 const { deployNode } = require("../../src/core/nodes/deploy_node");
 const { qaNode } = require("../../src/core/nodes/qa_node");
 const { fixPlanNode } = require("../../src/core/nodes/fix_plan_node");
-const { loadTraceIndex } = require("../../src/core/logic_utils");
+const { buildResumeStateFromCurrentSnapshot, loadTraceIndex } = require("../../src/core/logic_utils");
 const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
 const { GetServerIPSkill } = require("../../src/skills/get_server_ip");
 const { AgentResourceExhaustedError, AgentServiceUnavailableError } = require("../../src/core/agent");
@@ -412,6 +412,106 @@ test("workflow pauses into agent_pending when coder model quota is exhausted", a
   } finally {
     await removeTempWorkspace(workspace);
   }
+});
+
+test("deploy pending approval persists executor ticket and resume state points back to deploy", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalGetServerIP = GetServerIPSkill.config.run;
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      () => {},
+      () => {},
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: false,
+            backend: "local_shell",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: true,
+            approvalTicketId: "ticket-deploy",
+            blocked: true,
+            blockedReason: "approval required for start_runtime",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.agentRecoveryPending, true);
+    assert.equal(result.agentRecoveryNode, "deploy");
+    assert.equal(result.pendingApprovalTicketId, "ticket-deploy");
+    assert.equal(result.executorState?.approvalTickets?.some((ticket) => ticket.id === "ticket-deploy" && ticket.status === "pending"), true);
+    assert.equal(hasPendingExecutorApproval({ ...createBaseState(), ...result }), true);
+
+    const resumed = buildResumeStateFromCurrentSnapshot({
+      node: "agent_pending",
+      state: {
+        ...createBaseState(),
+        ...result,
+      },
+    });
+    assert.equal(resumed.resumeFromNode, "deploy");
+    assert.equal(resumed.pendingApprovalTicketId, "ticket-deploy");
+  } finally {
+    GetServerIPSkill.config.run = originalGetServerIP;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("approved executor ticket no longer keeps graph in pending gate", () => {
+  const state = createBaseState({
+    agentRecoveryPending: true,
+    agentRecoveryNode: "deploy",
+    pendingApprovalTicketId: "ticket-deploy",
+    executorState: {
+      version: "v1",
+      approvalTickets: [
+        {
+          id: "ticket-deploy",
+          stage: "background_runtime",
+          required: true,
+          status: "approved",
+          reason: "approval required for start_runtime",
+          requestedAt: "2026-04-01T00:00:00.000Z",
+          resolvedAt: "2026-04-01T00:01:00.000Z",
+          resolvedBy: "customer",
+        },
+      ],
+      runtimeHandles: [],
+      lastExecutorResult: {
+        ok: false,
+        backend: "local_shell",
+        stdout: "",
+        stderr: "",
+        retryable: false,
+        requiresApproval: true,
+        approvalTicketId: "ticket-deploy",
+        blocked: true,
+        blockedReason: "approval required for start_runtime",
+      },
+    },
+  });
+
+  assert.equal(hasPendingExecutorApproval(state), false);
 });
 
 test("deploy node persists deploy failure evidence and runtime ownership", async () => {

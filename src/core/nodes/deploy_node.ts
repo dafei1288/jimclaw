@@ -91,11 +91,22 @@ function createDeployExecutor(state: JimClawState) {
 }
 
 function buildDeployExecutorState(state: JimClawState, result: ExecutorResult): NonNullable<JimClawState["executorState"]> {
+  const approvalTickets = [...(state.executorState?.approvalTickets || [])];
+  if (result.requiresApproval && result.approvalTicketId && !approvalTickets.some((ticket) => ticket.id === result.approvalTicketId)) {
+    approvalTickets.push({
+      id: result.approvalTicketId,
+      stage: "background_runtime",
+      required: true,
+      status: "pending",
+      reason: result.blockedReason || "approval required for start_runtime",
+      requestedAt: new Date().toISOString(),
+    });
+  }
   return {
     version: "v1",
     capabilitySnapshot: state.executorState?.capabilitySnapshot,
     selectedBackend: result.backend,
-    approvalTickets: state.executorState?.approvalTickets || [],
+    approvalTickets,
     runtimeHandles: state.executorState?.runtimeHandles || [],
     lastExecutorResult: result,
   };
@@ -515,6 +526,7 @@ export async function deployNode(
         agentRecoveryPending: true,
         agentRecoveryNode: "deploy",
         agentRecoveryReason: approvalReason,
+        pendingApprovalTicketId: launchResult.approvalTicketId || "",
         executorState: buildDeployExecutorState(state, launchResult),
         lastFailedNode: "deploy",
         lastFailureSummary: approvalReason,

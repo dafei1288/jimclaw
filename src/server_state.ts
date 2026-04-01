@@ -45,8 +45,10 @@ export function createBaseGraphState(
     customerApprovalState: buildCustomerApprovalState({
       autoApprove: buildServerAutoApprove(autoApprove),
     }),
+    executorState: null,
     requiresApproval: false,
     pendingApprovalStage: null,
+    pendingApprovalTicketId: "",
     approvalNextNode: "",
   };
 }
@@ -90,8 +92,10 @@ export function createServerInitialSession(
     customerApprovalState: buildCustomerApprovalState({
       autoApprove: buildServerAutoApprove(autoApprove),
     }),
+    executorState: null,
     requiresApproval: false,
     pendingApprovalStage: null,
+    pendingApprovalTicketId: "",
     approvalNextNode: "",
     agentRecoveryPending: false,
     agentRecoveryNode: "",

@@ -250,11 +250,22 @@ function createInfraExecutor(preferredBackend: "local_shell" | "docker") {
 }
 
 function buildExecutorState(state: JimClawState, result: ExecutorResult): NonNullable<JimClawState["executorState"]> {
+  const approvalTickets = [...(state.executorState?.approvalTickets || [])];
+  if (result.requiresApproval && result.approvalTicketId && !approvalTickets.some((ticket) => ticket.id === result.approvalTicketId)) {
+    approvalTickets.push({
+      id: result.approvalTicketId,
+      stage: "network_install",
+      required: true,
+      status: "pending",
+      reason: result.blockedReason || "approval required for install_deps",
+      requestedAt: new Date().toISOString(),
+    });
+  }
   return {
     version: "v1",
     capabilitySnapshot: state.executorState?.capabilitySnapshot,
     selectedBackend: result.backend,
-    approvalTickets: state.executorState?.approvalTickets || [],
+    approvalTickets,
     runtimeHandles: state.executorState?.runtimeHandles || [],
     lastExecutorResult: result,
   };
@@ -365,6 +376,7 @@ export async function infraNode(
             agentRecoveryPending: true,
             agentRecoveryNode: "infra_setup",
             agentRecoveryReason: installResult.blockedReason || "approval required for install_deps",
+            pendingApprovalTicketId: installResult.approvalTicketId || "",
             executorState: buildExecutorState(state, installResult),
             testResults: installResult.blockedReason || "approval required for install_deps",
             lastFailedNode: "infra_setup",

@@ -35,12 +35,26 @@ function isAgentRecoveryError(error: unknown): error is AgentServiceUnavailableE
   return error instanceof AgentServiceUnavailableError || error instanceof AgentResourceExhaustedError || error instanceof AgentTimeoutError;
 }
 
+export function hasPendingExecutorApproval(state: JimClawState): boolean {
+  const ticketId = String(state.pendingApprovalTicketId || "").trim();
+  if (!ticketId) return false;
+  const ticket = (state.executorState?.approvalTickets || []).find((item: any) => item?.id === ticketId);
+  if (!ticket) return true;
+  return ticket.status === "pending";
+}
+
+function shouldPauseForAgentPending(state: JimClawState): boolean {
+  if (!state.agentRecoveryPending) return false;
+  if (!state.pendingApprovalTicketId) return true;
+  return hasPendingExecutorApproval(state);
+}
+
 function routeWithAgentPending<T extends string>(
   resolver: (state: JimClawState) => T,
   pendingNode: string = "agent_pending"
 ) {
   return (state: JimClawState): T | typeof pendingNode => {
-    if (state.agentRecoveryPending) return pendingNode;
+    if (shouldPauseForAgentPending(state)) return pendingNode;
     return resolver(state);
   };
 }
@@ -57,7 +71,7 @@ type ApprovalRequest = {
 };
 
 export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "infra_setup" | "qa" {
-  if (state.agentRecoveryPending) return "qa";
+  if (shouldPauseForAgentPending(state)) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
     return "qa";
   }
@@ -89,7 +103,7 @@ export function getQaNextNode(
   state: JimClawState,
   maxRetries: number
 ): "approval" | "deploy" | "architect" | "env_guard" | "infra_setup" | "post_mortem" | "architect_mediation" | "fix_plan" | "coder" {
-  if (state.agentRecoveryPending) return "coder";
+  if (shouldPauseForAgentPending(state)) return "coder";
   const openIssues = (state.issueTracker || []).filter((issue: any) => issue.status === "open");
   const blockingProtocolFailures = (state.protocolFailures || []).filter((failure: any) => failure?.blocking);
   const failureEvidence = extractFailureEvidence(state.testResults || "", state.deploymentStatus, state.blockedReason);

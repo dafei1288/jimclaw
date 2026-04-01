@@ -6,6 +6,7 @@ import { createJimClawGraph } from "./core/graph";
 import { buildReplayStateFromSnapshot, buildResumeStateFromCurrentSnapshot, loadCheckpointSnapshot, loadTraceIndex, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
 import { ModelManager } from "./utils/models";
 import { ApprovalAutoApprove, createBaseGraphState, createServerInitialSession } from "./server_state";
+import { approveTicket } from "./executor/approval_tickets";
 import path from "path";
 import * as fs from "fs/promises";
 import { AuditLogger } from "./utils/audit";
@@ -76,6 +77,52 @@ function markApprovalCheckpointApproved(state: any, stage: string) {
           : checkpoint
       ),
     },
+  };
+}
+
+function findPendingExecutorTicket(state: any) {
+  const ticketId = String(state?.pendingApprovalTicketId || state?.executorState?.lastExecutorResult?.approvalTicketId || "").trim();
+  if (!ticketId) return null;
+  const tickets = state?.executorState?.approvalTickets || [];
+  const ticket = tickets.find((item: any) => item?.id === ticketId) || null;
+  if (!ticket) {
+    return {
+      id: ticketId,
+      stage: "background_runtime",
+      status: "pending",
+      reason: state?.agentRecoveryReason || state?.blockedReason || "approval required",
+    };
+  }
+  return ticket.status === "pending" ? ticket : null;
+}
+
+function approvePendingExecutorTicket(state: any) {
+  const ticketId = String(state?.pendingApprovalTicketId || "").trim();
+  if (!ticketId) return state;
+  const executorState = state?.executorState || null;
+  const approvalTickets = (executorState?.approvalTickets || []).map((ticket: any) =>
+    ticket?.id === ticketId && ticket?.status === "pending"
+      ? approveTicket(ticket, "customer")
+      : ticket
+  );
+  return {
+    ...state,
+    pendingApprovalTicketId: "",
+    agentRecoveryPending: false,
+    agentRecoveryNode: "",
+    agentRecoveryReason: "",
+    executorState: executorState
+      ? {
+          ...executorState,
+          approvalTickets,
+          lastExecutorResult: executorState.lastExecutorResult
+            ? {
+                ...executorState.lastExecutorResult,
+                requiresApproval: false,
+              }
+            : executorState.lastExecutorResult,
+        }
+      : executorState,
   };
 }
 
@@ -188,8 +235,10 @@ let currentSession: any = {
   protocolFailures: [],
   protocolPatches: [],
   customerApprovalState: null,
+  executorState: null,
   requiresApproval: false,
   pendingApprovalStage: null,
+  pendingApprovalTicketId: "",
   approvalNextNode: "",
   agentRecoveryPending: false,
   agentRecoveryNode: "",
@@ -321,7 +370,9 @@ io.on("connection", (socket) => {
         if (stateUpdate.protocolFailures !== undefined) currentSession.protocolFailures = stateUpdate.protocolFailures;
         if (stateUpdate.protocolPatches !== undefined) currentSession.protocolPatches = stateUpdate.protocolPatches;
         if (stateUpdate.customerApprovalState !== undefined) currentSession.customerApprovalState = stateUpdate.customerApprovalState;
+        if (stateUpdate.executorState !== undefined) currentSession.executorState = stateUpdate.executorState;
         if (stateUpdate.pendingApprovalStage !== undefined) currentSession.pendingApprovalStage = stateUpdate.pendingApprovalStage;
+        if (stateUpdate.pendingApprovalTicketId !== undefined) currentSession.pendingApprovalTicketId = stateUpdate.pendingApprovalTicketId;
         if (stateUpdate.approvalNextNode !== undefined) currentSession.approvalNextNode = stateUpdate.approvalNextNode;
         if (stateUpdate.agentRecoveryPending !== undefined) currentSession.agentRecoveryPending = stateUpdate.agentRecoveryPending;
         if (stateUpdate.agentRecoveryNode !== undefined) currentSession.agentRecoveryNode = stateUpdate.agentRecoveryNode;
@@ -386,22 +437,27 @@ io.on("connection", (socket) => {
           nextNode: currentSession.approvalNextNode,
         });
       } else if (currentSession.agentRecoveryPending) {
-        currentSession.status = "Waiting Recovery";
+        const pendingExecutorTicket = findPendingExecutorTicket(currentSession);
+        currentSession.status = pendingExecutorTicket ? "Waiting Authorization" : "Waiting Recovery";
         await AuditLogger.recordStructuredEvent(currentSession.workspacePath, {
           type: "task-paused",
           sender: "System",
-          content: `等待模型服务恢复：${currentSession.agentRecoveryNode || "unknown"}`,
+          content: pendingExecutorTicket
+            ? `等待客户授权：${pendingExecutorTicket.id}`
+            : `等待模型服务恢复：${currentSession.agentRecoveryNode || "unknown"}`,
           timestamp: new Date().toLocaleString("zh-CN"),
           metadata: {
             currentNode: currentSession.currentNode,
             agentRecoveryNode: currentSession.agentRecoveryNode || undefined,
             agentRecoveryReason: currentSession.agentRecoveryReason || undefined,
+            pendingApprovalTicketId: currentSession.pendingApprovalTicketId || undefined,
           },
         });
         io.emit("task-paused", {
-          stage: "agent_recovery",
+          stage: pendingExecutorTicket ? "executor_approval" : "agent_recovery",
           nextNode: currentSession.agentRecoveryNode,
           reason: currentSession.agentRecoveryReason,
+          ticketId: pendingExecutorTicket?.id,
         });
       } else {
         currentSession.status = "Finished";
@@ -522,19 +578,24 @@ io.on("connection", (socket) => {
 
       const latestTeam = getTeamInfo();
       const latestState = await loadLatestGraphState(currentSession.workspacePath);
-      const resumeState = {
-        ...latestState,
-        agentRecoveryPending: false,
-        agentRecoveryNode: "",
-        agentRecoveryReason: "",
-      };
+      const hasPendingExecutorTicket = Boolean(findPendingExecutorTicket({ ...currentSession, ...latestState }));
+      const resumeState = hasPendingExecutorTicket
+        ? approvePendingExecutorTicket(latestState)
+        : {
+            ...latestState,
+            pendingApprovalTicketId: "",
+            agentRecoveryPending: false,
+            agentRecoveryNode: "",
+            agentRecoveryReason: "",
+          };
 
       await runGraphSession(
         latestTeam,
         {
           ...currentSession,
           status: "Running",
-          currentPhase: "recovery",
+          currentPhase: hasPendingExecutorTicket ? "approval" : "recovery",
+          pendingApprovalTicketId: "",
           agentRecoveryPending: false,
           agentRecoveryNode: "",
           agentRecoveryReason: "",
@@ -599,7 +660,9 @@ io.on("connection", (socket) => {
           protocolFailures: replayState.protocolFailures || [],
           protocolPatches: replayState.protocolPatches || [],
           customerApprovalState: replayState.customerApprovalState || null,
+          executorState: replayState.executorState || null,
           pendingApprovalStage: replayState.pendingApprovalStage || null,
+          pendingApprovalTicketId: replayState.pendingApprovalTicketId || "",
           approvalNextNode: replayState.approvalNextNode || "",
           agentRecoveryPending: replayState.agentRecoveryPending || false,
           agentRecoveryNode: replayState.agentRecoveryNode || "",

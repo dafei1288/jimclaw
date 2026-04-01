@@ -786,6 +786,9 @@ export const JimClawState = Annotation.Root({
   pendingApprovalStage: Annotation<ApprovalStage | null>({
     reducer: (x, y) => y ?? x,
   }),
+  pendingApprovalTicketId: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
   approvalNextNode: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),

@@ -87,6 +87,17 @@ function buildTerminalExecutorFailure(state: JimClawState, result: ExecutorResul
     stderr: result.stderr,
     raw: result.blockedReason || summary,
   });
+  const approvalTickets = [...(state.executorState?.approvalTickets || [])];
+  if (result.requiresApproval && result.approvalTicketId && !approvalTickets.some((ticket) => ticket.id === result.approvalTicketId)) {
+    approvalTickets.push({
+      id: result.approvalTicketId,
+      stage: "background_runtime",
+      required: true,
+      status: "pending",
+      reason: result.blockedReason || "approval required for run_tests",
+      requestedAt: new Date().toISOString(),
+    });
+  }
   const validationReport = buildValidationReport(
     [{
       summary,
@@ -107,7 +118,7 @@ function buildTerminalExecutorFailure(state: JimClawState, result: ExecutorResul
       version: "v1",
       capabilitySnapshot: state.executorState?.capabilitySnapshot,
       selectedBackend: result.backend,
-      approvalTickets: state.executorState?.approvalTickets || [],
+      approvalTickets,
       runtimeHandles: state.executorState?.runtimeHandles || [],
       lastExecutorResult: result,
     },
@@ -182,6 +193,30 @@ export async function terminalNode(
       continue;
     }
     break;
+  }
+
+  if (result.requiresApproval) {
+    const summary = `[Terminal] 测试执行需要授权：${result.blockedReason || "approval required for run_tests"}`;
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-terminal-r${state.retryCount || 0}`,
+      "terminal",
+      state.retryCount || 0,
+      `Terminal 第${state.retryCount || 0}轮：等待测试执行授权`,
+      `# Terminal 第${state.retryCount || 0}轮\n\n## 执行结论\n- 状态：等待授权\n- 原因：${summary}\n`
+    );
+    return {
+      testResults: result.stderr || result.stdout || summary,
+      meetingNotes: [note],
+      pendingApprovalTicketId: result.approvalTicketId || "",
+      agentRecoveryPending: true,
+      agentRecoveryNode: "terminal",
+      agentRecoveryReason: summary,
+      blockedReason: summary,
+      lastFailedNode: "terminal",
+      lastFailureSummary: summary,
+      ...buildTerminalExecutorFailure(state, result, summary),
+    };
   }
 
   if ((result.blocked || result.failureType) && mapExecutorFailureToValidationFailure(

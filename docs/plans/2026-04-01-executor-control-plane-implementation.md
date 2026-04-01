@@ -8,7 +8,7 @@
 
 **Tech Stack:** TypeScript, Node.js, LangGraph.js, existing JimClaw node graph, node:test/Jest-style repo tests
 
-**Status (2026-04-01):** Task 1-10 已完成。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/deploy-node.test.js')"`、`npm run test:core` 全部通过。
+**Status (2026-04-01):** Task 1-11 已完成。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。graph/server 现已识别 executor approval ticket：票据会写入 state，挂起时区分“等待授权”与“等待恢复”，恢复时会先提交票据再从原业务节点继续。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/workflow-replay.test.js')"`、`node -e "require('./tests/core/approval-node.test.js')"`、`npm run test:core` 全部通过。
 
 ---
 

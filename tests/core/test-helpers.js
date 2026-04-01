@@ -34,6 +34,7 @@ function createBaseState(overrides = {}) {
     customerApprovalState: null,
     executorState: null,
     pendingApprovalStage: null,
+    pendingApprovalTicketId: "",
     approvalNextNode: "",
     agentRecoveryPending: false,
     agentRecoveryNode: "",
