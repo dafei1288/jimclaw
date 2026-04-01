@@ -420,7 +420,6 @@ test("deploy node persists deploy failure evidence and runtime ownership", async
   const originalGetServerIP = GetServerIPSkill.config.run;
 
   ShellExecuteSkill.config.run = async ({ command }) => {
-    if (command.startsWith("docker exec -d")) return "Output:\n\nErrors:\n";
     if (command.startsWith("curl ")) return "Output:\n000\nErrors:\n";
     if (command.startsWith("docker exec ") && command.includes("netstat")) return "Output:\n\nErrors:\n";
     if (command.startsWith("docker logs ")) return "Output:\napp crashed on startup\nlisten EADDRNOTAVAIL\nErrors:\n";
@@ -449,7 +448,20 @@ test("deploy node persists deploy failure evidence and runtime ownership", async
       workspace,
       () => {},
       () => {},
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: true,
+            backend: "docker",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: false,
+            blocked: false,
+          }),
+        },
+      }
     );
 
     assert.equal(finalState.deploymentStatus.status, "failed");

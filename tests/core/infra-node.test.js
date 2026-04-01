@@ -326,9 +326,8 @@ test("infra setup cleans stale runtime process before install when deploy eviden
 test("infra setup uses host backend install and build when execution backend is host", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
-  const originalShellRun = ShellExecuteSkill.config.run;
   const originalFindPort = FindFreePortSkill.config.run;
-  const commands = [];
+  const executorCalls = [];
 
   await require("fs/promises").writeFile(
     require("path").join(workspace, "package.json"),
@@ -340,15 +339,72 @@ test("infra setup uses host backend install and build when execution backend is 
   );
 
   FindFreePortSkill.config.run = async () => "4123";
-  ShellExecuteSkill.config.run = async ({ command, workDir }) => {
-    commands.push({ command, workDir });
-    if (command === "npm install --silent") {
-      return "Output:\ninstalled\nErrors:\n";
-    }
-    if (command === "npm run build") {
-      return "Output:\nbuilt\nErrors:\n";
-    }
-    throw new Error(`unexpected command: ${command}`);
+
+  try {
+    const result = await infraNode(
+      createBaseState({
+        executionBackend: "host",
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async (intent) => {
+            executorCalls.push({ kind: intent.kind, command: intent.command });
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "ok",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
+    );
+
+    assert.equal(result.executionBackend, "host");
+    assert.equal(result.containerId, "");
+    assert.equal(result.allocatedHostPort, 4123);
+    assert.deepEqual(executorCalls, [
+      { kind: "install_deps", command: "npm install --silent" },
+      { kind: "build_workspace", command: "npm run build" },
+    ]);
+  } finally {
+    FindFreePortSkill.config.run = originalFindPort;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("infra setup routes host install and build through command executor instead of direct shell install", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalFindPort = FindFreePortSkill.config.run;
+  const executorCalls = [];
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      scripts: { build: "tsc" },
+    }, null, 2),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    throw new Error(`unexpected direct shell command: ${command}`);
   };
 
   try {
@@ -365,15 +421,150 @@ test("infra setup uses host backend install and build when execution backend is 
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async (intent) => {
+            executorCalls.push(intent.kind);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: intent.kind,
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
     );
 
     assert.equal(result.executionBackend, "host");
+    assert.deepEqual(executorCalls, ["install_deps", "build_workspace"]);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    FindFreePortSkill.config.run = originalFindPort;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("infra setup stops and enters pending recovery when executor requires approval", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalFindPort = FindFreePortSkill.config.run;
+  const shellCalls = [];
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({ name: "demo" }, null, 2),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    shellCalls.push(command);
+    throw new Error(`unexpected direct shell command: ${command}`);
+  };
+
+  try {
+    const result = await infraNode(
+      createBaseState({
+        executionBackend: "host",
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: false,
+            backend: "local_shell",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: true,
+            approvalTicketId: "ticket-infra",
+            blocked: true,
+            blockedReason: "approval required for install_deps",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.agentRecoveryPending, true);
     assert.equal(result.containerId, "");
-    assert.equal(result.allocatedHostPort, 4123);
-    assert.equal(commands.some((item) => item.command.startsWith("docker ")), false);
-    assert.equal(commands.filter((item) => item.command === "npm install --silent" && item.workDir === workspace).length, 1);
-    assert.equal(commands.filter((item) => item.command === "npm run build" && item.workDir === workspace).length, 1);
+    assert.equal(result.executorState?.lastExecutorResult?.requiresApproval, true);
+    assert.equal(result.executorState?.lastExecutorResult?.approvalTicketId, "ticket-infra");
+    assert.equal(shellCalls.length, 0);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    FindFreePortSkill.config.run = originalFindPort;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("infra setup maps executor unavailable failures to environment gaps", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalFindPort = FindFreePortSkill.config.run;
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({ name: "demo" }, null, 2),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    throw new Error(`unexpected direct shell command: ${command}`);
+  };
+
+  try {
+    const result = await infraNode(
+      createBaseState({
+        executionBackend: "host",
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: false,
+            backend: null,
+            stdout: "",
+            stderr: "spawn EPERM",
+            retryable: false,
+            requiresApproval: false,
+            blocked: true,
+            blockedReason: "no backend available",
+            failureType: "executor_unavailable",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.containerId, "");
+    assert.equal(result.validationReport?.failureType, "environment_gap");
+    assert.match(result.blockedReason || "", /宿主环境阻塞|no backend available/i);
+    assert.equal(result.lastFailedNode, "infra_setup");
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
     FindFreePortSkill.config.run = originalFindPort;

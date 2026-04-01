@@ -1,6 +1,13 @@
 export type ExecutorBackend = "local_shell" | "docker" | "remote_runner" | "external_executor";
 
-export const EXECUTION_INTENT_KINDS = ["install_deps", "run_tests", "start_runtime", "exec_shell"] as const;
+export const EXECUTION_INTENT_KINDS = [
+  "install_deps",
+  "build_workspace",
+  "prepare_runtime",
+  "run_tests",
+  "start_runtime",
+  "exec_shell",
+] as const;
 export type ExecutionIntentKind = (typeof EXECUTION_INTENT_KINDS)[number];
 
 export type ApprovalTicketStatus = "pending" | "approved" | "rejected" | "auto_approved";

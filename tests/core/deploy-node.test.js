@@ -130,7 +130,6 @@ test("deploy retries transient launch exec failure before final health verificat
   const originalGetServerIP = GetServerIPSkill.config.run;
   const originalSetTimeout = global.setTimeout;
   let launchCalls = 0;
-  let launchReady = false;
 
   global.setTimeout = ((fn, _ms, ...args) => {
     fn(...args);
@@ -139,22 +138,8 @@ test("deploy retries transient launch exec failure before final health verificat
 
   GetServerIPSkill.config.run = async () => "127.0.0.1";
   ShellExecuteSkill.config.run = async ({ command }) => {
-    if (command.startsWith('docker exec -d container-123 sh -c')) {
-      launchCalls += 1;
-      if (launchCalls === 1) {
-        return [
-          "Command failed with exit code 137.",
-          "Output:",
-          "",
-          "Errors:",
-          "OCI runtime exec failed: exec failed: container is not running",
-        ].join("\n");
-      }
-      launchReady = true;
-      return "Output:\n\nErrors:\n";
-    }
     if (command.startsWith("curl ")) {
-      return launchReady ? "Output:\n200\nErrors:\n" : "Output:\n000\nErrors:\n";
+      return launchCalls >= 2 ? "Output:\n200\nErrors:\n" : "Output:\n000\nErrors:\n";
     }
     throw new Error(`unexpected command: ${command}`);
   };
@@ -176,7 +161,35 @@ test("deploy retries transient launch exec failure before final health verificat
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => {
+            launchCalls += 1;
+            if (launchCalls === 1) {
+              return {
+                ok: false,
+                backend: "docker",
+                stdout: "",
+                stderr: "OCI runtime exec failed: exec failed: container is not running",
+                retryable: true,
+                requiresApproval: false,
+                blocked: false,
+                failureType: "executor_unavailable",
+              };
+            }
+            return {
+              ok: true,
+              backend: "docker",
+              stdout: "",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
     );
 
     assert.equal(launchCalls, 2);
@@ -196,6 +209,7 @@ test("deploy starts and verifies service on host backend without requiring conta
   const originalShellRun = ShellExecuteSkill.config.run;
   const originalGetServerIP = GetServerIPSkill.config.run;
   const originalSetTimeout = global.setTimeout;
+  const executorCalls = [];
   const commands = [];
 
   global.setTimeout = ((fn, _ms, ...args) => {
@@ -233,11 +247,29 @@ test("deploy starts and verifies service on host backend without requiring conta
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async (intent) => {
+            executorCalls.push(intent);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "4321",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
     );
 
     assert.equal(result.deploymentStatus.status, "running");
-    assert.equal(commands.some((item) => item.workDir === workspace && (item.command.startsWith("powershell -NoProfile -Command") || item.command.startsWith("mkdir -p .jimclaw"))), true);
+    assert.equal(executorCalls.length, 1);
+    assert.equal(executorCalls[0].kind, "start_runtime");
+    assert.equal(executorCalls[0].workspace, workspace);
     assert.equal(commands.some((item) => item.command.startsWith("curl ")), true);
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
@@ -253,7 +285,7 @@ test("deploy host backend uses a valid windows powershell -Command separator", a
   const originalShellRun = ShellExecuteSkill.config.run;
   const originalGetServerIP = GetServerIPSkill.config.run;
   const originalSetTimeout = global.setTimeout;
-  const commands = [];
+  const executorCalls = [];
 
   global.setTimeout = ((fn, _ms, ...args) => {
     fn(...args);
@@ -261,11 +293,7 @@ test("deploy host backend uses a valid windows powershell -Command separator", a
   });
 
   GetServerIPSkill.config.run = async () => "127.0.0.1";
-  ShellExecuteSkill.config.run = async ({ command, workDir }) => {
-    commands.push({ command, workDir });
-    if (command.startsWith("powershell -NoProfile -Command ") || command.startsWith("mkdir -p .jimclaw")) {
-      return "Output:\n4321\nErrors:\n";
-    }
+  ShellExecuteSkill.config.run = async ({ command }) => {
     if (command.startsWith("curl ")) {
       return "Output:\n200\nErrors:\n";
     }
@@ -290,10 +318,26 @@ test("deploy host backend uses a valid windows powershell -Command separator", a
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async (intent) => {
+            executorCalls.push(intent);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "4321",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
     );
 
-    const hostLaunch = commands.find((item) => item.command.startsWith("powershell -NoProfile -Command "));
+    const hostLaunch = executorCalls.find((item) => item.command.startsWith("powershell -NoProfile -Command "));
     assert.equal(Boolean(hostLaunch), true);
     assert.match(hostLaunch.command, /^powershell -NoProfile -Command "/);
     if (process.platform === "win32") {
@@ -388,9 +432,6 @@ test("deploy failure emits structured runtime gap diagnostics instead of raw tex
 
   GetServerIPSkill.config.run = async () => "127.0.0.1";
   ShellExecuteSkill.config.run = async ({ command }) => {
-    if (command.startsWith('docker exec -d container-123 sh -c')) {
-      return "Output:\n\nErrors:\n";
-    }
     if (command.startsWith("curl ")) {
       return "Output:\n000\nErrors:\n";
     }
@@ -427,7 +468,20 @@ test("deploy failure emits structured runtime gap diagnostics instead of raw tex
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: true,
+            backend: "docker",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: false,
+            blocked: false,
+          }),
+        },
+      }
     );
 
     assert.equal(result.deploymentStatus.status, "failed");
@@ -458,9 +512,6 @@ test("deploy falls back to alternate reachable health path before classifying ru
 
   GetServerIPSkill.config.run = async () => "127.0.0.1";
   ShellExecuteSkill.config.run = async ({ command }) => {
-    if (command.startsWith('docker exec -d container-123 sh -c')) {
-      return "Output:\n\nErrors:\n";
-    }
     if (command.startsWith("curl ")) {
       curlCommands.push(command);
       if (command.includes("http://127.0.0.1:4000/api/health")) {
@@ -494,7 +545,20 @@ test("deploy falls back to alternate reachable health path before classifying ru
       workspace,
       createNoopEmit,
       createNoopStartSpan,
-      recorder.save
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: true,
+            backend: "docker",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: false,
+            blocked: false,
+          }),
+        },
+      }
     );
 
     assert.equal(result.deploymentStatus.status, "running");
@@ -502,6 +566,210 @@ test("deploy falls back to alternate reachable health path before classifying ru
     assert.equal(curlCommands.some((command) => command.includes("http://127.0.0.1:4000/")), true);
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy routes runtime launch through command executor start_runtime intent", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  const executorCalls = [];
+  const curlCommands = [];
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith("curl ")) {
+      curlCommands.push(command);
+      return "Output:\n200\nErrors:\n";
+    }
+    throw new Error(`unexpected shell command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async (intent) => {
+            executorCalls.push(intent);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "4321",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+              artifacts: {
+                pidPath: `${workspace}\\.jimclaw\\server.pid`,
+                stdoutLogPath: `${workspace}\\.jimclaw\\server.stdout.log`,
+                stderrLogPath: `${workspace}\\.jimclaw\\server.stderr.log`,
+              },
+            };
+          },
+        },
+      }
+    );
+
+    assert.equal(result.deploymentStatus.status, "running");
+    assert.equal(executorCalls.length, 1);
+    assert.equal(executorCalls[0].kind, "start_runtime");
+    assert.equal(curlCommands.length > 0, true);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy enters pending recovery when start_runtime requires approval and skips health checks", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+  let curlCalled = false;
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith("curl ")) {
+      curlCalled = true;
+    }
+    throw new Error(`unexpected shell command: ${command}`);
+  };
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: false,
+            backend: "local_shell",
+            stdout: "",
+            stderr: "",
+            retryable: false,
+            requiresApproval: true,
+            approvalTicketId: "ticket-deploy",
+            blocked: true,
+            blockedReason: "approval required for start_runtime",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.agentRecoveryPending, true);
+    assert.equal(result.executorState?.lastExecutorResult?.approvalTicketId, "ticket-deploy");
+    assert.equal(result.deploymentStatus?.status, "failed");
+    assert.equal(curlCalled, false);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    global.setTimeout = originalSetTimeout;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("deploy maps blocked runtime start executor failures to structured runtime or environment gaps", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalSetTimeout = global.setTimeout;
+
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+
+  try {
+    const result = await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          entryPoint: "src/index.ts",
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => ({
+            ok: false,
+            backend: null,
+            stdout: "",
+            stderr: "spawn EPERM",
+            retryable: false,
+            requiresApproval: false,
+            blocked: true,
+            blockedReason: "no backend available",
+            failureType: "executor_unavailable",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.deploymentStatus.status, "failed");
+    assert.equal(result.validationReport.failureType, "environment_gap");
+    assert.equal(result.lastFailedNode, "deploy");
+    assert.match(result.lastFailureSummary || "", /部署启动失败|no backend available|spawn EPERM/i);
+  } finally {
     GetServerIPSkill.config.run = originalGetServerIP;
     global.setTimeout = originalSetTimeout;
     await removeTempWorkspace(workspace);

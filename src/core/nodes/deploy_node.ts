@@ -1,7 +1,10 @@
 import { JimClawState } from "../graph_types";
 import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
+import { createCommandExecutor } from "../../executor/command_executor";
+import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
+import { ExecutorResult } from "../../executor/types";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
 import * as fs from "fs/promises";
 import * as path from "path";
@@ -14,36 +17,88 @@ function isCommandFailureOutput(output: string): boolean {
   return /^Command failed with (exit code\s+\d+|error:)/i.test(String(output || "").trim());
 }
 
-async function launchServiceWithRetry(
-  workspace: string,
-  containerId: string,
-  launchCommand: string
-): Promise<string> {
-  let lastOutput = "";
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      lastOutput = await execInContainer(containerId, launchCommand, { background: true });
-    } catch (error: any) {
-      lastOutput = String(error?.message || error || "");
-    }
+function createDockerRuntimeAdapter(containerId: string) {
+  return {
+    async execute(intent: { command?: string }): Promise<ExecutorResult> {
+      if (!containerId) {
+        return {
+          ok: false,
+          backend: null,
+          stdout: "",
+          stderr: "container not ready",
+          retryable: false,
+          requiresApproval: false,
+          blocked: true,
+          blockedReason: "container not ready",
+          failureType: "executor_unavailable",
+        };
+      }
+      let lastOutput = "";
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          lastOutput = await execInContainer(containerId, intent.command || "", { background: true });
+        } catch (error: any) {
+          lastOutput = String(error?.message || error || "");
+        }
+        if (attempt === 0 && isRetryableDeployLaunchFailure(lastOutput)) {
+          continue;
+        }
+        break;
+      }
+      return {
+        ok: !isCommandFailureOutput(lastOutput),
+        backend: "docker",
+        stdout: lastOutput,
+        stderr: isCommandFailureOutput(lastOutput) ? lastOutput : "",
+        retryable: false,
+        requiresApproval: false,
+        blocked: false,
+        failureType: isCommandFailureOutput(lastOutput) ? classifyExecutorFailure({ raw: lastOutput }) : undefined,
+      };
+    },
+  };
+}
 
-    if (attempt === 0 && isRetryableDeployLaunchFailure(lastOutput)) {
-      await AuditLogger.log(
-        workspace,
-        "Infrastructure",
-        `**Retry:** 服务启动命令遇到瞬时容器执行错误，正在重试一次\n${lastOutput}`
-      );
-      continue;
-    }
+function createDeployExecutor(state: JimClawState) {
+  const preferredBackend = state.executionBackend === "host" ? "local_shell" : "docker";
+  return createCommandExecutor({
+    resolveBackend: async (_intent, snapshot) => {
+      if (preferredBackend === "local_shell") {
+        return {
+          selected: snapshot.localShell.available ? "local_shell" : null,
+          candidates: snapshot.localShell.available ? ["local_shell"] : [],
+          blocked: !snapshot.localShell.available,
+          blockedReason: snapshot.localShell.available ? undefined : (snapshot.localShell.reason || "local shell unavailable"),
+          requiresApproval: false,
+        };
+      }
+      return {
+        selected: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? "docker" : null,
+        candidates: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? ["docker"] : [],
+        blocked: !(snapshot.docker.cliAvailable && snapshot.docker.daemonReachable),
+        blockedReason:
+          snapshot.docker.cliAvailable && snapshot.docker.daemonReachable
+            ? undefined
+            : (snapshot.docker.reason || "docker unavailable"),
+        requiresApproval: false,
+      };
+    },
+    adapters: {
+      local_shell: createLocalShellAdapter(),
+      docker: createDockerRuntimeAdapter(state.containerId || ""),
+    },
+  });
+}
 
-    if (isCommandFailureOutput(lastOutput)) {
-      throw new Error(`服务启动失败：${lastOutput}`);
-    }
-
-    return lastOutput;
-  }
-
-  throw new Error(`服务启动失败：${lastOutput}`);
+function buildDeployExecutorState(state: JimClawState, result: ExecutorResult): NonNullable<JimClawState["executorState"]> {
+  return {
+    version: "v1",
+    capabilitySnapshot: state.executorState?.capabilitySnapshot,
+    selectedBackend: result.backend,
+    approvalTickets: state.executorState?.approvalTickets || [],
+    runtimeHandles: state.executorState?.runtimeHandles || [],
+    lastExecutorResult: result,
+  };
 }
 
 export function buildDeploymentUrls(ip: string, hostPort: string) {
@@ -199,6 +254,52 @@ function buildDeployRuntimeFailureArtifacts(
   };
 }
 
+function buildDeployExecutorFailure(
+  state: JimClawState,
+  result: ExecutorResult,
+  summary: string
+) {
+  const targetFile =
+    state.spec?.entryPoint ||
+    state.executionProtocol?.project?.workspaceLayout?.entryFiles?.[0] ||
+    undefined;
+  const evidence = [result.blockedReason || "", result.stderr || "", result.stdout || ""].filter(Boolean);
+  const failureType = result.failureType || classifyExecutorFailure({
+    raw: result.blockedReason || summary,
+    stdout: result.stdout,
+    stderr: result.stderr,
+  });
+  const validationFailureType = mapExecutorFailureToValidationFailure(failureType);
+  const validationReport = buildValidationReport(
+    [
+      {
+        summary,
+        file: targetFile,
+        evidence,
+      },
+    ],
+    {
+      failureType: validationFailureType,
+      blocking: true,
+    }
+  );
+
+  return {
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    protocolFailures: [
+      {
+        type: validationFailureType === "environment_gap" ? "tooling_unavailable" as const : "runtime_mismatch" as const,
+        node: "deploy",
+        file: targetFile,
+        summary,
+        evidence,
+        blocking: true,
+      },
+    ],
+  };
+}
+
 function classifyDeploymentVerificationFailure(args: {
   state: JimClawState;
   targetInternalPort: number;
@@ -280,12 +381,16 @@ export async function deployNode(
   WORKSPACE: string,
   emit: any,
   startSpan: any,
-  saveBoulder: any
+  saveBoulder: any,
+  deps?: {
+    commandExecutor?: Pick<ReturnType<typeof createCommandExecutor>, "executeIntent">;
+  }
 ) {
   startSpan("deploy");
   emit("phase-change", "System", "deployment");
   const round = state.retryCount || 0;
   const executionBackend = state.executionBackend || "docker";
+  const commandExecutor = deps?.commandExecutor || createDeployExecutor(state);
   
   // 1. 获取宿主机真实 IP 和端口映射
   const ip = await GetServerIPSkill.config.run({});
@@ -356,16 +461,96 @@ export async function deployNode(
     ? buildHostDeployLaunchCommand(WORKSPACE, runCmd, parseInt(hostPort, 10))
     : buildDeployLaunchCommand(runCmd, { port: targetInternalPort, host: "0.0.0.0" });
   try {
-    if (executionBackend === "host") {
-      const launchOut = await ShellExecuteSkill.config.run({
+    let launchResult: ExecutorResult = {
+      ok: false,
+      backend: executionBackend === "host" ? "local_shell" : "docker",
+      stdout: "",
+      stderr: "",
+      retryable: false,
+      requiresApproval: false,
+      blocked: false,
+    };
+    for (let attempt = 0; attempt < 2; attempt++) {
+      launchResult = await commandExecutor.executeIntent({
+        kind: "start_runtime",
+        workspace: WORKSPACE,
         command: launchCommand,
-        workDir: WORKSPACE,
-        timeout: 30000,
+        background: true,
+        port: executionBackend === "host" ? parseInt(hostPort, 10) : targetInternalPort,
+        host: "0.0.0.0",
       });
-      if (isCommandFailureOutput(launchOut)) {
-        throw new Error(`服务启动失败：${launchOut}`);
+
+      if (launchResult.requiresApproval) {
+        break;
       }
-      const parsedLaunch = parseHostLaunchResult(launchOut);
+
+      if (attempt === 0 && (launchResult.retryable || isRetryableDeployLaunchFailure(launchResult.stderr || launchResult.stdout))) {
+        await AuditLogger.log(
+          WORKSPACE,
+          "Infrastructure",
+          `**Retry:** 服务启动命令遇到瞬时执行错误，正在重试一次\n${launchResult.stderr || launchResult.stdout}`
+        );
+        continue;
+      }
+      break;
+    }
+
+    if (launchResult.requiresApproval) {
+      const approvalReason = launchResult.blockedReason || "approval required for start_runtime";
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-deploy-r${round}`,
+        "deploy",
+        round,
+        `Deploy 第${round}轮：等待运行时启动授权`,
+        `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：等待授权\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 原因：${approvalReason}\n`
+      );
+      const result = {
+        executionBackend,
+        deploymentStatus: { url: publicUrl, status: "failed" as const },
+        testResults: `${state.testResults || ""}\n${approvalReason}`.trim(),
+        isDone: false,
+        meetingNotes: [note],
+        blockedReason: approvalReason,
+        agentRecoveryPending: true,
+        agentRecoveryNode: "deploy",
+        agentRecoveryReason: approvalReason,
+        executorState: buildDeployExecutorState(state, launchResult),
+        lastFailedNode: "deploy",
+        lastFailureSummary: approvalReason,
+      };
+      await saveBoulder({ ...state, ...result }, "deploy");
+      return result;
+    }
+
+    if (!launchResult.ok || launchResult.blocked) {
+      const summary = `[部署启动失败] ${launchResult.blockedReason || launchResult.stderr || launchResult.stdout || "start_runtime failed"}`;
+      const executorFailureArtifacts = buildDeployExecutorFailure(state, launchResult, summary);
+      const note = await writeMeetingNote(
+        WORKSPACE,
+        `note-deploy-r${round}`,
+        "deploy",
+        round,
+        `Deploy 第${round}轮：启动失败`,
+        `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：失败\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 原因：${summary}\n`
+      );
+      const result = {
+        executionBackend,
+        deploymentStatus: { url: publicUrl, status: "failed" as const },
+        testResults: `${state.testResults || ""}\n${summary}`.trim(),
+        isDone: false,
+        ...executorFailureArtifacts,
+        meetingNotes: [note],
+        executorState: buildDeployExecutorState(state, launchResult),
+        lastFailedNode: "deploy",
+        lastFailureSummary: summary,
+      };
+      await saveBoulder({ ...state, ...result }, "deploy");
+      return result;
+    }
+
+    if (executionBackend === "host") {
+      const parsedLaunch = parseHostLaunchResult(`Output:\n${launchResult.stdout}\nErrors:\n${launchResult.stderr || ""}`);
       if (parsedLaunch.pid <= 0) {
         const evidence = [parsedLaunch.text, parsedLaunch.errors].filter(Boolean).join("\n");
         throw new Error(`服务启动失败：未获得有效进程 PID${evidence ? `\n${evidence}` : ""}`);
@@ -376,8 +561,6 @@ export async function deployNode(
       if (pid > 0) {
         await fs.writeFile(hostArtifacts.pidPath, String(pid), "utf-8");
       }
-    } else {
-      await launchServiceWithRetry(WORKSPACE, state.containerId, launchCommand);
     }
   } catch (error: any) {
     const errorMsg = `[部署启动失败] ${error.message || error}`;

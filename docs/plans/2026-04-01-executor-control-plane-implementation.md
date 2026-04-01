@@ -8,6 +8,8 @@
 
 **Tech Stack:** TypeScript, Node.js, LangGraph.js, existing JimClaw node graph, node:test/Jest-style repo tests
 
+**Status (2026-04-01):** Task 1-10 已完成。其中 `env_guard`、`infra_setup`、`terminal`、`deploy` 已全部迁移到执行控制面；`deploy` 现通过 `start_runtime` intent 统一处理启动、一次瞬时重试、授权挂起和环境/运行时故障分类。最新验证：`npx tsc --noEmit`、`node -e "require('./tests/core/deploy-node.test.js')"`、`npm run test:core` 全部通过。
+
 ---
 
 ### Task 1: 建立执行控制面类型
@@ -452,6 +454,14 @@ Expected: 因旧逻辑仍自己管理启动命令而失败
 Run: `node -e "require('./tests/core/deploy-node.test.js')"`
 Expected: `deploy` 测试通过
 
+**Implementation note (2026-04-01):**
+
+- `deploy_node.ts` 已改为通过 `CommandExecutor.executeIntent({ kind: "start_runtime" })` 启动运行时
+- 对 `retryable` 或瞬时容器执行错误保留一次节点内重试
+- `requiresApproval=true` 时直接写入 pending 恢复状态，不进入 health check
+- 启动阶段的 `executor_unavailable/process_spawn_denied/docker_daemon_unreachable` 归类为 `environment_gap`
+- 启动成功后的健康检查失败仍归类为 `runtime_gap`
+
 **Step 5: Commit**
 
 ```bash
@@ -627,4 +637,3 @@ Expected:
 git add .
 git commit -m "feat: validate executor control plane with real bookshelf run"
 ```
-

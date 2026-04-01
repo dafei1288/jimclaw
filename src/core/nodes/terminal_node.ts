@@ -1,10 +1,117 @@
 import { JimClawState } from "../graph_types";
-import { execInContainer, extractFailureEvidence, writeMeetingNote } from "../logic_utils";
+import { buildRepairPlan, buildValidationReport, execInContainer, extractFailureEvidence, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { createCommandExecutor } from "../../executor/command_executor";
+import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
+import { ExecutorResult } from "../../executor/types";
+import { createLocalShellAdapter } from "../../skills/shell_exec";
 
 function isRetryableTerminalExecFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
+}
+
+function isCommandFailureOutput(raw: string): boolean {
+  return /^Command failed with (exit code\s+\d+|error:)/i.test(String(raw || "").trim());
+}
+
+function createDockerTestAdapter(containerId: string) {
+  return {
+    async execute(intent: { command?: string }): Promise<ExecutorResult> {
+      if (!containerId) {
+        return {
+          ok: false,
+          backend: null,
+          stdout: "",
+          stderr: "container not ready",
+          retryable: false,
+          requiresApproval: false,
+          blocked: true,
+          blockedReason: "container not ready",
+          failureType: "executor_unavailable",
+        };
+      }
+      let raw = "";
+      try {
+        raw = await execInContainer(containerId, intent.command || "", { timeout: 90000 });
+      } catch (error: any) {
+        raw = String(error?.message || error || "");
+      }
+      return {
+        ok: !isCommandFailureOutput(raw),
+        backend: "docker",
+        stdout: raw,
+        stderr: isCommandFailureOutput(raw) ? raw : "",
+        retryable: isRetryableTerminalExecFailure(raw),
+        requiresApproval: false,
+        blocked: false,
+        failureType: isCommandFailureOutput(raw) ? classifyExecutorFailure({ raw }) : undefined,
+      };
+    },
+  };
+}
+
+function createTerminalExecutor(state: JimClawState) {
+  const preferredBackend = state.executionBackend === "host" ? "local_shell" : "docker";
+  return createCommandExecutor({
+    resolveBackend: async (_intent, snapshot) => {
+      if (preferredBackend === "local_shell") {
+        return {
+          selected: snapshot.localShell.available ? "local_shell" : null,
+          candidates: snapshot.localShell.available ? ["local_shell"] : [],
+          blocked: !snapshot.localShell.available,
+          blockedReason: snapshot.localShell.available ? undefined : (snapshot.localShell.reason || "local shell unavailable"),
+          requiresApproval: false,
+        };
+      }
+      return {
+        selected: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? "docker" : null,
+        candidates: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? ["docker"] : [],
+        blocked: !(snapshot.docker.cliAvailable && snapshot.docker.daemonReachable),
+        blockedReason:
+          snapshot.docker.cliAvailable && snapshot.docker.daemonReachable
+            ? undefined
+            : (snapshot.docker.reason || "docker unavailable"),
+        requiresApproval: false,
+      };
+    },
+    adapters: {
+      local_shell: createLocalShellAdapter(),
+      docker: createDockerTestAdapter(state.containerId || ""),
+    },
+  });
+}
+
+function buildTerminalExecutorFailure(state: JimClawState, result: ExecutorResult, summary: string): Partial<JimClawState> {
+  const failureType = result.failureType || classifyExecutorFailure({
+    stdout: result.stdout,
+    stderr: result.stderr,
+    raw: result.blockedReason || summary,
+  });
+  const validationReport = buildValidationReport(
+    [{
+      summary,
+      evidence: [result.blockedReason || "", result.stderr || "", result.stdout || ""].filter(Boolean),
+    }],
+    {
+      failureType: mapExecutorFailureToValidationFailure(failureType),
+      blocking: true,
+    }
+  );
+  return {
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    blockedReason: summary,
+    lastFailedNode: "terminal",
+    lastFailureSummary: summary,
+    executorState: {
+      version: "v1",
+      capabilitySnapshot: state.executorState?.capabilitySnapshot,
+      selectedBackend: result.backend,
+      approvalTickets: state.executorState?.approvalTickets || [],
+      runtimeHandles: state.executorState?.runtimeHandles || [],
+      lastExecutorResult: result,
+    },
+  };
 }
 
 /**
@@ -16,45 +123,24 @@ export async function terminalNode(
   WORKSPACE: string,
   emit: any,
   startSpan: any,
-  saveBoulder: any
+  saveBoulder: any,
+  deps?: {
+    commandExecutor?: Pick<ReturnType<typeof createCommandExecutor>, "executeIntent">;
+  }
 ) {
   startSpan("terminal");
   emit("phase-change", "System", "verification");
   const testCmd = state.spec?.testCommand || "npm test";
   const executionBackend = state.executionBackend || "docker";
+  const commandExecutor = deps?.commandExecutor || createTerminalExecutor(state);
   
   await AuditLogger.log(
     WORKSPACE,
     "Terminal",
     `### [Test Execution]\n\n**Command:** ${testCmd}\n**Backend:** ${executionBackend}\n**Container:** ${state.containerId}`
   );
-
-  if (executionBackend === "host") {
-    const hostResult = await ShellExecuteSkill.config.run({
-      command: testCmd,
-      workDir: WORKSPACE,
-      timeout: 90000,
-    });
-    await AuditLogger.log(WORKSPACE, "Terminal", `**Host Test Output:**\n${hostResult}`);
-    const evidence = extractFailureEvidence(hostResult, state.deploymentStatus, state.blockedReason);
-    const note = await writeMeetingNote(
-      WORKSPACE,
-      `note-terminal-r${state.retryCount || 0}`,
-      "terminal",
-      state.retryCount || 0,
-      evidence.hasBlockingFailure ? `Terminal 第${state.retryCount || 0}轮：宿主机测试失败` : `Terminal 第${state.retryCount || 0}轮：宿主机测试通过`,
-      `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 命令：${testCmd}\n- 后端：host\n- 结论：${evidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${hostResult}\n\`\`\`\n`
-    );
-    return {
-      testResults: hostResult,
-      meetingNotes: [note],
-      blockedReason: "",
-      lastFailedNode: evidence.hasBlockingFailure ? state.lastFailedNode : "",
-      lastFailureSummary: evidence.hasBlockingFailure ? state.lastFailureSummary : "",
-    };
-  }
   
-  if (!state.containerId) {
+  if (executionBackend !== "host" && !state.containerId) {
     // 保留 infra_node 写入的构建错误（如 Dockerfile 错误），不用通用信息覆盖
     const errMsg = state.testResults?.includes("基础设施")
       ? state.testResults
@@ -71,27 +157,55 @@ export async function terminalNode(
     return { testResults: errMsg, meetingNotes: [note] };
   }
 
-  let result = "";
+  let result: ExecutorResult = {
+    ok: false,
+    backend: executionBackend === "host" ? "local_shell" : "docker",
+    stdout: "",
+    stderr: "",
+    retryable: false,
+    requiresApproval: false,
+    blocked: false,
+  };
   for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      result = await execInContainer(state.containerId, `NODE_ENV=test ${testCmd}`, { timeout: 90000 });
-    } catch (error: any) {
-      result = String(error?.message || error || "");
-    }
+    result = await commandExecutor.executeIntent({
+      kind: "run_tests",
+      workspace: WORKSPACE,
+      command: executionBackend === "host" ? testCmd : `NODE_ENV=test ${testCmd}`,
+    });
 
-    if (attempt === 0 && isRetryableTerminalExecFailure(result)) {
+    if (attempt === 0 && (result.retryable || isRetryableTerminalExecFailure(result.stderr || result.stdout))) {
       await AuditLogger.log(
         WORKSPACE,
         "Terminal",
-        `**Retry:** 测试容器执行出现瞬时错误，正在重试一次\n${result}`
+        `**Retry:** 测试执行出现瞬时错误，正在重试一次\n${result.stderr || result.stdout}`
       );
       continue;
     }
     break;
   }
-  
-  await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${result}`);
-  const evidence = extractFailureEvidence(result, state.deploymentStatus, state.blockedReason);
+
+  if ((result.blocked || result.failureType) && mapExecutorFailureToValidationFailure(
+    result.failureType || classifyExecutorFailure({ raw: result.blockedReason || result.stderr || result.stdout })
+  ) === "environment_gap") {
+    const summary = `[Terminal] 测试执行环境不可用：${result.blockedReason || result.stderr || result.stdout || "run_tests failed"}`;
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-terminal-r${state.retryCount || 0}`,
+      "terminal",
+      state.retryCount || 0,
+      `Terminal 第${state.retryCount || 0}轮：测试执行环境失败`,
+      `# Terminal 第${state.retryCount || 0}轮\n\n## 执行结论\n- 状态：环境失败\n- 原因：${summary}\n`
+    );
+    return {
+      testResults: result.stderr || result.stdout || summary,
+      meetingNotes: [note],
+      ...buildTerminalExecutorFailure(state, result, summary),
+    };
+  }
+
+  const rawOutput = result.stdout || result.stderr || "";
+  await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${rawOutput}`);
+  const evidence = extractFailureEvidence(rawOutput, state.deploymentStatus, state.blockedReason);
   const summary = evidence.hasBlockingFailure
     ? `Terminal 第${state.retryCount || 0}轮：测试失败`
     : `Terminal 第${state.retryCount || 0}轮：测试通过`;
@@ -101,11 +215,11 @@ export async function terminalNode(
     "terminal",
     state.retryCount || 0,
     summary,
-    `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 命令：${testCmd}\n- 容器：${state.containerId}\n- 结论：${evidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${result}\n\`\`\`\n`
+    `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 命令：${testCmd}\n- 容器：${state.containerId}\n- 结论：${evidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${rawOutput}\n\`\`\`\n`
   );
 
   return {
-    testResults: result,
+    testResults: rawOutput,
     meetingNotes: [note],
     blockedReason: "",
     lastFailedNode: evidence.hasBlockingFailure ? state.lastFailedNode : "",

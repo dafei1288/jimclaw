@@ -1,9 +1,12 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState } from "../graph_types";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { createCommandExecutor } from "../../executor/command_executor";
+import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
+import { ExecutorResult } from "../../executor/types";
+import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
-import { execInContainer, writeMeetingNote } from "../logic_utils";
+import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
 
 /**
@@ -173,6 +176,120 @@ async function runInfraHostCommand(
   return output;
 }
 
+function unwrapSkillOutput(raw: string): string {
+  const text = String(raw || "");
+  const match = text.match(/Output:\n([\s\S]*?)(?:\nErrors:|$)/);
+  return (match ? match[1] : text).trim();
+}
+
+function extractSkillErrors(raw: string): string {
+  const text = String(raw || "");
+  const match = text.match(/\nErrors:\n([\s\S]*)$/);
+  return (match ? match[1] : "").trim();
+}
+
+function createDockerCliAdapter() {
+  return {
+    async execute(intent: { command?: string; workspace: string }): Promise<ExecutorResult> {
+      const raw = await ShellExecuteSkill.config.run({
+        command: intent.command || "",
+        workDir: intent.workspace,
+        timeout: 300000,
+      });
+      const failed = /^Command failed/i.test(String(raw || "").trim());
+      const failureType = failed
+        ? classifyExecutorFailure({
+            raw,
+            stdout: unwrapSkillOutput(raw),
+            stderr: extractSkillErrors(raw),
+          })
+        : undefined;
+      return {
+        ok: !failed,
+        backend: "docker",
+        stdout: unwrapSkillOutput(raw),
+        stderr: extractSkillErrors(raw),
+        retryable: false,
+        requiresApproval: false,
+        blocked: false,
+        failureType,
+      };
+    },
+  };
+}
+
+function createInfraExecutor(preferredBackend: "local_shell" | "docker") {
+  return createCommandExecutor({
+    resolveBackend: async (_intent, snapshot) => {
+      if (preferredBackend === "local_shell") {
+        return {
+          selected: snapshot.localShell.available ? "local_shell" : null,
+          candidates: snapshot.localShell.available ? ["local_shell"] : [],
+          blocked: !snapshot.localShell.available,
+          blockedReason: snapshot.localShell.available ? undefined : (snapshot.localShell.reason || "local shell unavailable"),
+          requiresApproval: false,
+        };
+      }
+
+      return {
+        selected: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? "docker" : null,
+        candidates: snapshot.docker.cliAvailable && snapshot.docker.daemonReachable ? ["docker"] : [],
+        blocked: !(snapshot.docker.cliAvailable && snapshot.docker.daemonReachable),
+        blockedReason:
+          snapshot.docker.cliAvailable && snapshot.docker.daemonReachable
+            ? undefined
+            : (snapshot.docker.reason || "docker unavailable"),
+        requiresApproval: false,
+      };
+    },
+    adapters: {
+      local_shell: createLocalShellAdapter(),
+      docker: createDockerCliAdapter(),
+    },
+  });
+}
+
+function buildExecutorState(state: JimClawState, result: ExecutorResult): NonNullable<JimClawState["executorState"]> {
+  return {
+    version: "v1",
+    capabilitySnapshot: state.executorState?.capabilitySnapshot,
+    selectedBackend: result.backend,
+    approvalTickets: state.executorState?.approvalTickets || [],
+    runtimeHandles: state.executorState?.runtimeHandles || [],
+    lastExecutorResult: result,
+  };
+}
+
+function buildInfraExecutorFailurePatch(
+  state: JimClawState,
+  result: ExecutorResult,
+  summary: string
+): Partial<JimClawState> {
+  const failureType = result.failureType || classifyExecutorFailure({
+    stdout: result.stdout,
+    stderr: result.stderr,
+    raw: result.blockedReason || summary,
+  });
+  const validationReport = buildValidationReport(
+    [{
+      summary,
+      evidence: [result.blockedReason || "", result.stderr || "", result.stdout || ""].filter(Boolean),
+    }],
+    {
+      failureType: mapExecutorFailureToValidationFailure(failureType),
+      blocking: true,
+    }
+  );
+  return {
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    blockedReason: summary,
+    lastFailedNode: "infra_setup",
+    lastFailureSummary: summary,
+    executorState: buildExecutorState(state, result),
+  };
+}
+
 /**
  * Infra 节点：负责构建运行和测试所需的基础设施
  */
@@ -182,13 +299,19 @@ export async function infraNode(
   WORKSPACE: string,
   emit: any,
   startSpan: any,
-  saveBoulder: any
+  saveBoulder: any,
+  deps?: {
+    commandExecutor?: Pick<ReturnType<typeof createCommandExecutor>, "executeIntent">;
+  }
 ) {
   startSpan("infra_setup");
   const round = state.retryCount || 0;
   const lang = state.spec?.language?.toLowerCase() ?? "javascript";
   const image = lang.includes("python") ? "python:3.11-slim" : "node:20-alpine";
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
+  const commandExecutor =
+    deps?.commandExecutor ||
+    createInfraExecutor(state.executionBackend === "host" ? "local_shell" : "docker");
   
   // 1. 获取宿主机空闲端口
   let hostPort = 0;
@@ -225,14 +348,59 @@ export async function infraNode(
 
     try {
       if (hasPackageJson) {
-        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies on host (npm install)`);
-        const installOut = await runInfraHostCommand(WORKSPACE, "npm install --silent", "npm install", 300000);
-        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Install Output:**\n${installOut}`);
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies on host via executor`);
+        const installResult = await commandExecutor.executeIntent({
+          kind: "install_deps",
+          workspace: WORKSPACE,
+          command: "npm install --silent",
+          requiresNetwork: true,
+        });
+        if (installResult.requiresApproval) {
+          return {
+            executionBackend: "host" as const,
+            containerId: "",
+            allocatedHostPort: hostPort,
+            blockedReason: installResult.blockedReason || "approval required for install_deps",
+            requiresApproval: true,
+            agentRecoveryPending: true,
+            agentRecoveryNode: "infra_setup",
+            agentRecoveryReason: installResult.blockedReason || "approval required for install_deps",
+            executorState: buildExecutorState(state, installResult),
+            testResults: installResult.blockedReason || "approval required for install_deps",
+            lastFailedNode: "infra_setup",
+            lastFailureSummary: installResult.blockedReason || "approval required for install_deps",
+          };
+        }
+        if (!installResult.ok || installResult.blocked) {
+          const summary = `[基础设施异常] ${installResult.blockedReason || installResult.stderr || installResult.stdout || "install_deps failed"}`;
+          return {
+            executionBackend: "host" as const,
+            containerId: "",
+            allocatedHostPort: hostPort,
+            testResults: summary,
+            ...buildInfraExecutorFailurePatch(state, installResult, summary),
+          };
+        }
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Install Output:**\n${installResult.stdout}`);
 
         if (hasBuildScript(packageJsonContent)) {
-          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace on host (npm run build)`);
-          const buildOut = await runInfraHostCommand(WORKSPACE, "npm run build", "npm run build", 300000);
-          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Build Output:**\n${buildOut}`);
+          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace on host via executor`);
+          const buildResult = await commandExecutor.executeIntent({
+            kind: "build_workspace",
+            workspace: WORKSPACE,
+            command: "npm run build",
+          });
+          if (!buildResult.ok || buildResult.blocked) {
+            const summary = `[基础设施异常] ${buildResult.blockedReason || buildResult.stderr || buildResult.stdout || "build_workspace failed"}`;
+            return {
+              executionBackend: "host" as const,
+              containerId: "",
+              allocatedHostPort: hostPort,
+              testResults: summary,
+              ...buildInfraExecutorFailurePatch(state, buildResult, summary),
+            };
+          }
+          await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Build Output:**\n${buildResult.stdout}`);
         }
       }
     } catch (e: any) {
@@ -275,6 +443,7 @@ export async function infraNode(
       testResults: "",
       blockedReason: "",
       protocolFailures: [],
+      executorState: state.executorState,
       lastFailedNode: "",
       lastFailureSummary: "",
     };
