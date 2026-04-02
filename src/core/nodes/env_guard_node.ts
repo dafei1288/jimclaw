@@ -7,6 +7,7 @@ import { createCommandExecutor, ResolvedExecutionIntent } from "../../executor/c
 import { CapabilitySnapshot, ExecutorBackend, ExecutorResult } from "../../executor/types";
 import { AuditLogger } from "../../utils/audit";
 import { buildRepairPlan, buildValidationReport, getDeterministicTemplateScaffold } from "../logic_utils";
+import { createLocalShellAdapter } from "../../skills/shell_exec";
 
 function isNodeLikeProject(language?: string): boolean {
   const lang = String(language || "").toLowerCase();
@@ -267,6 +268,41 @@ function collectCapabilityEvidence(snapshot: CapabilitySnapshot): string[] {
   return evidence;
 }
 
+function buildExecutorStateFromResult(
+  state: JimClawState,
+  snapshot: CapabilitySnapshot,
+  result: ExecutorResult
+): NonNullable<JimClawState["executorState"]> {
+  const approvalTickets = [...(state.executorState?.approvalTickets || [])];
+  if (result.requiresApproval && result.approvalTicketId && !approvalTickets.some((ticket) => ticket.id === result.approvalTicketId)) {
+    approvalTickets.push({
+      id: result.approvalTicketId,
+      stage: "network_install",
+      required: true,
+      status: "pending",
+      reason: result.blockedReason || "approval required for install_deps",
+      requestedAt: new Date().toISOString(),
+    });
+  }
+  return {
+    version: "v1",
+    capabilitySnapshot: snapshot,
+    selectedBackend: result.backend,
+    approvalTickets,
+    runtimeHandles: state.executorState?.runtimeHandles || [],
+    lastExecutorResult: result,
+  };
+}
+
+async function hasNodeModules(workspace: string): Promise<boolean> {
+  try {
+    await fs.access(path.join(workspace, "node_modules"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function buildExecutorBlockedReason(resolved: ResolvedExecutionIntent): string {
   const reasons = collectCapabilityEvidence(resolved.capabilitySnapshot);
   return [
@@ -441,7 +477,7 @@ export async function envGuardNode(
   startSpan: any,
   saveBoulder: any,
   deps?: {
-    commandExecutor?: Pick<ReturnType<typeof createCommandExecutor>, "probeCapabilities" | "resolveIntent">;
+    commandExecutor?: Pick<ReturnType<typeof createCommandExecutor>, "probeCapabilities" | "resolveIntent" | "executeIntent">;
   }
 ) {
   const buildEnvironmentFailurePatch = (
@@ -467,7 +503,11 @@ export async function envGuardNode(
 
   const round = state.retryCount || 0;
   const ledger: RepairLedgerEntry[] = [];
-  const commandExecutor = deps?.commandExecutor || createCommandExecutor();
+  const commandExecutor = deps?.commandExecutor || createCommandExecutor({
+    adapters: {
+      local_shell: createLocalShellAdapter(),
+    },
+  });
   let selectedBackend: "docker" | "host" = state.executionBackend || "docker";
 
   if (!isNodeLikeProject(state.spec?.language)) {
@@ -684,6 +724,152 @@ export async function envGuardNode(
       const actionText = normalized.actions.join("；");
       ledger.push({ round, phase: "env_guard", action: actionText, result: "success" });
       await AuditLogger.log(WORKSPACE, "Environment", `**Action:** ${actionText}`);
+    }
+
+    const nodeModulesReady = await hasNodeModules(WORKSPACE);
+    if (!nodeModulesReady) {
+      if (resolvedIntent.resolution.selected === "docker") {
+        const actionText = "检测到缺少 node_modules，但当前 backend= docker，改由 infra_setup 容器内统一安装依赖";
+        ledger.push({ round, phase: "env_guard", action: actionText, result: "success" });
+        await AuditLogger.log(WORKSPACE, "Environment", `**Action:** ${actionText}`);
+      } else if (typeof commandExecutor.executeIntent === "function") {
+        await AuditLogger.log(WORKSPACE, "Environment", `**Action:** 预安装依赖 (install_deps)`);
+        const installResult = await commandExecutor.executeIntent({
+          kind: "install_deps",
+          workspace: WORKSPACE,
+          command: "npm install --include=dev --silent",
+          requiresNetwork: true,
+        });
+        const installExecutorState = buildExecutorStateFromResult(state, resolvedIntent.capabilitySnapshot, installResult);
+
+        if (installResult.requiresApproval) {
+          const approvalReason = `[EnvGuard] 预安装依赖需要授权：${installResult.blockedReason || "approval required for install_deps"}`;
+          const failurePatch = buildEnvironmentFailurePatch(approvalReason, [
+            approvalReason,
+            truncateForLog(installResult.stderr || installResult.stdout || ""),
+          ]);
+          ledger.push({ round, phase: "env_guard", action: "预安装依赖等待授权", result: "failed" });
+          await saveBoulder(
+            {
+              ...state,
+              ...bootstrapPatch,
+              ...failurePatch,
+              envReady: false,
+              blockedReason: approvalReason,
+              requiresApproval: true,
+              repairLedger: ledger,
+              executionBackend: selectedBackend,
+              executorState: installExecutorState,
+              agentRecoveryPending: true,
+              agentRecoveryNode: "env_guard",
+              agentRecoveryReason: approvalReason,
+              pendingApprovalTicketId: installResult.approvalTicketId || "",
+            },
+            "env_guard_approval_required"
+          );
+          return {
+            ...bootstrapPatch,
+            ...failurePatch,
+            envReady: false,
+            blockedReason: approvalReason,
+            requiresApproval: true,
+            repairLedger: ledger,
+            executionBackend: selectedBackend,
+            executorState: installExecutorState,
+            agentRecoveryPending: true,
+            agentRecoveryNode: "env_guard",
+            agentRecoveryReason: approvalReason,
+            pendingApprovalTicketId: installResult.approvalTicketId || "",
+            testResults: `${state.testResults || ""}\n${approvalReason}`.trim(),
+          };
+        }
+
+        if (installResult.blocked) {
+          const blockedReason = installResult.blockedReason || "no backend available";
+          const reason = "[EnvGuard] 宿主环境阻塞：预安装依赖失败，当前环境无法执行 install_deps。";
+          const failurePatch = buildEnvironmentFailurePatch(reason, [
+            reason,
+            truncateForLog(blockedReason),
+          ]);
+          ledger.push({ round, phase: "env_guard", action: "预安装依赖被阻塞", result: "failed" });
+          await saveBoulder(
+            {
+              ...state,
+              ...bootstrapPatch,
+              ...failurePatch,
+              envReady: false,
+              blockedReason: reason,
+              requiresApproval: false,
+              repairLedger: ledger,
+              executionBackend: selectedBackend,
+              executorState: installExecutorState,
+              agentRecoveryPending: true,
+              agentRecoveryNode: "env_guard",
+              agentRecoveryReason: blockedReason,
+              resumeFromNode: "env_guard",
+            },
+            "env_guard_host_blocked"
+          );
+          return {
+            ...bootstrapPatch,
+            ...failurePatch,
+            envReady: false,
+            blockedReason: reason,
+            requiresApproval: false,
+            repairLedger: ledger,
+            executionBackend: selectedBackend,
+            executorState: installExecutorState,
+            agentRecoveryPending: true,
+            agentRecoveryNode: "env_guard",
+            agentRecoveryReason: blockedReason,
+            resumeFromNode: "env_guard",
+            testResults: `${state.testResults || ""}\n${reason}\n${truncateForLog(blockedReason)}`.trim(),
+          };
+        }
+
+        if (!installResult.ok) {
+          const summary = `[EnvGuard] 预安装依赖失败：${installResult.stderr || installResult.stdout || "install_deps failed"}`;
+          const failurePatch = buildEnvironmentFailurePatch(summary, [
+            truncateForLog(installResult.stderr || ""),
+            truncateForLog(installResult.stdout || ""),
+          ].filter(Boolean));
+          ledger.push({ round, phase: "env_guard", action: "执行预安装依赖", result: "failed" });
+          await saveBoulder(
+            {
+              ...state,
+              ...bootstrapPatch,
+              ...failurePatch,
+              envReady: false,
+              blockedReason: summary,
+              requiresApproval: false,
+              repairLedger: ledger,
+              executionBackend: selectedBackend,
+              executorState: installExecutorState,
+              resumeFromNode: "env_guard",
+            },
+            "env_guard_install_failed"
+          );
+          return {
+            ...bootstrapPatch,
+            ...failurePatch,
+            envReady: false,
+            blockedReason: summary,
+            requiresApproval: false,
+            repairLedger: ledger,
+            executionBackend: selectedBackend,
+            executorState: installExecutorState,
+            resumeFromNode: "env_guard",
+            testResults: `${state.testResults || ""}\n${summary}`.trim(),
+          };
+        }
+
+        ledger.push({ round, phase: "env_guard", action: "执行预安装依赖 (install_deps)", result: "success" });
+        await AuditLogger.log(
+          WORKSPACE,
+          "Environment",
+          `**Action:** 预安装依赖成功\n${truncateForLog(installResult.stdout || "")}`
+        );
+      }
     }
 
     const backendAction = selectedBackend === "host"

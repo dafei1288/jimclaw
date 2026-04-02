@@ -113,6 +113,29 @@ function summarizeCoderPlan(coderPlan: any): string {
   return JSON.stringify(compact, null, 2);
 }
 
+function shouldBypassLlmCollaboration(
+  failingFiles: string[],
+  openIssues: any[],
+  state: JimClawState
+): { bypass: boolean; reason: string } {
+  if (failingFiles.length === 0) return { bypass: false, reason: "" };
+  const hasQaFailedFiles = (state.qaFailures?.failedFiles || []).length > 0;
+  if (!hasQaFailedFiles) return { bypass: false, reason: "" };
+
+  const staticIssueIdPattern = /^(BUG-COMPILE-|BUG-AUTO-|BUG-VERIFIER-|BUG-DEPLOY-|BUG-QA-FALLBACK-)/;
+  const staticIssueSignals = openIssues.filter((issue: any) =>
+    staticIssueIdPattern.test(String(issue?.id || "")) ||
+    /静态兜底|模型不可用|模型降级/.test(`${issue?.description || ""} ${issue?.title || ""}`)
+  );
+  const allStatic = openIssues.length > 0 && staticIssueSignals.length === openIssues.length;
+  if (!allStatic) return { bypass: false, reason: "" };
+
+  return {
+    bypass: true,
+    reason: "QA 侧已进入静态归因兜底，直接生成确定性 fixPlan，跳过模型协商超时风险。",
+  };
+}
+
 /**
  * FixPlan 节点：QA 与 Coder 在编写代码前进行协商
  *
@@ -209,31 +232,42 @@ ${summarizedFiles}
     items: [],
   };
   let degradedByFallback = false;
-
-  try {
-    const coderResponse = await agents.coder.chat(
-      [{ role: "user", content: coderPrompt }],
-      (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
-      {
-        mode: "coding",
-        brief: buildSystemContext(state),
-        workspaceDir: WORKSPACE,
-        timeoutMs: FIX_PLAN_CODER_TIMEOUT_MS,
-      }
-    );
-
-    coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
-      overall_diagnosis: "（解析失败）",
-      items: [],
-    });
-  } catch (error: any) {
-    if (!isRecoverableFixPlanError(error)) throw error;
+  const bypassDecision = shouldBypassLlmCollaboration(failingFiles, openIssues, state);
+  if (bypassDecision.bypass) {
     degradedByFallback = true;
-    emit("thinking", "System", `fix_plan 模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
     coderPlan = {
-      overall_diagnosis: `模型资源不足，使用规则化降级计划。原始错误：${error.message || error}`,
+      overall_diagnosis: bypassDecision.reason,
       items: [],
     };
+    emit("thinking", "System", `fix_plan 进入静态快速通道：${bypassDecision.reason}`, {});
+  }
+
+  if (!degradedByFallback) {
+    try {
+      const coderResponse = await agents.coder.chat(
+        [{ role: "user", content: coderPrompt }],
+        (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
+        {
+          mode: "coding",
+          brief: buildSystemContext(state),
+          workspaceDir: WORKSPACE,
+          timeoutMs: FIX_PLAN_CODER_TIMEOUT_MS,
+        }
+      );
+
+      coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
+        overall_diagnosis: "（解析失败）",
+        items: [],
+      });
+    } catch (error: any) {
+      if (!isRecoverableFixPlanError(error)) throw error;
+      degradedByFallback = true;
+      emit("thinking", "System", `fix_plan 模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
+      coderPlan = {
+        overall_diagnosis: `模型资源不足，使用规则化降级计划。原始错误：${error.message || error}`,
+        items: [],
+      };
+    }
   }
 
   // === Step 2：QA 审查计划 ===

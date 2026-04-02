@@ -9,6 +9,7 @@ import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_e
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
+import { runWithHeartbeat } from "../node_heartbeat";
 
 /**
  * 从 ShellExecuteSkill 返回值中提取纯 stdout 内容。
@@ -126,6 +127,15 @@ function buildRuntimeCleanupCommand(): string {
   ].join("; ");
 }
 
+function isTimeoutOutput(raw: string): boolean {
+  return /timed out|超时/i.test(String(raw || ""));
+}
+
+function hasCommandProgressOutput(raw: string): boolean {
+  const text = String(raw || "");
+  return /(added\s+\d+\s+packages|audited\s+\d+\s+packages|npm\s+warn|download|fetch|resolved|building|transpiling|compiled)/i.test(text);
+}
+
 async function runInfraContainerCommand(
   workspace: string,
   containerId: string,
@@ -134,9 +144,10 @@ async function runInfraContainerCommand(
   timeout: number
 ): Promise<string> {
   let lastOutput = "";
+  let effectiveTimeout = timeout;
   for (let attempt = 0; attempt < 2; attempt++) {
     try {
-      lastOutput = await execInContainer(containerId, command, { timeout });
+      lastOutput = await execInContainer(containerId, command, { timeout: effectiveTimeout });
     } catch (error: any) {
       lastOutput = String(error?.message || error || "");
     }
@@ -150,8 +161,22 @@ async function runInfraContainerCommand(
       continue;
     }
 
+    if (attempt === 0 && isTimeoutOutput(lastOutput) && hasCommandProgressOutput(lastOutput)) {
+      effectiveTimeout = Math.min(Math.round(timeout * 1.8), 900000);
+      await AuditLogger.log(
+        workspace,
+        "Infrastructure",
+        `**Retry:** ${label} 命中慢进度超时，检测到持续输出，放宽超时到 ${effectiveTimeout}ms 后重试一次`
+      );
+      continue;
+    }
+
     if (isCommandFailureOutput(lastOutput)) {
       throw new Error(`${label}失败：${parseSkillOutput(lastOutput) || lastOutput}`);
+    }
+
+    if (isTimeoutOutput(lastOutput)) {
+      throw new Error(`${label}失败：无进度超时，未观察到可判定进展。${parseSkillOutput(lastOutput) || lastOutput}`);
     }
 
     return lastOutput;
@@ -166,13 +191,30 @@ async function runInfraHostCommand(
   label: string,
   timeout: number
 ): Promise<string> {
-  const output = await ShellExecuteSkill.config.run({
-    command,
-    workDir: workspace,
-    timeout,
-  });
+  let output = "";
+  let effectiveTimeout = timeout;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    output = await ShellExecuteSkill.config.run({
+      command,
+      workDir: workspace,
+      timeout: effectiveTimeout,
+    });
+    if (attempt === 0 && isTimeoutOutput(output) && hasCommandProgressOutput(output)) {
+      effectiveTimeout = Math.min(Math.round(timeout * 1.8), 900000);
+      await AuditLogger.log(
+        workspace,
+        "Infrastructure",
+        `**Retry:** ${label} 命中慢进度超时，放宽超时到 ${effectiveTimeout}ms 后重试一次`
+      );
+      continue;
+    }
+    break;
+  }
   if (isCommandFailureOutput(output)) {
     throw new Error(`${label}失败：${parseSkillOutput(output) || output}`);
+  }
+  if (isTimeoutOutput(output)) {
+    throw new Error(`${label}失败：无进度超时，未观察到可判定进展。${parseSkillOutput(output) || output}`);
   }
   return output;
 }
@@ -330,6 +372,28 @@ export async function infraNode(
   }
   const containerPort = state.manifest?.services?.[0]?.port || 8080;
   const executionBackend = state.executionBackend || "docker";
+  let containerId = "";
+  const buildHeartbeatState = (stage: string) => ({
+    ...state,
+    executionBackend,
+    containerId: containerId || state.containerId || "",
+    allocatedHostPort: hostPort,
+    runtimeStateSnapshot: {
+      version: "v1" as const,
+      envReady: Boolean(state.envReady),
+      hostDepsReady: false,
+      testRuntimeReady: Boolean(containerId || state.containerId),
+      deployRuntimeReady: Boolean(containerId || state.containerId),
+      executionBackend: executionBackend as "docker" | "host",
+      containerId: (containerId || state.containerId || "") || undefined,
+      hostPort,
+      containerPort,
+      deploymentUrl: state.deploymentStatus?.url,
+      runtimePid: state.hostRuntimePid || undefined,
+      tokenUsage: state.runtimeStateSnapshot?.tokenUsage,
+    },
+    blockedReason: stage,
+  });
 
   await AuditLogger.log(WORKSPACE, "Infrastructure", `### [Infrastructure Setup]\n\n**Host Port Allocated:** ${hostPort}\n**Container Port Target:** ${containerPort}`);
 
@@ -343,12 +407,19 @@ export async function infraNode(
 
     try {
       if (hasPackageJson) {
+        await saveBoulder(buildHeartbeatState("host_installing_deps"), "infra_setup_stage_installing");
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies on host via executor`);
-        const installResult = await commandExecutor.executeIntent({
-          kind: "install_deps",
-          workspace: WORKSPACE,
-          command: "npm install --silent",
-          requiresNetwork: true,
+        const installResult = await runWithHeartbeat({
+          run: async () =>
+            commandExecutor.executeIntent({
+              kind: "install_deps",
+              workspace: WORKSPACE,
+              command: "npm install --silent",
+              requiresNetwork: true,
+            }),
+          onHeartbeat: async () => {
+            await saveBoulder(buildHeartbeatState("host_installing_deps"), "infra_setup_heartbeat_install");
+          },
         });
         if (installResult.requiresApproval) {
           return {
@@ -380,11 +451,18 @@ export async function infraNode(
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Host Install Output:**\n${installResult.stdout}`);
 
         if (hasBuildScript(packageJsonContent)) {
+          await saveBoulder(buildHeartbeatState("host_building_workspace"), "infra_setup_stage_building");
           await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace on host via executor`);
-          const buildResult = await commandExecutor.executeIntent({
-            kind: "build_workspace",
-            workspace: WORKSPACE,
-            command: "npm run build",
+          const buildResult = await runWithHeartbeat({
+            run: async () =>
+              commandExecutor.executeIntent({
+                kind: "build_workspace",
+                workspace: WORKSPACE,
+                command: "npm run build",
+              }),
+            onHeartbeat: async () => {
+              await saveBoulder(buildHeartbeatState("host_building_workspace"), "infra_setup_heartbeat_build");
+            },
           });
           if (!buildResult.ok || buildResult.blocked) {
             const summary = `[基础设施异常] ${buildResult.blockedReason || buildResult.stderr || buildResult.stdout || "build_workspace failed"}`;
@@ -458,8 +536,6 @@ export async function infraNode(
     hasCompose = true;
   } catch {}
 
-  let containerId = "";
-
   if (hasCompose) {
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Using Docker Compose`);
     
@@ -490,13 +566,9 @@ export async function infraNode(
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
 
-    await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose down 2>/dev/null || true` });
-    await ShellExecuteSkill.config.run({
-      command: `for /f %i in ('docker ps -aq --filter "status=exited" --filter "name=run_" --filter "name=-${serviceName}-run-"') do @docker rm -f %i`,
-      timeout: 30000,
-    }).catch(() => {});
-    await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose rm -f -s -v 2>nul || exit /b 0` }).catch(() => {});
-    const composeOut = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose build ${serviceName}` });
+    await ShellExecuteSkill.config.run({ command: "docker-compose down", workDir: WORKSPACE }).catch(() => {});
+    await ShellExecuteSkill.config.run({ command: "docker-compose rm -f -s -v", workDir: WORKSPACE }).catch(() => {});
+    const composeOut = await ShellExecuteSkill.config.run({ command: `docker-compose build ${serviceName}`, workDir: WORKSPACE });
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Compose Output:**\n${composeOut}`);
 
     // 构建失败（exit code != 0）立即返回，错误写入 testResults 供 QA 分析
@@ -528,7 +600,8 @@ export async function infraNode(
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
       runOut = await ShellExecuteSkill.config.run({
-        command: `cd ${WORKSPACE} && docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`,
+        command: `docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`,
+        workDir: WORKSPACE,
         timeout: 60000,
       });
 
@@ -580,12 +653,12 @@ export async function infraNode(
         return finalizeHostBackend();
       }
       console.warn(`[System] 无法直接获取 compose run 产生的容器 ID，尝试回退查询服务容器...`);
-      const fallbackPs = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose ps -q ${serviceName}` });
+      const fallbackPs = await ShellExecuteSkill.config.run({ command: `docker-compose ps -q ${serviceName}`, workDir: WORKSPACE });
       containerId = extractContainerId(fallbackPs);
     }
 
     if (!containerId) {
-      const composeLog = await ShellExecuteSkill.config.run({ command: `cd ${WORKSPACE} && docker-compose logs --tail=30 2>&1` });
+      const composeLog = await ShellExecuteSkill.config.run({ command: "docker-compose logs --tail=30", workDir: WORKSPACE });
       const errMsg = `[基础设施致命错误] docker-compose 启动后未能找到运行中的容器（端口 ${hostPort}）。\n容器日志：\n${parseSkillOutput(composeLog)}`;
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fatal:** ${errMsg}`);
       console.error(`[System] ${errMsg}`);
@@ -692,21 +765,35 @@ export async function infraNode(
     }
 
     if (hasPackageJson) {
+      await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (npm install)`);
-      const installOut = hasCompose
-        ? await runInfraContainerCommand(
-            WORKSPACE,
-            containerId,
-            "NODE_ENV=development npm install --include=dev --silent",
-            "npm install",
-            300000
-          )
-        : await runInfraContainerCommand(WORKSPACE, containerId, "npm install --silent", "npm install", 300000);
+      const installOut = await runWithHeartbeat({
+        run: async () =>
+          hasCompose
+            ? runInfraContainerCommand(
+                WORKSPACE,
+                containerId,
+                "NODE_ENV=development npm install --include=dev --silent",
+                "npm install",
+                300000
+              )
+            : runInfraContainerCommand(WORKSPACE, containerId, "npm install --silent", "npm install", 300000),
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
+        },
+      });
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${installOut}`);
 
       if (hasBuildScript(packageJsonContent)) {
+        await saveBoulder(buildHeartbeatState("container_building_workspace"), "infra_setup_stage_building");
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building workspace (npm run build)`);
-        const buildOut = await runInfraContainerCommand(WORKSPACE, containerId, "npm run build", "npm run build", 300000);
+        const buildOut = await runWithHeartbeat({
+          run: async () =>
+            runInfraContainerCommand(WORKSPACE, containerId, "npm run build", "npm run build", 300000),
+          onHeartbeat: async () => {
+            await saveBoulder(buildHeartbeatState("container_building_workspace"), "infra_setup_heartbeat_build");
+          },
+        });
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Output:**\n${buildOut}`);
       }
     }

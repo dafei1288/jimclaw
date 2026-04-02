@@ -419,6 +419,14 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
       // 审计记录：模型输出内容
       if (response.content) {
         await AuditLogger.log(options?.workspaceDir, this.persona.name, `### [Response Content]\n\n${response.content}`);
+        if (eventCallback) {
+          eventCallback({
+            type: "llm_content",
+            sender: this.persona.name,
+            role: this.persona.role,
+            content: response.content,
+          });
+        }
       }
 
       const tokenUsage = extractTokenUsage(response);

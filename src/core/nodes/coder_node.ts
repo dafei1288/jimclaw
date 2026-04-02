@@ -21,6 +21,16 @@ function isNodeLikeLanguage(language?: string): boolean {
   return /typescript|javascript|node/.test(normalized);
 }
 
+function getCoderMaxParallel(state: JimClawState): number {
+  const raw = Number((state as any).coderMaxParallel || 1);
+  if (!Number.isFinite(raw) || raw <= 1) return 1;
+  return Math.min(Math.floor(raw), 4);
+}
+
+function isExperimentalModelParallelEnabled(state: JimClawState): boolean {
+  return Boolean((state as any).coderExperimentalModelParallel);
+}
+
 async function hasWorkspaceNodeModules(workspace: string): Promise<boolean> {
   try {
     await fs.access(path.join(workspace, "node_modules"));
@@ -94,14 +104,27 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
 
 function isCompactAuthFallbackRuntimeScaffoldFile(state: JimClawState, fileTarget: string): boolean {
   if (!isPlanningFallbackActive(state)) return false;
-  if (state.spec?.authScaffoldMode !== "compact") return false;
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
-  return normalized === "src/services/authservice.ts";
+  return (
+    normalized === "src/services/authservice.ts" ||
+    /^src\/services\/auth[a-z0-9]+service\.ts$/i.test(normalized)
+  );
 }
 
 function isAcceptedFallbackValidationArtifact(state: JimClawState, fileTarget: string, generationSource?: string): boolean {
   if (generationSource !== "deterministic_scaffold") return true;
   return isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget);
+}
+
+function resolveAllowedDeterministicScaffold(state: JimClawState, fileTarget: string): string {
+  const deterministicScaffold = getDeterministicTemplateScaffold(state, fileTarget);
+  if (!deterministicScaffold) return "";
+  const scaffoldAllowed = Boolean(
+    !isPlanningFallbackActive(state) ||
+    isSafeDeterministicScaffoldFile(fileTarget) ||
+    isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget)
+  );
+  return scaffoldAllowed ? deterministicScaffold : "";
 }
 
 function isValidationCoreFile(state: JimClawState, fileTarget: string): boolean {
@@ -180,11 +203,14 @@ function isCorePhaseActive(
 
 function getCoderTaskTimeoutMs(
   state: JimClawState,
-  subTasks: Array<{ fileTarget: string }>
+  subTasks: Array<{ fileTarget: string }>,
+  localAttempt: number = 0
 ): number {
   const overrideTimeout = Number((state as any).coderTaskTimeoutMs || 0);
-  if (overrideTimeout > 0) return overrideTimeout;
-  return isCorePhaseActive(state, subTasks) ? 120000 : 240000;
+  const baseTimeout = overrideTimeout > 0 ? overrideTimeout : (isCorePhaseActive(state, subTasks) ? 120000 : 240000);
+  if (localAttempt <= 0) return baseTimeout;
+  // 慢进度超时时给一次预算提升，避免“有进度却被硬切”。
+  return Math.min(Math.round(baseTimeout * 1.5), 360000);
 }
 
 function getCoderFirstWriteTimeoutMs(
@@ -243,9 +269,13 @@ async function invokeCoderWithTaskTimeout(args: {
   let timeoutHandle: NodeJS.Timeout | null = null;
   let firstWriteHandle: NodeJS.Timeout | null = null;
   let firstWriteObserved = false;
+  let progressObserved = false;
+  let lastEventAt = Date.now();
 
   try {
     const wrappedOnEvent = (event: any) => {
+      progressObserved = true;
+      lastEventAt = Date.now();
       const contentStr = String(event?.content || "");
       if (!firstWriteObserved) {
         const wroteFile = event?.tool === "write_file" && contentStr.includes("Successfully wrote");
@@ -290,7 +320,11 @@ async function invokeCoderWithTaskTimeout(args: {
 
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutHandle = setTimeout(() => {
-        const timeoutError = new AgentTimeoutError(agentName, args.timeoutMs);
+        const timeoutError: any = new AgentTimeoutError(agentName, args.timeoutMs);
+        timeoutError.timeoutKind = progressObserved ? "slow_progress" : "no_progress";
+        timeoutError.progressObserved = progressObserved;
+        timeoutError.firstWriteObserved = firstWriteObserved;
+        timeoutError.lastEventAgoMs = Date.now() - lastEventAt;
         controller.abort(timeoutError);
         reject(timeoutError);
       }, args.timeoutMs);
@@ -476,7 +510,8 @@ function shouldRetryTaskLocally(options: {
   if (options.toolError) return false;
   return (
     isLocalSelfHealContentError(options.formatError) ||
-    isLocalSelfHealContentError(options.extractError)
+    isLocalSelfHealContentError(options.extractError) ||
+    /慢进度超时/i.test(options.extractError)
   );
 }
 
@@ -1080,12 +1115,372 @@ export async function coderNode(
     ? await hasWorkspaceNodeModules(WORKSPACE)
     : true;
   const skipPerFileQualityChecks = isNodeLikeLanguage(state.spec?.language) && !nodeModulesReady;
+  const maxParallel = getCoderMaxParallel(state);
+  const experimentalModelParallel = isExperimentalModelParallelEnabled(state);
   let blockedReason = "";
   let blockedFailedFiles: string[] = [];
   let validationCheckpointRequested = false;
   let validationCheckpointReason = "";
   const localRetryAttempts: Record<string, number> = {};
   const localRetryArtifacts: Record<string, string> = {};
+
+  const runDeterministicParallelBatch = async (): Promise<{ progressed: boolean; stop: boolean }> => {
+    if (maxParallel <= 1 || blockedReason || validationCheckpointRequested) {
+      return { progressed: false, stop: false };
+    }
+
+    const prioritized = getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks;
+    const readyTasks = prioritized.filter((task) => {
+      if (task.status === "completed") return false;
+      if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) return false;
+      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) return false;
+      if ((localRetryAttempts[task.fileTarget] || 0) > 0) return false;
+      const hasFixPlan = (state.fixPlan || []).some((plan) => plan.fileTarget === task.fileTarget);
+      if (hasFixPlan) return false;
+      return Boolean(resolveAllowedDeterministicScaffold(state, task.fileTarget));
+    });
+    const batch = readyTasks.slice(0, maxParallel);
+    if (batch.length < 2) {
+      return { progressed: false, stop: false };
+    }
+
+    emit(
+      "thinking",
+      "System",
+      `[Coder] 启用并行批次（${batch.length}个）：${batch.map((item) => item.fileTarget).join(", ")}`,
+      { batch: batch.map((item) => item.fileTarget) }
+    );
+
+    const generationResults = await Promise.all(
+      batch.map(async (task) => {
+        const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
+        if (!scaffold) {
+          return {
+            ok: false as const,
+            task,
+            code: "",
+            error: "确定性骨架不可用",
+          };
+        }
+        const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
+        if (validationError) {
+          return {
+            ok: false as const,
+            task,
+            code: "",
+            error: validationError,
+          };
+        }
+        const importContractErrors = validateImportContracts(task.fileTarget, scaffold, filesContent);
+        if (importContractErrors.length > 0) {
+          return {
+            ok: false as const,
+            task,
+            code: "",
+            error: `依赖导出契约校验失败: ${importContractErrors.join("; ")}`,
+          };
+        }
+        const protocolDependencyErrors = validateProtocolDependencyRoles(
+          state.executionProtocol,
+          task.fileTarget,
+          scaffold,
+          filesContent
+        );
+        if (protocolDependencyErrors.length > 0) {
+          return {
+            ok: false as const,
+            task,
+            code: "",
+            error: `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}`,
+          };
+        }
+        return {
+          ok: true as const,
+          task,
+          code: scaffold,
+          generationSource: "deterministic_scaffold" as const,
+        };
+      })
+    );
+
+    let progressed = false;
+    for (const generation of generationResults) {
+      const task = generation.task;
+      if (!generation.ok) {
+        task.status = "failed";
+        task.lastError = generation.error;
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "error",
+          error: generation.error,
+        });
+        blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${generation.error}`;
+        blockedFailedFiles = [task.fileTarget];
+        emit("thinking", "System", `[Coder] 并行批次失败，停止本轮后续生成: ${blockedReason}`, { task });
+        return { progressed, stop: true };
+      }
+
+      const filePath = path.join(WORKSPACE, task.fileTarget);
+      const previousCode = filesContent[task.fileTarget];
+      const previousStatus = task.status;
+      const previousError = task.lastError;
+      const codeLogStartIndex = codeLogEntries.length;
+      try {
+        filesContent[task.fileTarget] = generation.code;
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, generation.code);
+        task.status = "completed";
+        delete task.lastError;
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "written",
+          generationSource: generation.generationSource,
+        });
+        const incrementalResult = {
+          code: JSON.stringify(filesContent, null, 2),
+          subTasks: [...subTasks],
+          codeLog: [...(state.codeLog || []), ...codeLogEntries],
+          blockedReason: "",
+          testResults: "",
+          qaFailures: null,
+          lastFailedNode: "",
+          lastFailureSummary: "",
+          failureFingerprint: "",
+          sameFailureCount: 0,
+        };
+        await persistWriteRecoveryIntent(WORKSPACE, {
+          taskId: task.id,
+          fileTarget: task.fileTarget,
+          expectedContent: generation.code,
+          nodeName: `coder_task_${task.id}`,
+          traceId: (state as any).traceId,
+          snapshotState: { ...state, ...incrementalResult } as any,
+        });
+        await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
+        await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        delete localRetryAttempts[task.fileTarget];
+        delete localRetryArtifacts[task.fileTarget];
+        progressed = true;
+        emit("thinking", "System", `[Coder] 并行批次完成: ${task.fileTarget}`, { task });
+        const checkpointDecision = shouldRequestValidationCheckpoint(state, subTasks as any, codeLogEntries);
+        if (checkpointDecision.requested) {
+          validationCheckpointRequested = true;
+          validationCheckpointReason = checkpointDecision.reason;
+          emit("thinking", "System", `[Coder] ${validationCheckpointReason}`, { task });
+          return { progressed, stop: true };
+        }
+      } catch (error: any) {
+        await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        if (previousCode === undefined) {
+          delete filesContent[task.fileTarget];
+          await fs.rm(filePath, { force: true }).catch(() => undefined);
+        } else {
+          filesContent[task.fileTarget] = previousCode;
+          await fs.mkdir(path.dirname(filePath), { recursive: true });
+          await fs.writeFile(filePath, previousCode);
+        }
+        task.status = previousStatus || "failed";
+        task.lastError = `${previousError ? `${previousError}; ` : ""}状态保存失败: ${error.message || error}`;
+        codeLogEntries.splice(codeLogStartIndex);
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "error",
+          error: task.lastError,
+        });
+        blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${task.lastError}`;
+        blockedFailedFiles = [task.fileTarget];
+        emit("thinking", "System", `[Coder] 并行批次状态落盘失败，停止本轮后续生成: ${blockedReason}`, { task });
+        return { progressed, stop: true };
+      }
+    }
+
+    return { progressed, stop: false };
+  };
+
+  const runModelParallelBatch = async (): Promise<{ progressed: boolean; stop: boolean }> => {
+    if (!experimentalModelParallel || maxParallel <= 1 || blockedReason || validationCheckpointRequested) {
+      return { progressed: false, stop: false };
+    }
+
+    const prioritized = getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks;
+    const readyTasks = prioritized.filter((task) => {
+      if (task.status === "completed") return false;
+      if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) return false;
+      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) return false;
+      if ((localRetryAttempts[task.fileTarget] || 0) > 0) return false;
+      const hasFixPlan = (state.fixPlan || []).some((plan) => plan.fileTarget === task.fileTarget);
+      if (hasFixPlan) return false;
+      return !Boolean(resolveAllowedDeterministicScaffold(state, task.fileTarget));
+    });
+    const batch = readyTasks.slice(0, maxParallel);
+    if (batch.length < 2) {
+      return { progressed: false, stop: false };
+    }
+
+    emit(
+      "thinking",
+      "System",
+      `[Coder] 启用实验模型并行批次（${batch.length}个）：${batch.map((item) => item.fileTarget).join(", ")}`,
+      { batch: batch.map((item) => item.fileTarget) }
+    );
+
+    const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any);
+    const generationResults = await Promise.all(
+      batch.map(async (task) => {
+        const prompt = `请实现 ${task.fileTarget}。\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}\n\n仅输出 markdown 代码块中的完整文件内容，不要调用 write_file 工具。`;
+        try {
+          const coderResponse = await invokeCoderWithTaskTimeout({
+            agent: agents.coder,
+            prompt,
+            onEvent: (ev) => {
+              emit(ev.type, ev.sender, `并行开发: ${task.fileTarget}`, ev);
+            },
+            brief: buildCoderExecutionContext(state, task),
+            workspaceDir: WORKSPACE,
+            timeoutMs: taskTimeoutMs,
+            firstWriteTimeoutMs: 0,
+          });
+          const rawResponseText = extractText(coderResponse.content);
+          const extractResult = extractCodeFromResponse(rawResponseText);
+          if (!extractResult.isValid) {
+            return { ok: false as const, task, code: "", error: extractResult.error || "代码提取失败" };
+          }
+          const code = extractResult.code || "";
+          const validationError = validateGeneratedFileContent(task.fileTarget, code);
+          if (validationError) {
+            return { ok: false as const, task, code: "", error: validationError };
+          }
+          const importContractErrors = validateImportContracts(task.fileTarget, code, filesContent);
+          if (importContractErrors.length > 0) {
+            return { ok: false as const, task, code: "", error: `依赖导出契约校验失败: ${importContractErrors.join("; ")}` };
+          }
+          const protocolDependencyErrors = validateProtocolDependencyRoles(state.executionProtocol, task.fileTarget, code, filesContent);
+          if (protocolDependencyErrors.length > 0) {
+            return { ok: false as const, task, code: "", error: `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}` };
+          }
+          return {
+            ok: true as const,
+            task,
+            code,
+            generationSource: "model" as const,
+          };
+        } catch (error: any) {
+          if (error?.code === "CODER_FIRST_WRITE_TIMEOUT") {
+            return { ok: false as const, task, code: "", error: `首个写入超时（>${taskTimeoutMs}ms）` };
+          }
+          if (isAgentTimeoutError(error)) {
+            return { ok: false as const, task, code: "", error: `单文件生成超时（>${taskTimeoutMs}ms）` };
+          }
+          return { ok: false as const, task, code: "", error: String(error?.message || error || "模型并行生成失败") };
+        }
+      })
+    );
+
+    let progressed = false;
+    for (const generation of generationResults) {
+      const task = generation.task;
+      if (!generation.ok) {
+        task.status = "failed";
+        task.lastError = generation.error;
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "error",
+          error: generation.error,
+        });
+        blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${generation.error}`;
+        blockedFailedFiles = [task.fileTarget];
+        emit("thinking", "System", `[Coder] 实验模型并行批次失败，停止本轮后续生成: ${blockedReason}`, { task });
+        return { progressed, stop: true };
+      }
+
+      const filePath = path.join(WORKSPACE, task.fileTarget);
+      const previousCode = filesContent[task.fileTarget];
+      const previousStatus = task.status;
+      const previousError = task.lastError;
+      const codeLogStartIndex = codeLogEntries.length;
+      try {
+        filesContent[task.fileTarget] = generation.code;
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, generation.code);
+        task.status = "completed";
+        delete task.lastError;
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "written",
+          generationSource: generation.generationSource,
+        });
+        const incrementalResult = {
+          code: JSON.stringify(filesContent, null, 2),
+          subTasks: [...subTasks],
+          codeLog: [...(state.codeLog || []), ...codeLogEntries],
+          blockedReason: "",
+          testResults: "",
+          qaFailures: null,
+          lastFailedNode: "",
+          lastFailureSummary: "",
+          failureFingerprint: "",
+          sameFailureCount: 0,
+        };
+        await persistWriteRecoveryIntent(WORKSPACE, {
+          taskId: task.id,
+          fileTarget: task.fileTarget,
+          expectedContent: generation.code,
+          nodeName: `coder_task_${task.id}`,
+          traceId: (state as any).traceId,
+          snapshotState: { ...state, ...incrementalResult } as any,
+        });
+        await saveBoulder({ ...state, ...incrementalResult }, `coder_task_${task.id}`);
+        await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        delete localRetryAttempts[task.fileTarget];
+        delete localRetryArtifacts[task.fileTarget];
+        progressed = true;
+        emit("thinking", "System", `[Coder] 实验模型并行批次完成: ${task.fileTarget}`, { task });
+        const checkpointDecision = shouldRequestValidationCheckpoint(state, subTasks as any, codeLogEntries);
+        if (checkpointDecision.requested) {
+          validationCheckpointRequested = true;
+          validationCheckpointReason = checkpointDecision.reason;
+          emit("thinking", "System", `[Coder] ${validationCheckpointReason}`, { task });
+          return { progressed, stop: true };
+        }
+      } catch (error: any) {
+        await clearWriteRecoveryIntent(WORKSPACE, task.id);
+        if (previousCode === undefined) {
+          delete filesContent[task.fileTarget];
+          await fs.rm(filePath, { force: true }).catch(() => undefined);
+        } else {
+          filesContent[task.fileTarget] = previousCode;
+          await fs.mkdir(path.dirname(filePath), { recursive: true });
+          await fs.writeFile(filePath, previousCode);
+        }
+        task.status = previousStatus || "failed";
+        task.lastError = `${previousError ? `${previousError}; ` : ""}状态保存失败: ${error.message || error}`;
+        codeLogEntries.splice(codeLogStartIndex);
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "error",
+          error: task.lastError,
+        });
+        blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${task.lastError}`;
+        blockedFailedFiles = [task.fileTarget];
+        emit("thinking", "System", `[Coder] 实验模型并行批次状态落盘失败，停止本轮后续生成: ${blockedReason}`, { task });
+        return { progressed, stop: true };
+      }
+    }
+
+    return { progressed, stop: false };
+  };
 
   // 1. 根据 QA 反馈，精准重置需要修复的任务状态
   if (state.qaFailures && state.qaFailures.failedFiles.length > 0) {
@@ -1113,6 +1508,26 @@ export async function coderNode(
   let progressMade = true;
   while (progressMade && !blockedReason) {
     progressMade = false;
+    const parallelBatch = await runDeterministicParallelBatch();
+    if (parallelBatch.progressed) {
+      progressMade = true;
+    }
+    if (parallelBatch.stop) {
+      break;
+    }
+    if (parallelBatch.progressed) {
+      continue;
+    }
+    const modelParallelBatch = await runModelParallelBatch();
+    if (modelParallelBatch.progressed) {
+      progressMade = true;
+    }
+    if (modelParallelBatch.stop) {
+      break;
+    }
+    if (modelParallelBatch.progressed) {
+      continue;
+    }
     for (const task of getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
@@ -1282,15 +1697,8 @@ CMD ["node", "dist/index.js"]`;
         return relative.startsWith("..") ? trimmed.replace(/\\/g, "/") : relative;
       };
 
-      const deterministicScaffold = getDeterministicTemplateScaffold(state, task.fileTarget);
-      const scaffoldAllowed = Boolean(
-        deterministicScaffold &&
-        (
-          !isPlanningFallbackActive(state) ||
-          isSafeDeterministicScaffoldFile(task.fileTarget) ||
-          isCompactAuthFallbackRuntimeScaffoldFile(state, task.fileTarget)
-        )
-      );
+      const deterministicScaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
+      const scaffoldAllowed = Boolean(deterministicScaffold);
       let generationSource: FileChangeEntry["generationSource"] | undefined;
       let extractResult;
       if (scaffoldAllowed) {
@@ -1305,7 +1713,7 @@ CMD ["node", "dist/index.js"]`;
             { task }
           );
         }
-        const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any);
+        const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any, taskLocalAttempt);
         const taskFirstWriteTimeoutMs = getCoderFirstWriteTimeoutMs(state, subTasks as any, task.fileTarget);
         try {
           const coderResponse = await invokeCoderWithTaskTimeout({
@@ -1355,10 +1763,13 @@ CMD ["node", "dist/index.js"]`;
               error: `首个写入超时（>${taskFirstWriteTimeoutMs}ms），在首次 write_file 前未产生任何落盘动作，判定当前任务过大或提示过重，请拆分职责或缩减上下文后重试`,
             };
           } else if (isAgentTimeoutError(error)) {
+            const isSlowProgressTimeout = String(error?.timeoutKind || "").toLowerCase() === "slow_progress";
             extractResult = {
               isValid: false,
               code: "",
-              error: `单文件生成超时（>${taskTimeoutMs}ms），已中止当前文件生成，请缩小任务范围或继续后续验证`,
+              error: isSlowProgressTimeout
+                ? `单文件生成超时（慢进度，>${taskTimeoutMs}ms，期间有事件产出）。将自动提升一次超时预算后重试`
+                : `单文件生成超时（无进度，>${taskTimeoutMs}ms，未观测到有效产出）。请缩小任务范围或拆分子任务`,
             };
           } else {
             throw error;

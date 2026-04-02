@@ -49,3 +49,19 @@ test("explicit autoApprove override is preserved", () => {
     deploy: false,
   });
 });
+
+test("execution tuning flags are propagated to graph and session state", () => {
+  const graphState = createBaseGraphState("图书管理系统", 5, undefined, {
+    coderMaxParallel: 3,
+    coderExperimentalModelParallel: true,
+  });
+  const session = createServerInitialSession("图书管理系统", 5, undefined, {
+    coderMaxParallel: 3,
+    coderExperimentalModelParallel: true,
+  });
+
+  assert.equal(graphState.coderMaxParallel, 3);
+  assert.equal(graphState.coderExperimentalModelParallel, true);
+  assert.equal(session.coderMaxParallel, 3);
+  assert.equal(session.coderExperimentalModelParallel, true);
+});

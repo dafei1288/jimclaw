@@ -9,6 +9,7 @@ const {
   createSnapshotRecorder,
 } = require("./test-helpers");
 const { qaNode } = require("../../src/core/nodes/qa_node");
+const { AgentTimeoutError } = require("../../src/core/agent");
 
 test("qa keeps coder blocking failures focused on the actual blocked file", async () => {
   const workspace = await createTempWorkspace();
@@ -239,6 +240,180 @@ test("qa enriches issue ownership with failing completed test files mentioned in
     assert.equal(result.issueTracker.length, 1);
     assert.equal(result.issueTracker[0].relatedFiles.includes("tests/health.test.ts"), true);
     assert.equal(result.qaFailures.failedFiles.includes("tests/health.test.ts"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("qa injects TypeScript compile-error files into failedFiles even when llm attribution is noisy", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    retryCount: 3,
+    testResults: [
+      "[基础设施构建失败]",
+      "src/controllers/bookController.ts(41,27): error TS2345: Argument of type 'string | string[]' is not assignable to parameter of type 'string'.",
+      "src/services/bookMutationService.ts(51,33): error TS18048: 'input.isbn' is possibly 'undefined'.",
+    ].join("\n"),
+    issueTracker: [],
+    contract: { title: "demo", requirements: [], acceptanceCriteria: [] },
+    apiContract: { endpoints: [] },
+    spec: {
+      language: "TypeScript",
+      filesToCreate: [
+        "src/controllers/bookController.ts",
+        "src/services/bookMutationService.ts",
+        "Dockerfile",
+      ],
+    },
+    subTasks: [
+      {
+        id: "task-controller",
+        description: "controller",
+        fileTarget: "src/controllers/bookController.ts",
+        dependencies: [],
+        contextRequirement: "controller",
+        status: "completed",
+      },
+      {
+        id: "task-service",
+        description: "service",
+        fileTarget: "src/services/bookMutationService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "completed",
+      },
+      {
+        id: "task-docker",
+        description: "docker",
+        fileTarget: "Dockerfile",
+        dependencies: [],
+        contextRequirement: "docker",
+        status: "completed",
+      },
+    ],
+  });
+
+  try {
+    const result = await qaNode(
+      state,
+      {
+        qa: {
+          async chat() {
+            return {
+              content: '{"issues":[{"id":"BUG-001","title":"构建失败","description":"请检查容器构建配置。","severity":"major","status":"open","relatedFiles":["Dockerfile"],"rawErrorSnippet":"build failed","detectedRound":3}]}',
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.qaFailures.failedFiles.includes("src/controllers/bookController.ts"), true);
+    assert.equal(result.qaFailures.failedFiles.includes("src/services/bookMutationService.ts"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("qa skips llm deep analysis when compile failures are explicit", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    retryCount: 4,
+    testResults: "src/controllers/bookController.ts(41,27): error TS2345: bad type",
+    issueTracker: [],
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["src/controllers/bookController.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-controller",
+        description: "controller",
+        fileTarget: "src/controllers/bookController.ts",
+        dependencies: [],
+        contextRequirement: "controller",
+        status: "completed",
+      },
+    ],
+  });
+
+  try {
+    const result = await qaNode(
+      state,
+      {
+        qa: {
+          async chat() {
+            throw new Error("qa chat should be skipped when compile failure is explicit");
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.issueTracker.length > 0, true);
+    assert.equal(result.issueTracker[0].id.startsWith("BUG-COMPILE-"), true);
+    assert.equal(result.qaFailures.failedFiles.includes("src/controllers/bookController.ts"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("qa normalizes duplicated workspace prefixes in compile-error file paths", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    retryCount: 4,
+    testResults: [
+      "[基础设施构建失败]",
+      "workspace/run_1775115550991/workspace/run_1775115550991/src/controllers/bookController.ts(41,27): error TS2345: bad type",
+    ].join("\n"),
+    issueTracker: [],
+    contract: { title: "demo", requirements: [], acceptanceCriteria: [] },
+    apiContract: { endpoints: [] },
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["src/controllers/bookController.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-controller",
+        description: "controller",
+        fileTarget: "src/controllers/bookController.ts",
+        dependencies: [],
+        contextRequirement: "controller",
+        status: "completed",
+      },
+    ],
+  });
+
+  try {
+    const result = await qaNode(
+      state,
+      {
+        qa: {
+          async chat() {
+            return { content: '{"issues":[]}' };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.qaFailures.failedFiles.includes("src/controllers/bookController.ts"), true);
+    assert.equal(result.qaFailures.failedFiles.some((f) => String(f).includes("workspace/run_")), false);
   } finally {
     await removeTempWorkspace(workspace);
   }
@@ -711,6 +886,55 @@ test("qa keeps env_guard install failures in environment repair loop instead of 
     assert.equal(result.lastFailedNode, "qa");
     assert.match(result.lastFailureSummary || "", /npm install|环境|EPERM/);
     assert.equal(recorder.snapshots.at(-1).node, "qa_env_fix");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("qa falls back to static ownership when qa model times out", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    retryCount: 6,
+    testResults: "src/controllers/bookController.ts(41,27): error TS2345: bad type",
+    issueTracker: [],
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["src/controllers/bookController.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-controller",
+        description: "controller",
+        fileTarget: "src/controllers/bookController.ts",
+        dependencies: [],
+        contextRequirement: "controller",
+        status: "completed",
+      },
+    ],
+  });
+
+  try {
+    const result = await qaNode(
+      state,
+      {
+        qa: {
+          async chat() {
+            throw new AgentTimeoutError("清扬", 45000);
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.issueTracker.length > 0, true);
+    assert.equal(result.qaFailures.failedFiles.includes("src/controllers/bookController.ts"), true);
+    assert.equal(result.lastFailedNode, "qa");
+    assert.equal(recorder.snapshots.at(-1).node, "qa");
   } finally {
     await removeTempWorkspace(workspace);
   }

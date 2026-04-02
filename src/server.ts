@@ -222,6 +222,9 @@ let currentSession: any = {
   logs: [],
   events: [],
   deployment: { status: "none", url: null },
+  contractSource: "model",
+  designSource: "model",
+  orchestrationSource: "model",
   mediationDirectives: null,
   fixPlan: null,
   projectBrief: [],
@@ -236,6 +239,8 @@ let currentSession: any = {
   protocolPatches: [],
   customerApprovalState: null,
   executorState: null,
+  coderMaxParallel: Math.max(1, Math.min(4, Math.floor(Number(ModelManager.getGlobalConfig()?.coderMaxParallel || 1)))),
+  coderExperimentalModelParallel: Boolean(ModelManager.getGlobalConfig()?.coderExperimentalModelParallel),
   requiresApproval: false,
   pendingApprovalStage: null,
   pendingApprovalTicketId: "",
@@ -514,12 +519,17 @@ io.on("connection", (socket) => {
   socket.on("run-task", async (data: { userGoal: string; autoApprove?: ApprovalAutoApprove }) => {
     const { userGoal, autoApprove } = data;
     const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+    const globalCoderMaxParallel = Number(ModelManager.getGlobalConfig()?.coderMaxParallel || 1);
+    const globalCoderExperimentalModelParallel = Boolean(ModelManager.getGlobalConfig()?.coderExperimentalModelParallel);
     console.log(
       `Starting task for client ${socket.id}: ${userGoal} | maxRetries: ${globalMaxRetries}`
     );
     const latestTeam = getTeamInfo();
     const initialSession = {
-      ...createServerInitialSession(userGoal, globalMaxRetries, autoApprove),
+      ...createServerInitialSession(userGoal, globalMaxRetries, autoApprove, {
+        coderMaxParallel: globalCoderMaxParallel,
+        coderExperimentalModelParallel: globalCoderExperimentalModelParallel,
+      }),
       metrics: {
         tokenUsage: createEmptyTokenUsage(),
         progress: buildProgressMetrics([]),
@@ -530,7 +540,10 @@ io.on("connection", (socket) => {
     await runGraphSession(
       latestTeam,
       initialSession,
-      createBaseGraphState(userGoal, globalMaxRetries, autoApprove)
+      createBaseGraphState(userGoal, globalMaxRetries, autoApprove, {
+        coderMaxParallel: globalCoderMaxParallel,
+        coderExperimentalModelParallel: globalCoderExperimentalModelParallel,
+      })
     );
   });
 

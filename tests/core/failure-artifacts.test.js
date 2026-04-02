@@ -256,6 +256,64 @@ test("current workspace qa snapshot keeps failure evidence for qa resume routing
   assert.match(replayState.blockedReason, /jsonwebtoken/);
 });
 
+test("current workspace infra_setup snapshot resumes from infra_setup instead of pm", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "infra_setup",
+    state: createBaseState({
+      retryCount: 6,
+      resumeFromNode: "pm",
+      lastFailedNode: "infra_setup",
+      lastFailureSummary: "docker-compose 构建失败",
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "infra_setup");
+});
+
+test("agent_pending fallback uses lastFailedNode when agentRecoveryNode is missing", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "agent_pending",
+    state: createBaseState({
+      retryCount: 7,
+      agentRecoveryPending: true,
+      agentRecoveryNode: "",
+      resumeFromNode: "pm",
+      lastFailedNode: "qa",
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "qa_resume_router");
+});
+
+test("agent_pending resume preserves failure evidence for qa re-evaluation", () => {
+  const replayState = buildResumeStateFromCurrentSnapshot({
+    node: "agent_pending",
+    state: createBaseState({
+      retryCount: 8,
+      agentRecoveryPending: true,
+      agentRecoveryNode: "qa",
+      testResults: "[基础设施构建失败]\nsrc/controllers/bookController.ts(41,27): error TS2345: bad type",
+      qaFailures: {
+        failedFiles: ["src/controllers/bookController.ts"],
+        testErrors: ["TS2345"],
+        failedTestNames: [],
+      },
+      validationReport: {
+        version: "v1",
+        status: "fail",
+        failureType: "implementation_bug",
+        blocking: true,
+        findings: [{ summary: "TS 编译失败", file: "src/controllers/bookController.ts", evidence: ["TS2345"] }],
+      },
+    }),
+  });
+
+  assert.equal(replayState.resumeFromNode, "qa_resume_router");
+  assert.match(replayState.testResults, /TS2345/);
+  assert.equal(replayState.qaFailures?.failedFiles?.includes("src/controllers/bookController.ts"), true);
+  assert.equal(replayState.validationReport?.blocking, true);
+});
+
 test("current workspace env_guard host-blocked snapshot keeps executor environment evidence", () => {
   const replayState = buildResumeStateFromCurrentSnapshot({
     node: "env_guard_host_blocked",

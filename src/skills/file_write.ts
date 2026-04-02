@@ -43,23 +43,24 @@ export const FileWriteSkill = new Skill({
       if (!workspaceRoot) {
         throw new Error("JIMCLAW_WORKSPACE 未设置：禁止在 workspace 目录外写入文件。");
       }
+      const normalizedWorkspaceRoot = path.resolve(workspaceRoot);
 
       // 容错：agent 有时会传入绝对路径（含路径名拼写错误）
       // 若绝对路径在 workspace 内，转为相对路径；若在 workspace 外，拒绝写入
       let resolvedFilePath = filePath;
       if (path.isAbsolute(filePath)) {
-        const normalizedFile = path.normalize(filePath);
-        const normalizedRoot = path.normalize(workspaceRoot);
+        const normalizedFile = path.resolve(filePath);
+        const normalizedRoot = normalizedWorkspaceRoot;
         if (normalizedFile.startsWith(normalizedRoot + path.sep) || normalizedFile === normalizedRoot) {
-          resolvedFilePath = path.relative(workspaceRoot, normalizedFile);
+          resolvedFilePath = path.relative(normalizedWorkspaceRoot, normalizedFile);
         } else {
           throw new Error(`安全限制：绝对路径 "${filePath}" 不在 workspace 目录内，请使用相对路径。`);
         }
       }
 
-      const absolutePath = path.resolve(workspaceRoot, resolvedFilePath);
+      const absolutePath = path.resolve(normalizedWorkspaceRoot, resolvedFilePath);
       // 路径安全检查：防止 ../../../ 等路径穿越攻击
-      if (!absolutePath.startsWith(workspaceRoot + path.sep) && absolutePath !== workspaceRoot) {
+      if (!absolutePath.startsWith(normalizedWorkspaceRoot + path.sep) && absolutePath !== normalizedWorkspaceRoot) {
         throw new Error(`安全限制：不允许写入 workspace 目录外的路径 "${filePath}"。`);
       }
       const dirPath = path.dirname(absolutePath);

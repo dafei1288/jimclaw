@@ -17,6 +17,7 @@ function createResolvedExecutor({
   capabilitySnapshot,
   resolution,
   approvalTicket,
+  executeResult,
 } = {}) {
   const snapshot = capabilitySnapshot || {
     version: "v1",
@@ -38,6 +39,15 @@ function createResolvedExecutor({
       resolution: resolved,
       approvalTicket,
     }),
+    executeIntent: async () => executeResult || {
+      ok: true,
+      backend: "local_shell",
+      stdout: "installed",
+      stderr: "",
+      retryable: false,
+      requiresApproval: false,
+      blocked: false,
+    },
   };
 }
 
@@ -619,16 +629,273 @@ test("env guard delegates backend resolution to command executor instead of prob
               },
             };
           },
+          executeIntent: async (intent) => {
+            executorCalls.push(`execute:${intent.kind}`);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "installed",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
         },
       }
     );
 
     assert.equal(result.envReady, true);
     assert.equal(result.executionBackend, "host");
-    assert.deepEqual(executorCalls, ["probe", "resolve:install_deps"]);
+    assert.deepEqual(executorCalls, ["probe", "resolve:install_deps", "execute:install_deps"]);
     assert.equal(shellCalls.some((command) => /docker version|jimclaw-host-probe|executor-shell-probe/i.test(command)), false);
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("env guard preinstall gate executes install_deps when node_modules is missing", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const calls = [];
+
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["package.json", "src/index.ts"],
+      dependencies: { express: "^5.0.0" },
+      devDependencies: { typescript: "^5.0.0" },
+    },
+    subTasks: [
+      { id: "task-001", fileTarget: "package.json", description: "pkg", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-002", fileTarget: "src/index.ts", description: "index", dependencies: [], contextRequirement: "", status: "completed" },
+    ],
+    code: JSON.stringify({
+      "package.json": JSON.stringify({
+        name: "demo",
+        version: "1.0.0",
+        dependencies: { express: "^5.0.0" },
+        devDependencies: { typescript: "^5.0.0" },
+      }, null, 2),
+      "src/index.ts": 'import express from "express";\nconst app = express();\nexport default app;\n',
+    }),
+  });
+
+  try {
+    await fs.mkdir(path.join(workspace, "src"), { recursive: true });
+    await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({
+      name: "demo",
+      version: "1.0.0",
+      dependencies: { express: "^5.0.0" },
+      devDependencies: { typescript: "^5.0.0" },
+    }, null, 2));
+    await fs.writeFile(path.join(workspace, "src", "index.ts"), 'import express from "express";\nconst app = express();\nexport default app;\n');
+
+    const result = await envGuardNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          probeCapabilities: async () => ({
+            version: "v1",
+            localShell: { available: true },
+            docker: { cliAvailable: true, daemonReachable: true },
+            network: { outboundAllowed: true },
+            backgroundProcess: { available: true },
+          }),
+          resolveIntent: async (_intent, snapshot) => ({
+            capabilitySnapshot: snapshot,
+            resolution: {
+              selected: "local_shell",
+              candidates: ["docker", "local_shell"],
+              blocked: false,
+              requiresApproval: false,
+            },
+          }),
+          executeIntent: async (intent) => {
+            calls.push(intent);
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "installed",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
+    );
+
+    assert.equal(result.envReady, true);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].kind, "install_deps");
+    assert.match(calls[0].command, /npm install/);
+    assert.equal(recorder.snapshots.at(-1).node, "env_guard_ready");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("env guard preinstall gate enters pending state when install_deps requires approval", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["package.json"],
+      dependencies: { express: "^5.0.0" },
+      devDependencies: {},
+    },
+    code: JSON.stringify({
+      "package.json": JSON.stringify({
+        name: "demo",
+        version: "1.0.0",
+        dependencies: { express: "^5.0.0" },
+        devDependencies: {},
+      }, null, 2),
+    }),
+  });
+
+  try {
+    await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({
+      name: "demo",
+      version: "1.0.0",
+      dependencies: { express: "^5.0.0" },
+      devDependencies: {},
+    }, null, 2));
+
+    const result = await envGuardNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          probeCapabilities: async () => ({
+            version: "v1",
+            localShell: { available: true },
+            docker: { cliAvailable: true, daemonReachable: true },
+            network: { outboundAllowed: true },
+            backgroundProcess: { available: true },
+          }),
+          resolveIntent: async (_intent, snapshot) => ({
+            capabilitySnapshot: snapshot,
+            resolution: {
+              selected: "local_shell",
+              candidates: ["local_shell"],
+              blocked: false,
+              requiresApproval: false,
+            },
+          }),
+          executeIntent: async () => ({
+            ok: false,
+            backend: "local_shell",
+            stdout: "",
+            stderr: "approval required",
+            retryable: false,
+            requiresApproval: true,
+            approvalTicketId: "ticket-preinstall",
+            blocked: true,
+            blockedReason: "approval required",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.envReady, false);
+    assert.equal(result.requiresApproval, true);
+    assert.equal(result.agentRecoveryPending, true);
+    assert.equal(result.pendingApprovalTicketId, "ticket-preinstall");
+    assert.equal(recorder.snapshots.at(-1).node, "env_guard_approval_required");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("env guard preinstall gate enters host_blocked when install_deps is blocked", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      filesToCreate: ["package.json"],
+      dependencies: { express: "^5.0.0" },
+      devDependencies: {},
+    },
+    code: JSON.stringify({
+      "package.json": JSON.stringify({
+        name: "demo",
+        version: "1.0.0",
+        dependencies: { express: "^5.0.0" },
+        devDependencies: {},
+      }, null, 2),
+    }),
+  });
+
+  try {
+    await fs.writeFile(path.join(workspace, "package.json"), JSON.stringify({
+      name: "demo",
+      version: "1.0.0",
+      dependencies: { express: "^5.0.0" },
+      devDependencies: {},
+    }, null, 2));
+
+    const result = await envGuardNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          probeCapabilities: async () => ({
+            version: "v1",
+            localShell: { available: true },
+            docker: { cliAvailable: true, daemonReachable: true },
+            network: { outboundAllowed: true },
+            backgroundProcess: { available: true },
+          }),
+          resolveIntent: async (_intent, snapshot) => ({
+            capabilitySnapshot: snapshot,
+            resolution: {
+              selected: "local_shell",
+              candidates: ["local_shell"],
+              blocked: false,
+              requiresApproval: false,
+            },
+          }),
+          executeIntent: async () => ({
+            ok: false,
+            backend: "local_shell",
+            stdout: "",
+            stderr: "backend unavailable",
+            retryable: false,
+            requiresApproval: false,
+            blocked: true,
+            blockedReason: "backend unavailable",
+          }),
+        },
+      }
+    );
+
+    assert.equal(result.envReady, false);
+    assert.equal(result.agentRecoveryPending, true);
+    assert.equal(result.agentRecoveryNode, "env_guard");
+    assert.equal(result.resumeFromNode, "env_guard");
+    assert.equal(recorder.snapshots.at(-1).node, "env_guard_host_blocked");
+  } finally {
     await removeTempWorkspace(workspace);
   }
 });

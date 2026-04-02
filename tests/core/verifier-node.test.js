@@ -264,6 +264,237 @@ export default app;`,
   }
 });
 
+test("verifier rejects staged validation when a core business file is still a deterministic scaffold from fallback planning", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const requirementProtocol = buildRequirementProtocol({
+    title: "图书管理系统",
+    requirements: ["需要后端 API"],
+    acceptanceCriteria: ["用户能够查询图书列表"],
+  });
+  const spec = {
+    language: "TypeScript",
+    testCommand: "npm test",
+    entryPoint: "src/index.ts",
+    filesToCreate: [
+      "package.json",
+      "jest.config.cjs",
+      "tests/setup.test.ts",
+      "src/models/book.ts",
+      "src/services/bookService.ts",
+      "src/controllers/bookController.ts",
+      "src/routes/books.ts",
+      "src/index.ts",
+    ],
+  };
+  const state = createBaseState({
+    requirementProtocol,
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    validationCheckpointRequested: true,
+    spec,
+    subTasks: [
+      { id: "task-1", description: "pkg", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-2", description: "jest", fileTarget: "jest.config.cjs", dependencies: ["package.json"], contextRequirement: "", status: "completed" },
+      { id: "task-3", description: "setup", fileTarget: "tests/setup.test.ts", dependencies: ["package.json"], contextRequirement: "", status: "completed" },
+      { id: "task-4", description: "model", fileTarget: "src/models/book.ts", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-5", description: "service", fileTarget: "src/services/bookService.ts", dependencies: ["src/models/book.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-6", description: "controller", fileTarget: "src/controllers/bookController.ts", dependencies: ["src/services/bookService.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-7", description: "route", fileTarget: "src/routes/books.ts", dependencies: ["src/controllers/bookController.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-8", description: "entry", fileTarget: "src/index.ts", dependencies: ["src/routes/books.ts"], contextRequirement: "", status: "completed" },
+    ],
+    apiContract: {
+      endpoints: [],
+    },
+    codeLog: [
+      { round: 0, file: "package.json", taskTitle: "pkg", status: "written", generationSource: "model" },
+      { round: 0, file: "jest.config.cjs", taskTitle: "jest", status: "written", generationSource: "model" },
+      { round: 0, file: "tests/setup.test.ts", taskTitle: "setup", status: "written", generationSource: "model" },
+      { round: 0, file: "src/models/book.ts", taskTitle: "model", status: "written", generationSource: "model" },
+      { round: 0, file: "src/services/bookService.ts", taskTitle: "service", status: "written", generationSource: "deterministic_scaffold" },
+      { round: 0, file: "src/controllers/bookController.ts", taskTitle: "controller", status: "written", generationSource: "model" },
+      { round: 0, file: "src/routes/books.ts", taskTitle: "route", status: "written", generationSource: "model" },
+      { round: 0, file: "src/index.ts", taskTitle: "entry", status: "written", generationSource: "model" },
+    ],
+  });
+  state.executionProtocol = buildExecutionProtocol(spec, { services: [{ name: "api", port: 10000 }] }, state.apiContract, requirementProtocol);
+
+  try {
+    await fs.mkdir(path.join(workspace, "tests"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "models"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "services"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "controllers"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "routes"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "jest" }, dependencies: { express: "^4.18.2" } }, null, 2),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "jest.config.cjs"),
+      `module.exports = {
+  preset: "ts-jest",
+  testEnvironment: "node",
+  roots: ["<rootDir>/tests"],
+  testMatch: ["**/*.test.ts"],
+};`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "tests/setup.test.ts"),
+      `describe("setup", () => { it("works", () => { expect(true).toBe(true); }); });`,
+      "utf-8"
+    );
+    await fs.writeFile(path.join(workspace, "src/models/book.ts"), `export interface Book { id: string; title: string; }\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/services/bookService.ts"), `export const listBooks = () => [];\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/controllers/bookController.ts"), `export const listBooksHandler = () => [];\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/routes/books.ts"), `export default {};\n`, "utf-8");
+    await fs.writeFile(
+      path.join(workspace, "src/index.ts"),
+      `import express from "express";
+const app = express();
+app.use("/api/books", (_req, res) => res.status(200).json([]));
+app.get("/api/health", (_req, res) => res.status(200).json({ success: true }));
+app.listen(10000);
+export default app;`,
+      "utf-8"
+    );
+
+    const result = await verifierNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.match(result.testResults || "", /阶段验证拒绝/);
+    assert.match(result.testResults || "", /src\/services\/bookService\.ts/);
+    assert.match(result.testResults || "", /降级骨架/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("verifier allows compact fallback auth service scaffold during staged validation", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const requirementProtocol = buildRequirementProtocol({
+    title: "图书管理系统",
+    requirements: ["需要后端 API 和登录认证"],
+    acceptanceCriteria: ["用户能够登录并查询图书列表"],
+  });
+  const spec = {
+    language: "TypeScript",
+    testCommand: "npm test",
+    entryPoint: "src/index.ts",
+    authScaffoldMode: "compact",
+    filesToCreate: [
+      "package.json",
+      "jest.config.cjs",
+      "tests/setup.test.ts",
+      "src/models/book.ts",
+      "src/services/bookService.ts",
+      "src/services/authService.ts",
+      "src/controllers/bookController.ts",
+      "src/routes/books.ts",
+      "src/index.ts",
+    ],
+  };
+  const state = createBaseState({
+    requirementProtocol,
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    validationCheckpointRequested: true,
+    spec,
+    subTasks: [
+      { id: "task-1", description: "pkg", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-2", description: "jest", fileTarget: "jest.config.cjs", dependencies: ["package.json"], contextRequirement: "", status: "completed" },
+      { id: "task-3", description: "setup", fileTarget: "tests/setup.test.ts", dependencies: ["package.json"], contextRequirement: "", status: "completed" },
+      { id: "task-4", description: "model", fileTarget: "src/models/book.ts", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-5", description: "service", fileTarget: "src/services/bookService.ts", dependencies: ["src/models/book.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-6", description: "auth-service", fileTarget: "src/services/authService.ts", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-7", description: "controller", fileTarget: "src/controllers/bookController.ts", dependencies: ["src/services/bookService.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-8", description: "route", fileTarget: "src/routes/books.ts", dependencies: ["src/controllers/bookController.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-9", description: "entry", fileTarget: "src/index.ts", dependencies: ["src/routes/books.ts"], contextRequirement: "", status: "completed" },
+    ],
+    apiContract: {
+      endpoints: [],
+    },
+    codeLog: [
+      { round: 0, file: "package.json", taskTitle: "pkg", status: "written", generationSource: "model" },
+      { round: 0, file: "jest.config.cjs", taskTitle: "jest", status: "written", generationSource: "model" },
+      { round: 0, file: "tests/setup.test.ts", taskTitle: "setup", status: "written", generationSource: "model" },
+      { round: 0, file: "src/models/book.ts", taskTitle: "model", status: "written", generationSource: "model" },
+      { round: 0, file: "src/services/bookService.ts", taskTitle: "service", status: "written", generationSource: "model" },
+      { round: 0, file: "src/services/authService.ts", taskTitle: "auth-service", status: "written", generationSource: "deterministic_scaffold" },
+      { round: 0, file: "src/controllers/bookController.ts", taskTitle: "controller", status: "written", generationSource: "model" },
+      { round: 0, file: "src/routes/books.ts", taskTitle: "route", status: "written", generationSource: "model" },
+      { round: 0, file: "src/index.ts", taskTitle: "entry", status: "written", generationSource: "model" },
+    ],
+  });
+  state.executionProtocol = buildExecutionProtocol(spec, { services: [{ name: "api", port: 10000 }] }, state.apiContract, requirementProtocol);
+
+  try {
+    await fs.mkdir(path.join(workspace, "tests"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "models"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "services"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "controllers"), { recursive: true });
+    await fs.mkdir(path.join(workspace, "src", "routes"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "package.json"),
+      JSON.stringify({ name: "demo", scripts: { test: "jest" }, dependencies: { express: "^4.18.2", jsonwebtoken: "^9.0.2" } }, null, 2),
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "jest.config.cjs"),
+      `module.exports = {
+  preset: "ts-jest",
+  testEnvironment: "node",
+  roots: ["<rootDir>/tests"],
+  testMatch: ["**/*.test.ts"],
+};`,
+      "utf-8"
+    );
+    await fs.writeFile(
+      path.join(workspace, "tests/setup.test.ts"),
+      `describe("setup", () => { it("works", () => { expect(true).toBe(true); }); });`,
+      "utf-8"
+    );
+    await fs.writeFile(path.join(workspace, "src/models/book.ts"), `export interface Book { id: string; title: string; }\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/services/bookService.ts"), `export const listBooks = () => [];\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/services/authService.ts"), `export class AuthService {}\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/controllers/bookController.ts"), `export const listBooksHandler = () => [];\n`, "utf-8");
+    await fs.writeFile(path.join(workspace, "src/routes/books.ts"), `export default {};\n`, "utf-8");
+    await fs.writeFile(
+      path.join(workspace, "src/index.ts"),
+      `import express from "express";
+const app = express();
+app.use("/api/books", (_req, res) => res.status(200).json([]));
+app.get("/api/health", (_req, res) => res.status(200).json({ success: true }));
+app.listen(10000);
+export default app;`,
+      "utf-8"
+    );
+
+    const result = await verifierNode(
+      state,
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.testResults || "", "");
+    assert.equal(result.validationReport?.status, "pass");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("verifier success clears stale protocol and failure markers", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

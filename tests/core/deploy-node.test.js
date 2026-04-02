@@ -775,3 +775,72 @@ test("deploy maps blocked runtime start executor failures to structured runtime 
     await removeTempWorkspace(workspace);
   }
 });
+
+test("deploy emits heartbeat snapshots during runtime launch and health check", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalShellRun = ShellExecuteSkill.config.run;
+  const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalHeartbeat = process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+
+  process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = "5";
+  GetServerIPSkill.config.run = async () => "127.0.0.1";
+  ShellExecuteSkill.config.run = async ({ command }) => {
+    if (command.startsWith("curl ")) {
+      return "Output:\n200\nErrors:\n";
+    }
+    throw new Error(`unexpected shell command: ${command}`);
+  };
+
+  try {
+    await deployNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4000,
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+          runCommand: "npm start",
+        },
+        deploymentStatus: { status: "none" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "4321",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
+    );
+
+    const nodes = recorder.snapshots.map((item) => item.node);
+    assert.equal(nodes.includes("deploy_stage_launching"), true);
+    assert.equal(nodes.some((node) => node === "deploy_heartbeat_launching"), true);
+    assert.equal(nodes.includes("deploy_stage_healthcheck"), true);
+    assert.equal(nodes.some((node) => node === "deploy_heartbeat_healthcheck"), true);
+  } finally {
+    ShellExecuteSkill.config.run = originalShellRun;
+    GetServerIPSkill.config.run = originalGetServerIP;
+    if (originalHeartbeat === undefined) {
+      delete process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+    } else {
+      process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = originalHeartbeat;
+    }
+    await removeTempWorkspace(workspace);
+  }
+});

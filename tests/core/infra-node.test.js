@@ -658,3 +658,65 @@ test("infra setup maps executor unavailable failures to environment gaps", async
     await removeTempWorkspace(workspace);
   }
 });
+
+test("infra setup emits heartbeat snapshots during host install stage", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalFindPort = FindFreePortSkill.config.run;
+  const originalHeartbeat = process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+
+  await require("fs/promises").writeFile(
+    require("path").join(workspace, "package.json"),
+    JSON.stringify({ name: "demo" }, null, 2),
+    "utf-8"
+  );
+
+  FindFreePortSkill.config.run = async () => "4123";
+  process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = "5";
+
+  try {
+    await infraNode(
+      createBaseState({
+        executionBackend: "host",
+        spec: {
+          language: "TypeScript",
+          filesToCreate: [],
+        },
+        manifest: { services: [{ name: "app", port: 10000, description: "demo" }], environment: {}, sharedConfig: {} },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "ok",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
+    );
+
+    const nodes = recorder.snapshots.map((item) => item.node);
+    assert.equal(nodes.includes("infra_setup_stage_installing"), true);
+    assert.equal(nodes.some((node) => node === "infra_setup_heartbeat_install"), true);
+  } finally {
+    FindFreePortSkill.config.run = originalFindPort;
+    if (originalHeartbeat === undefined) {
+      delete process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+    } else {
+      process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = originalHeartbeat;
+    }
+    await removeTempWorkspace(workspace);
+  }
+});

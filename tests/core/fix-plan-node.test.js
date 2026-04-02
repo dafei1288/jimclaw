@@ -176,6 +176,83 @@ test("fix plan treats coder timeout as recoverable and still produces determinis
   }
 });
 
+test("fix plan bypasses llm collaboration when qa already marked static fallback issues", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const failingFile = "src/controllers/bookController.ts";
+  await fs.mkdir(path.join(workspace, "src", "controllers"), { recursive: true });
+  await fs.writeFile(path.join(workspace, failingFile), "export const x = 1;\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 5,
+    testResults: "src/controllers/bookController.ts(41,27): error TS2345: bad type",
+    qaFailures: {
+      failedFiles: [failingFile],
+      testErrors: ["TS2345"],
+      failedTestNames: [],
+    },
+    issueTracker: [
+      {
+        id: "BUG-COMPILE-1",
+        title: "src/controllers/bookController.ts 编译失败",
+        description: "TS2345: bad type；QA 模型不可用，已启用静态兜底。",
+        severity: "major",
+        status: "open",
+        relatedFiles: [failingFile],
+        detectedRound: 5,
+      },
+    ],
+    subTasks: [
+      {
+        id: "task-controller",
+        fileTarget: failingFile,
+        description: "controller",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "failed",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() {
+        return { name: "星河" };
+      },
+      async chat() {
+        throw new Error("coder chat should not be called in static bypass mode");
+      },
+    },
+    qa: {
+      getPersona() {
+        return { name: "清扬" };
+      },
+      async chat() {
+        throw new Error("qa chat should not be called in static bypass mode");
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.fixPlan.length, 1);
+    assert.equal(result.fixPlan[0].fileTarget, failingFile);
+    assert.equal(result.fixPlan[0].qaApproval, "approved");
+    assert.equal(result.subTasks[0].status, "pending");
+    assert.equal(recorder.snapshots.at(-1).node, "fix_plan");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("fix plan uses coding mode for coder and qa collaboration", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

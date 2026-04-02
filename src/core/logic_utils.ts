@@ -3585,7 +3585,7 @@ FROM node:20-alpine AS builder
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci
+RUN npm install
 
 COPY . .
 RUN npm run build
@@ -3596,7 +3596,7 @@ FROM node:20-alpine
 WORKDIR /app
 
 COPY package*.json ./
-RUN npm ci --only=production
+RUN npm install --omit=dev
 
 COPY --from=builder /app/dist ./dist
 
@@ -4396,6 +4396,7 @@ function buildBoundedCrudFilePlan(spec: any, requirementProtocol: RequirementPro
   const language = String(spec?.language || "").toLowerCase();
   const ext = /typescript/.test(language) ? ".ts" : ".js";
   const framework = detectNodeTestFramework(spec);
+  const authScaffoldMode = spec?.authScaffoldMode === "compact" ? "compact" : "split";
   const { singular, plural } = getPrimaryEntityStems(requirementProtocol);
   const camelSingular = toCamelCase(singular) || singular || "item";
   const auditRequired = Boolean(requirementProtocol?.capabilities?.auditLogRequired || requiresStructuredLogging(requirementProtocol));
@@ -4442,9 +4443,11 @@ function buildBoundedCrudFilePlan(spec: any, requirementProtocol: RequirementPro
     push(`src/middleware/auth${ext}`);
     push(`src/routes/auth${ext}`);
     push(`src/controllers/authController${ext}`);
-    push(`src/services/authSessionService${ext}`);
-    push(`src/services/authCredentialService${ext}`);
-    push(`src/services/authAccountPolicyService${ext}`);
+    if (authScaffoldMode !== "compact") {
+      push(`src/services/authSessionService${ext}`);
+      push(`src/services/authCredentialService${ext}`);
+      push(`src/services/authAccountPolicyService${ext}`);
+    }
     push(`src/services/authService${ext}`);
   }
 
@@ -4919,6 +4922,7 @@ export function buildTraceIndex(
       lastStatus: entry.status,
       taskTitle: entry.taskTitle,
       lastError: entry.error,
+      generationSource: entry.generationSource,
     };
     return acc;
   }, {});
@@ -5252,7 +5256,19 @@ export function buildReplayStateFromSnapshot(
 function shouldPreserveFailureEvidenceForNode(nodeName: string): boolean {
   const rawNode = String(nodeName || "").trim();
   if (!rawNode) return false;
-  if (["qa", "approval", "approval_pending", "deploy"].includes(rawNode)) return true;
+  if ([
+    "qa",
+    "approval",
+    "approval_pending",
+    "deploy",
+    "agent_pending",
+    "infra_setup",
+    "terminal",
+    "verifier",
+    "fix_plan",
+    "architect_mediation",
+    "coder",
+  ].includes(rawNode)) return true;
   if (/^env_guard/i.test(rawNode)) return true;
   return false;
 }
@@ -5286,17 +5302,53 @@ export function buildResumeStateFromCurrentSnapshot(snapshot: { node: string; st
   const preserveFailureEvidence = shouldPreserveFailureEvidenceForNode(rawNode);
   const replayState = buildReplayStateFromSnapshot(snapshotState, { preserveFailureEvidence });
   const strippedCrashNode = rawNode.replace(/_crash$/i, "");
+  const graphNodes = new Set([
+    "pm",
+    "architect",
+    "contract_sync",
+    "approval",
+    "approval_pending",
+    "orchestrator",
+    "coder",
+    "env_guard",
+    "infra_setup",
+    "terminal",
+    "verifier",
+    "qa",
+    "deploy",
+    "post_mortem",
+    "persistence",
+    "architect_mediation",
+    "fix_plan",
+    "agent_pending",
+  ]);
+
+  function normalizeResumeNode(nodeName: string): string {
+    const normalized = String(nodeName || "").trim();
+    if (!normalized) return "";
+    if (/^coder_task_/i.test(normalized)) return "coder";
+    if (normalized === "approval_pending") return "approval";
+    if (normalized === "qa") return "qa_resume_router";
+    if (normalized === "qa_checkpoint_resume" || normalized === "qa_env_fix") return "qa";
+    if (/^env_guard/i.test(normalized)) return "env_guard";
+    if (graphNodes.has(normalized)) return normalized;
+    return "";
+  }
 
   const resumeFromNode =
     rawNode === "agent_pending"
-      ? String(snapshotState.agentRecoveryNode || snapshotState.resumeFromNode || "pm")
+      ? String(
+          normalizeResumeNode(String(snapshotState.agentRecoveryNode || "")) ||
+          normalizeResumeNode(String(snapshotState.lastFailedNode || "")) ||
+          getResumeNodeFromCheckpoint(String(snapshotState.lastFailedNode || "")) ||
+          normalizeResumeNode(String(snapshotState.resumeFromNode || "")) ||
+          "pm"
+        )
       : rawNode === "approval_pending"
         ? "approval"
-        : /^coder_task_/i.test(rawNode)
-          ? "coder"
-          : /_crash$/i.test(rawNode)
-            ? (strippedCrashNode || "pm")
-            : getResumeNodeFromCheckpoint(rawNode);
+        : normalizeResumeNode(rawNode) ||
+          (/_crash$/i.test(rawNode) ? (normalizeResumeNode(strippedCrashNode) || strippedCrashNode || "pm") : "") ||
+          getResumeNodeFromCheckpoint(rawNode);
 
   return {
     ...replayState,

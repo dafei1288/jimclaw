@@ -1,6 +1,7 @@
 import { Team } from "./agents/team";
 import { createJimClawGraph } from "./core/graph";
 import { buildCustomerApprovalState, buildReplayStateFromSnapshot, buildResumeStateFromCurrentSnapshot, loadCheckpointSnapshot, prepareReplayStateFromCheckpoint } from "./core/logic_utils";
+import { ModelManager } from "./utils/models";
 import * as fs from "fs/promises";
 import * as path from "path";
 
@@ -311,6 +312,9 @@ async function main() {
   const userGoal = args[0] || "a simple Counter app with increment and decrement";
   console.log(`🚀 Starting JimClaw: Multi-Agent Collaboration Session for goal: "${userGoal}"`);
   const workspacePath = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
+  const globalConfig = ModelManager.getGlobalConfig?.() || {};
+  const coderMaxParallel = Number(globalConfig?.coderMaxParallel || 1);
+  const coderExperimentalModelParallel = Boolean(globalConfig?.coderExperimentalModelParallel);
 
   // 1. 初始化协作图
   const app = await createJimClawGraph(Team, undefined, { workspacePath });
@@ -330,6 +334,8 @@ async function main() {
       qaFailures: null,
       packageJsonHash: "",
       customerApprovalState: buildCustomerApprovalState({ autoApprove }),
+      coderMaxParallel: Number.isFinite(coderMaxParallel) ? Math.max(1, Math.min(4, Math.floor(coderMaxParallel))) : 1,
+      coderExperimentalModelParallel,
     },
     { recursionLimit: 500 }
   );

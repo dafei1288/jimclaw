@@ -31,6 +31,7 @@ export interface TechSpec {
   entryPoint: string;
   filesToCreate: string[];
   interfaces: string;
+  authScaffoldMode?: "split" | "compact";
   // 架构师定义的核心依赖，Coder 以此为基准，可按需追加，但不得擅自移动分类
   dependencies: Record<string, string>;     // 运行时依赖，如 { "express": "^4.18.2" }
   devDependencies: Record<string, string>;  // 开发依赖，如 { "typescript": "^5.3.3" }
@@ -45,6 +46,7 @@ export const TechSpecSchema = z.object({
   entryPoint: z.string(),
   filesToCreate: z.array(z.string()),
   interfaces: z.string(),
+  authScaffoldMode: z.enum(["split", "compact"]).optional(),
   dependencies: z.record(z.string(), z.string()).optional(),
   devDependencies: z.record(z.string(), z.string()).optional(),
 });
@@ -115,6 +117,9 @@ export interface MediationDirective {
   detail: string;
 }
 
+export type PlanningSource = "model" | "deterministic-fallback";
+export type GenerationSource = "model" | "deterministic_scaffold" | "recovered_disk";
+
 export const MediationDirectiveSchema = z.array(z.object({
   file: z.string(),
   action: z.string(),
@@ -130,6 +135,7 @@ export interface FileChangeEntry {
   taskTitle: string;
   status: "written" | "skipped" | "error";
   error?: string;
+  generationSource?: GenerationSource;
 }
 
 /**
@@ -282,6 +288,7 @@ export interface TraceFileSummary {
   lastStatus: "written" | "skipped" | "error";
   taskTitle: string;
   lastError?: string;
+  generationSource?: GenerationSource;
 }
 
 export type ProtocolFileRole =
@@ -615,7 +622,13 @@ export const JimClawState = Annotation.Root({
   contract: Annotation<TaskContract | null>({
     reducer: (x, y) => y ?? x,
   }),
+  contractSource: Annotation<PlanningSource>({
+    reducer: (x, y) => y ?? x,
+  }),
   spec: Annotation<TechSpec | null>({
+    reducer: (x, y) => y ?? x,
+  }),
+  designSource: Annotation<PlanningSource>({
     reducer: (x, y) => y ?? x,
   }),
   manifest: Annotation<SystemManifest | null>({
@@ -631,6 +644,9 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y ?? x,
   }),
   userGoal: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  orchestrationSource: Annotation<PlanningSource>({
     reducer: (x, y) => y ?? x,
   }),
   retryCount: Annotation<number>({
@@ -677,6 +693,12 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y ?? x,
   }),
   maxRetries: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+  }),
+  coderMaxParallel: Annotation<number>({
+    reducer: (x, y) => y ?? x,
+  }),
+  coderExperimentalModelParallel: Annotation<boolean>({
     reducer: (x, y) => y ?? x,
   }),
   templateId: Annotation<string>({

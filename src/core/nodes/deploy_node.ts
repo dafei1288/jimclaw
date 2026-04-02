@@ -9,6 +9,7 @@ import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_e
 import { AuditLogger } from "../../utils/audit";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { runWithHeartbeat } from "../node_heartbeat";
 
 function isRetryableDeployLaunchFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
@@ -387,6 +388,26 @@ export async function deployNode(
   const round = state.retryCount || 0;
   const executionBackend = state.executionBackend || "docker";
   const commandExecutor = deps?.commandExecutor || createDeployExecutor(state);
+  const buildHeartbeatState = (stage: string) => ({
+    ...state,
+    executionBackend,
+    blockedReason: stage,
+    runtimeStateSnapshot: {
+      version: "v1" as const,
+      envReady: Boolean(state.envReady),
+      hostDepsReady: Boolean(state.envReady),
+      testRuntimeReady: Boolean(state.containerId || executionBackend === "host"),
+      deployRuntimeReady: Boolean(state.containerId || executionBackend === "host"),
+      executionBackend: executionBackend as "docker" | "host",
+      containerId: state.containerId || undefined,
+      hostPort: state.allocatedHostPort || undefined,
+      containerPort: state.manifest?.services?.[0]?.port,
+      deploymentUrl: state.deploymentStatus?.url,
+      startupLogPath: state.hostRuntimeLogPath || undefined,
+      runtimePid: state.hostRuntimePid || undefined,
+      tokenUsage: state.runtimeStateSnapshot?.tokenUsage,
+    },
+  });
   
   // 1. 获取宿主机真实 IP 和端口映射
   const ip = await GetServerIPSkill.config.run({});
@@ -466,14 +487,21 @@ export async function deployNode(
       requiresApproval: false,
       blocked: false,
     };
+    await saveBoulder(buildHeartbeatState("deploy_launching_runtime"), "deploy_stage_launching");
     for (let attempt = 0; attempt < 2; attempt++) {
-      launchResult = await commandExecutor.executeIntent({
-        kind: "start_runtime",
-        workspace: WORKSPACE,
-        command: launchCommand,
-        background: true,
-        port: executionBackend === "host" ? parseInt(hostPort, 10) : targetInternalPort,
-        host: "0.0.0.0",
+      launchResult = await runWithHeartbeat({
+        run: async () =>
+          commandExecutor.executeIntent({
+            kind: "start_runtime",
+            workspace: WORKSPACE,
+            command: launchCommand,
+            background: true,
+            port: executionBackend === "host" ? parseInt(hostPort, 10) : targetInternalPort,
+            host: "0.0.0.0",
+          }),
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("deploy_launching_runtime"), "deploy_heartbeat_launching");
+        },
       });
 
       if (launchResult.requiresApproval) {
@@ -593,8 +621,10 @@ export async function deployNode(
   emit("thinking", "System", `正在验证服务连通性: ${healthCheckTarget} ...`);
   let isAccessible = false;
   let lastError = "";
+  await saveBoulder(buildHeartbeatState("deploy_healthcheck_loop"), "deploy_stage_healthcheck");
 
   for (let i = 0; i < 10; i++) { // 尝试 10 次，每次间隔 3s
+    await saveBoulder(buildHeartbeatState(`deploy_healthcheck_attempt_${i + 1}`), "deploy_heartbeat_healthcheck");
     for (const candidate of healthCheckCandidates) {
       try {
         const curlOut = await ShellExecuteSkill.config.run({ 

@@ -91,7 +91,24 @@ export async function qaNode(
   }
 
   function normalizeFileTarget(file: string | undefined | null): string {
-    return String(file || "").replace(/\\/g, "/").trim();
+    let normalized = String(file || "").replace(/\\/g, "/").trim();
+    if (!normalized) return "";
+    normalized = normalized.replace(/^\.\/+/, "").replace(/^\/+/, "");
+    const workspacePosix = String(WORKSPACE || "").replace(/\\/g, "/").replace(/\/+$/, "");
+    if (workspacePosix) {
+      while (normalized.startsWith(`${workspacePosix}/`)) {
+        normalized = normalized.slice(workspacePosix.length + 1);
+      }
+      const workspaceName = path.posix.basename(workspacePosix);
+      while (workspaceName && normalized.startsWith(`${workspaceName}/`)) {
+        normalized = normalized.slice(workspaceName.length + 1);
+      }
+    }
+    if (/workspace\/run_[^/]+\//.test(normalized)) {
+      const segments = normalized.split(/workspace\/run_[^/]+\//g).filter(Boolean);
+      normalized = segments[segments.length - 1] || normalized;
+    }
+    return normalized.replace(/^\.\/+/, "").replace(/^\/+/, "");
   }
 
   function collectKnownProjectFiles(state: JimClawState): string[] {
@@ -161,6 +178,45 @@ export async function qaNode(
     return Array.from(hits);
   }
 
+  type CompileFailure = {
+    file: string;
+    line?: number;
+    column?: number;
+    code?: string;
+    message: string;
+    raw: string;
+  };
+
+  function extractCompileFailures(text: string): CompileFailure[] {
+    const output = String(text || "");
+    if (!output.trim()) return [];
+    const failures: CompileFailure[] = [];
+    const seen = new Set<string>();
+    const patterns: RegExp[] = [
+      /([^\s:]+?\.[a-zA-Z0-9]+)\((\d+),(\d+)\):\s*error\s+(TS\d+):\s*([^\r\n]+)/g, // tsc
+      /([^\s:]+?\.[a-zA-Z0-9]+):(\d+):(\d+):\s*error(?:\[[^\]]+\])?:\s*([^\r\n]+)/g, // rustc/gcc/eslint-like
+      /([^\s:]+?\.[a-zA-Z0-9]+):(\d+):\s*([^\r\n]+error[^\r\n]*)/gi, // file:line: ...error...
+    ];
+
+    for (const pattern of patterns) {
+      let match: RegExpExecArray | null;
+      while ((match = pattern.exec(output)) !== null) {
+        const file = normalizeFileTarget(match[1]);
+        if (!file) continue;
+        const line = Number(match[2] || 0) || undefined;
+        const column = Number(match[3] || 0) || undefined;
+        const code = match[4]?.startsWith("TS") ? match[4] : undefined;
+        const message = (match[5] || match[4] || "").trim() || "编译失败";
+        const raw = match[0].trim();
+        const key = `${file}|${line || 0}|${column || 0}|${code || ""}|${message}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        failures.push({ file, line, column, code, message, raw });
+      }
+    }
+    return failures;
+  }
+
   function isTransientEnvironmentFailure(text: string): boolean {
     return /spawn\s+\w+\s+ENOENT|spawn EPERM|EADDRINUSE|EACCES|docker|connect ECONNREFUSED|timed out|timeout|port already in use/i.test(String(text || ""));
   }
@@ -169,7 +225,8 @@ export async function qaNode(
     state: JimClawState,
     issues: Issue[],
     failingTestFiles: string[],
-    rawUnitOutput: string
+    rawUnitOutput: string,
+    compileFailures: CompileFailure[]
   ): { issues: Issue[]; reopenFiles: string[] } {
     const knownFiles = collectKnownProjectFiles(state);
     const knownFileSet = new Set(knownFiles);
@@ -182,6 +239,7 @@ export async function qaNode(
     const globalText = [rawUnitOutput, validationText, state.lastFailureSummary || "", state.blockedReason || ""]
       .filter(Boolean)
       .join("\n");
+    const compileFailureFiles = compileFailures.map((item) => normalizeFileTarget(item.file)).filter(Boolean);
     const globalConfigFiles = inferConfigOwnedFiles(globalText, knownFileSet);
     const augmentedIssues = issues.map((issue) => {
       const issueText = [issue.title, issue.description, issue.rawErrorSnippet, validationText].filter(Boolean).join("\n");
@@ -191,6 +249,9 @@ export async function qaNode(
       for (const file of normalizedFailingTests) {
         if (issueText.includes(file)) nextFiles.add(file);
       }
+      for (const file of compileFailureFiles) {
+        if (issueText.includes(file) || issueText.includes(path.posix.basename(file))) nextFiles.add(file);
+      }
       return {
         ...issue,
         relatedFiles: Array.from(nextFiles),
@@ -199,6 +260,7 @@ export async function qaNode(
 
     const reopenFiles = new Set<string>([
       ...normalizedFailingTests,
+      ...compileFailureFiles,
       ...globalConfigFiles,
       ...augmentedIssues.filter((issue) => issue.status === "open").flatMap((issue) => issue.relatedFiles || []),
     ]);
@@ -434,6 +496,13 @@ ${JSON.stringify(resolvedIssues.filter((issue) => issue.status === "resolved"), 
   }
 
   const isCoderBlockedFailure = failureEvidence.coderBlocked;
+  const compileFailures = extractCompileFailures(rawUnitOutput);
+  const compileFailureFiles = Array.from(new Set(compileFailures.map((item) => normalizeFileTarget(item.file)).filter(Boolean)));
+  const shouldBypassQaLlmForCompileFailures =
+    compileFailures.length > 0 &&
+    !isCoderBlockedFailure &&
+    !failureEvidence.verifierFailed &&
+    !deploymentFail;
   if (isCoderBlockedFailure) {
     const blockedFiles = Array.from(new Set(state.qaFailures?.failedFiles || []));
     const blockedErrors = state.qaFailures?.testErrors?.length
@@ -591,21 +660,59 @@ ${JSON.stringify(state.issueTracker || [])}
 请严格输出 JSON 数组格式：{"issues": [{"id": "...", "title": "...", "description": "...", "severity": "...", "status": "...", "relatedFiles": ["..."], "rawErrorSnippet": "...", "detectedRound": ${round}}]}
 请确保内容使用中文。`;
 
-  const response = await agents.qa.chat([{ role: "user", content: prompt }], (ev) => emit(ev.type, ev.sender, "正在深度审计质量问题", ev), {
-    mode: "coding",
-    workspaceDir: WORKSPACE,
-    brief: buildSystemContext(state),
-    timeoutMs: QA_MODEL_TIMEOUT_MS,
-  });
-
-  const parsed = parseJsonFromResponse(extractText(response.content), { issues: [] });
-  let issues: Issue[] = parsed.issues || [];
+  let issues: Issue[] = [];
+  let qaModelFallbackReason = "";
+  if (shouldBypassQaLlmForCompileFailures) {
+    issues = compileFailures.map((failure, idx) => ({
+      id: `BUG-COMPILE-${idx + 1}`,
+      title: `${failure.file} 编译失败`,
+      description: failure.code ? `${failure.code}: ${failure.message}` : failure.message,
+      severity: "major" as const,
+      status: "open" as const,
+      relatedFiles: [failure.file],
+      rawErrorSnippet: failure.raw,
+      detectedRound: round,
+    }));
+    qaModelFallbackReason = "检测到明确编译错误，已跳过 QA 模型深度分析。";
+    emit("thinking", "System", qaModelFallbackReason, { node: "qa", compileFailureCount: compileFailures.length });
+  }
+  try {
+    if (!issues.length) {
+      const response = await agents.qa.chat([{ role: "user", content: prompt }], (ev) => emit(ev.type, ev.sender, "正在深度审计质量问题", ev), {
+        mode: "coding",
+        workspaceDir: WORKSPACE,
+        brief: buildSystemContext(state),
+        timeoutMs: QA_MODEL_TIMEOUT_MS,
+      });
+      const parsed = parseJsonFromResponse(extractText(response.content), { issues: [] });
+      issues = parsed.issues || [];
+    }
+  } catch (error: any) {
+    qaModelFallbackReason = String(error?.message || error || "qa 模型不可用");
+    emit("thinking", "System", `QA 模型不可用，启用静态归因兜底：${qaModelFallbackReason}`, {
+      node: "qa",
+      timeoutMs: QA_MODEL_TIMEOUT_MS,
+    });
+  }
 
   // 安全网：如果 LLM 解析失败返回空数组，但验证仍未通过，必须生成兜底工单，禁止 QA 歧义放行
   if (issues.length === 0 && failureEvidence.hasBlockingFailure) {
     const existingOpen = (state.issueTracker || []).filter(i => i.status === 'open');
     if (existingOpen.length > 0) {
       issues = existingOpen;
+    } else if (compileFailures.length > 0) {
+      issues = compileFailures.map((failure, idx) => ({
+        id: `BUG-COMPILE-${idx + 1}`,
+        title: `${failure.file} 编译失败`,
+        description: failure.code
+          ? `${failure.code}: ${failure.message}`
+          : failure.message,
+        severity: "major" as const,
+        status: "open" as const,
+        relatedFiles: [failure.file],
+        rawErrorSnippet: failure.raw,
+        detectedRound: round,
+      }));
     } else if (failingTestFiles.length > 0) {
       issues = failingTestFiles.map((f, idx) => ({
         id: `BUG-AUTO-${idx + 1}`,
@@ -623,7 +730,7 @@ ${JSON.stringify(state.issueTracker || [])}
       issues = [{
         id: "BUG-DEPLOY-001",
         title: "部署连通性验证失败",
-        description: deployErrorSection || "部署健康检查失败，请检查启动日志、监听端口和容器映射。",
+        description: deployErrorSection || qaModelFallbackReason || "部署健康检查失败，请检查启动日志、监听端口和容器映射。",
         severity: "critical",
         status: "open",
         relatedFiles: [],
@@ -634,7 +741,9 @@ ${JSON.stringify(state.issueTracker || [])}
       issues = [{
         id: "BUG-QA-FALLBACK-001",
         title: "测试验证未通过",
-        description: "测试输出中存在明确失败证据，但未能自动归因到具体工单，请优先检查最新失败日志。",
+        description: qaModelFallbackReason
+          ? `测试输出中存在明确失败证据，且 QA 模型不可用（${qaModelFallbackReason}），已启用静态兜底。`
+          : "测试输出中存在明确失败证据，但未能自动归因到具体工单，请优先检查最新失败日志。",
         severity: "major",
         status: "open",
         relatedFiles: [],
@@ -644,7 +753,7 @@ ${JSON.stringify(state.issueTracker || [])}
     }
   }
 
-  const augmentedOwnership = augmentIssueOwnership(state, issues, failingTestFiles, rawUnitOutput);
+  const augmentedOwnership = augmentIssueOwnership(state, issues, failingTestFiles, rawUnitOutput, compileFailures);
   issues = augmentedOwnership.issues;
   const reopenFiles = augmentedOwnership.reopenFiles;
 
@@ -716,6 +825,7 @@ ${JSON.stringify(issues, null, 2)}
       failedFiles: Array.from(new Set([
         ...issues.filter(i => i.status === 'open').flatMap(i => i.relatedFiles),
         ...failingTestFiles,
+        ...compileFailureFiles,
         ...reopenFiles,
       ])),
       testErrors: issues.filter(i => i.status === 'open').map(i => `${i.title}: ${i.description}`),
@@ -728,7 +838,11 @@ ${JSON.stringify(issues, null, 2)}
     lastFailedNode: isDone ? "" : (deploymentFail ? "deploy" : failureEvidence.verifierFailed ? "verifier" : "qa"),
     lastFailureSummary: isDone
       ? ""
-      : (issues[0]?.title ? `${decisionLabel}：${issues[0].title}` : `${decisionLabel}：测试验证未通过`),
+      : (
+          qaModelFallbackReason
+            ? `${decisionLabel}：${issues[0]?.title || "测试验证未通过"}（QA 模型兜底：${qaModelFallbackReason}）`
+            : (issues[0]?.title ? `${decisionLabel}：${issues[0].title}` : `${decisionLabel}：测试验证未通过`)
+        ),
   };
 
   await saveBoulder({ ...state, ...result }, "qa");

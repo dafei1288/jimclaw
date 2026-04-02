@@ -27,6 +27,8 @@ export interface JimClawConfig {
     maxRetries?: number;
     workspaceDir?: string;
     enableEvolution?: boolean;
+    coderMaxParallel?: number;
+    coderExperimentalModelParallel?: boolean;
   };
 }
 

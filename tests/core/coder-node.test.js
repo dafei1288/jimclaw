@@ -4221,6 +4221,83 @@ test("coder allows compact fallback auth service to use deterministic scaffold w
   }
 });
 
+test("coder allows fallback split auth helper services to use deterministic scaffold even without compact flag", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    filesToCreate: [
+      "src/services/authAccountPolicyService.ts",
+    ],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec,
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      { endpoints: [{ method: "POST", path: "/api/auth/login" }] },
+      buildRequirementProtocol({
+        title: "图书管理系统",
+        requirements: ["需要登录认证"],
+        acceptanceCriteria: ["用户能够登录"],
+      })
+    ),
+    subTasks: [
+      {
+        id: "task-auth-account-policy-service",
+        description: "auth account policy service",
+        fileTarget: "src/services/authAccountPolicyService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({}),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const shouldNotRun = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(
+      result.codeLog.some(
+        (entry) =>
+          entry.file === "src/services/authAccountPolicyService.ts" &&
+          entry.status === "written" &&
+          entry.generationSource === "deterministic_scaffold"
+      ),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder allows fallback auth infrastructure files to use deterministic scaffold without waiting for the model", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
@@ -4662,6 +4739,170 @@ test("coder execution brief resolves task-id dependencies into file targets", as
     const brief = capturedBrief.join("\n");
     assert.match(brief, /directDependencies：package\.json/);
     assert.doesNotMatch(brief, /task-package/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder enables deterministic scaffold batch parallelization when maxParallel > 1", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const emits = [];
+  let chatCalls = 0;
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统", requirements: [], acceptanceCriteria: [] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      filesToCreate: ["package.json", "tsconfig.json"],
+      interfaces: "",
+      dependencies: { express: "^4.18.2" },
+      devDependencies: { typescript: "^5.3.3", jest: "^29.7.0", "ts-jest": "^29.1.1" },
+    },
+    subTasks: [
+      {
+        id: "task-pkg",
+        description: "write package",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+      {
+        id: "task-tsconfig",
+        description: "write tsconfig",
+        fileTarget: "tsconfig.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+    coderMaxParallel: 2,
+  });
+
+  const emit = (type, sender, content, payload) => {
+    emits.push({ type, sender, content, payload });
+  };
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const shouldNotRun = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      emit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks.every((task) => task.status === "completed"), true);
+    assert.equal(
+      result.codeLog.filter((entry) => entry.generationSource === "deterministic_scaffold").length >= 2,
+      true
+    );
+    assert.equal(
+      emits.some((item) => /启用并行批次/.test(String(item.content || ""))),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder enables experimental model batch parallelization when enabled", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const emits = [];
+  let chatCalls = 0;
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      filesToCreate: ["src/a.ts", "src/b.ts"],
+      interfaces: "",
+      dependencies: {},
+      devDependencies: {},
+    },
+    subTasks: [
+      {
+        id: "task-a",
+        description: "write a",
+        fileTarget: "src/a.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+      {
+        id: "task-b",
+        description: "write b",
+        fileTarget: "src/b.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+    coderMaxParallel: 2,
+    coderExperimentalModelParallel: true,
+  });
+
+  const emit = (type, sender, content, payload) => {
+    emits.push({ type, sender, content, payload });
+  };
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            chatCalls += 1;
+            const prompt = messages?.[0]?.content || "";
+            if (prompt.includes("src/a.ts")) {
+              return { content: "```typescript\nexport const a = 1;\n```" };
+            }
+            if (prompt.includes("src/b.ts")) {
+              return { content: "```typescript\nexport const b = 2;\n```" };
+            }
+            return { content: "```typescript\nexport const x = 0;\n```" };
+          },
+        },
+      },
+      workspace,
+      emit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 2);
+    assert.equal(result.subTasks.every((task) => task.status === "completed"), true);
+    assert.equal(
+      emits.some((item) => /实验模型并行批次/.test(String(item.content || ""))),
+      true
+    );
+    const aCode = await fs.readFile(path.join(workspace, "src/a.ts"), "utf-8");
+    const bCode = await fs.readFile(path.join(workspace, "src/b.ts"), "utf-8");
+    assert.match(aCode, /export const a = 1/);
+    assert.match(bCode, /export const b = 2/);
   } finally {
     await removeTempWorkspace(workspace);
   }

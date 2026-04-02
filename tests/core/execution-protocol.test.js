@@ -408,6 +408,44 @@ test("stabilizeSpecForExecution removes install artifacts and build outputs from
   assert.equal(nextSpec.filesToCreate.includes("tests/health.test.ts"), true);
 });
 
+test("stabilizeSpecForExecution keeps fallback auth layout compact when explicitly requested", () => {
+  const nextSpec = stabilizeSpecForExecution(
+    {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      authScaffoldMode: "compact",
+      filesToCreate: [
+        "package.json",
+        "tsconfig.json",
+        "src/index.ts",
+        "src/routes/books.ts",
+        "src/controllers/bookController.ts",
+        "src/services/bookService.ts",
+        "src/models/book.ts",
+        "src/middleware/auth.ts",
+        "src/routes/auth.ts",
+        "src/controllers/authController.ts",
+        "src/services/authService.ts",
+        "tests/books.test.ts",
+        "tests/auth.test.ts",
+      ],
+    },
+    buildRequirementProtocol({
+      title: "图书管理系统",
+      requirements: ["实现图书管理系统，包含登录鉴权"],
+      acceptanceCriteria: ["用户能够登录并访问受保护接口"],
+    })
+  );
+
+  assert.equal(nextSpec.filesToCreate.includes("src/services/authService.ts"), true);
+  assert.equal(nextSpec.filesToCreate.includes("src/services/authSessionService.ts"), false);
+  assert.equal(nextSpec.filesToCreate.includes("src/services/authCredentialService.ts"), false);
+  assert.equal(nextSpec.filesToCreate.includes("src/services/authAccountPolicyService.ts"), false);
+});
+
 test("stabilizeSpecForExecution auto-adds .dockerignore when docker artifacts are planned", () => {
   const nextSpec = stabilizeSpecForExecution(
     {

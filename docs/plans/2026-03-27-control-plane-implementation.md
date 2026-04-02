@@ -41,6 +41,18 @@
      - `resumeFromNode=env_guard`
    - 图路由将进入 `agent_pending` 结束当前会话，输出 `--resume` 指令等待恢复后继续。
 
+4. 长耗时阶段心跳快照（infra/terminal/deploy）
+   - 新增 `runWithHeartbeat` 节点工具，默认每 45s（可通过 `JIMCLAW_HEARTBEAT_INTERVAL_MS` 覆盖）写一次心跳。
+   - `infra_setup`：在 install/build 阶段写 `infra_setup_stage_*` 与 `infra_setup_heartbeat_*`。
+   - `terminal`：在测试执行阶段写 `terminal_stage_running_tests` 与 `terminal_heartbeat_running_tests`。
+   - `deploy`：在运行时启动与健康检查阶段写 `deploy_stage_*` 与 `deploy_heartbeat_*`。
+   - 结果：外层超时中断后，`boulder.json` 能反映真实子阶段，不再长期停在旧节点造成“假卡住”。
+
+5. 回归验证（2026-04-02）
+   - `node --test tests/core/infra-node.test.js tests/core/terminal-node.test.js tests/core/deploy-node.test.js`：通过（32/32）
+   - `node -e "require('./tests/core/coder-node.test.js'); require('./tests/core/server-state.test.js'); require('./tests/core/env-guard-node.test.js'); require('./tests/core/workflow-replay.test.js');"`：通过（106/106）
+   - `npx tsc --noEmit`：通过
+
 ### 推荐执行方式（真实案例）
 
 1. 前台启动一次真实任务：
@@ -51,6 +63,37 @@
    - `npx ts-node src/index.ts --approve "<workspacePath>"`
 4. 出现模型恢复挂起时：
    - `npx ts-node src/index.ts --resume "<workspacePath>"`
+
+### 2026-04-02 追加落地（QA/FixPlan 快速收敛）
+
+1. QA 超时不再阻塞主流程
+   - `qa_node` 的深度分析调用改为 `try/catch`，`AgentTimeoutError`/模型不可用时直接走静态归因兜底。
+   - 结果：避免再次进入 `agent_pending` 等待人工恢复。
+
+2. 明确编译错误时跳过 QA 深度分析
+   - 当日志中存在 `file(line,col): error TSxxxx` 等明确编译错误，QA 直接产出 `BUG-COMPILE-*`，不再先等待 45s 超时。
+   - 同时把编译失败文件强制注入 `qaFailures.failedFiles`，确保后续 `fix_plan/coder` 精准重开。
+
+3. fix_plan 增加静态快速通道
+   - 当 open issues 已全部属于静态兜底工单（`BUG-COMPILE-*`、`BUG-QA-FALLBACK-*` 等），`fix_plan` 直接生成确定性修复计划，跳过 coder/qa 双模型协商。
+   - 目标：把修复链耗时从“两次模型调用 + 超时风险”压缩为“单次规则化计划”。
+
+4. QA 失败文件路径归一化增强
+   - 新增重复前缀清洗：`workspace/run_xxx/workspace/run_xxx/...` -> 项目相对路径。
+   - 避免 QA 工具误读文件路径导致“读不到文件 -> 继续超时”。
+
+5. 新增 run 健康报告工具（run 级量化）
+   - 新增：
+     - `src/utils/run_health.ts`
+     - `scripts/run_health_report.ts`
+   - 命令：
+     - `npx ts-node scripts/run_health_report.ts workspace --limit 8`
+   - 输出指标：
+     - `status/retry/agent_pending/qa_timeout/static_fallback/open_issues/last_node/last_failure`
+
+6. 本批验证
+   - `node --test tests/core/qa-node.test.js tests/core/fix-plan-node.test.js tests/core/run-health.test.js`：通过
+   - `npx tsc --noEmit`：通过
 
 ---
 

@@ -57,6 +57,9 @@ function classifyVerifierIssue(issue: string): {
   failureType: VerifierFailureType;
   protocolType: "layout_mismatch" | "contract_drift" | "runtime_mismatch" | "test_discovery_gap" | "tooling_unavailable";
 } {
+  if (/阶段验证拒绝|降级骨架/i.test(issue)) {
+    return { failureType: "implementation_bug", protocolType: "contract_drift" };
+  }
   if (
     /缺少 package\.json|缺少 jest\.config\.cjs|运行时框架 .*devDependencies|jest: not found|npm ERR|node_modules|module not found/i.test(issue)
   ) {
@@ -76,6 +79,36 @@ function classifyVerifierIssue(issue: string): {
 
 function isInfrastructureFailureOutput(text: string): boolean {
   return /(基础设施|docker-compose|docker run|spawn EPERM|spawn ENOENT|EACCES|OCI runtime|容器未成功启动|容器 ID 为空)/i.test(String(text || ""));
+}
+
+function isPlanningFallbackActive(state: JimClawState): boolean {
+  return (
+    state.designSource === "deterministic-fallback" ||
+    state.orchestrationSource === "deterministic-fallback"
+  );
+}
+
+function isCompactAuthFallbackRuntimeScaffoldFile(state: JimClawState, fileTarget: string): boolean {
+  if (!isPlanningFallbackActive(state)) return false;
+  if (state.spec?.authScaffoldMode !== "compact") return false;
+  const normalized = normalizeNodeJestTestFilePath(fileTarget).toLowerCase();
+  return normalized === "src/services/authservice.ts";
+}
+
+function isCoreBusinessFile(state: JimClawState, fileTarget: string): boolean {
+  const role = getProtocolFileContract(state.executionProtocol, fileTarget)?.role || "other";
+  return ["entry", "route", "controller", "service", "repository", "model", "middleware"].includes(role);
+}
+
+function getLatestGenerationSource(state: JimClawState, fileTarget: string): string | undefined {
+  const normalized = normalizeNodeJestTestFilePath(fileTarget);
+  for (let index = (state.codeLog || []).length - 1; index >= 0; index -= 1) {
+    const entry = state.codeLog?.[index];
+    if (entry && normalizeNodeJestTestFilePath(entry.file) === normalized) {
+      return entry.generationSource;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -106,6 +139,17 @@ export async function verifierNode(
   const plannedFiles = filesToCreate;
   const requirementProtocol = state.requirementProtocol || state.executionProtocol?.requirements || null;
   const language = (state.spec?.language || "").toLowerCase();
+  if (stagedValidationMode && isPlanningFallbackActive(state)) {
+    const downgradedCoreFiles = activeFiles.filter(
+      (file) =>
+        isCoreBusinessFile(state, file) &&
+        getLatestGenerationSource(state, file) === "deterministic_scaffold" &&
+        !isCompactAuthFallbackRuntimeScaffoldFile(state, file)
+    );
+    for (const file of downgradedCoreFiles) {
+      issues.push(`阶段验证拒绝：核心业务文件 ${file} 仍是降级骨架产物，必须由模型重新生成后才能进入环境验证`);
+    }
+  }
   if (!state.containerId && isInfrastructureFailureOutput(`${state.testResults || ""}\n${state.lastFailureSummary || ""}\n${state.blockedReason || ""}`)) {
     const issue = state.testResults || state.lastFailureSummary || "[Verifier] 基础设施未就绪，跳过静态预检";
     const validationReport = buildValidationReport(

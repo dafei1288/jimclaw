@@ -17,8 +17,10 @@ export function buildServerAutoApprove(autoApprove?: ApprovalAutoApprove) {
 export function createBaseGraphState(
   userGoal: string,
   maxRetries: number,
-  autoApprove?: ApprovalAutoApprove
+  autoApprove?: ApprovalAutoApprove,
+  executionTuning?: { coderMaxParallel?: number; coderExperimentalModelParallel?: boolean }
 ) {
+  const coderMaxParallel = Number(executionTuning?.coderMaxParallel || 1);
   return {
     userGoal,
     messages: [],
@@ -27,9 +29,12 @@ export function createBaseGraphState(
     maxRetries,
     isDone: false,
     contract: null,
+    contractSource: "model",
     spec: null,
+    designSource: "model",
     manifest: null,
     subTasks: [],
+    orchestrationSource: "model",
     code: "",
     testResults: "",
     qaFailures: null,
@@ -46,6 +51,8 @@ export function createBaseGraphState(
       autoApprove: buildServerAutoApprove(autoApprove),
     }),
     executorState: null,
+    coderMaxParallel: Number.isFinite(coderMaxParallel) ? Math.max(1, Math.min(4, Math.floor(coderMaxParallel))) : 1,
+    coderExperimentalModelParallel: Boolean(executionTuning?.coderExperimentalModelParallel),
     requiresApproval: false,
     pendingApprovalStage: null,
     pendingApprovalTicketId: "",
@@ -56,8 +63,10 @@ export function createBaseGraphState(
 export function createServerInitialSession(
   userGoal: string,
   maxRetries: number,
-  autoApprove?: ApprovalAutoApprove
+  autoApprove?: ApprovalAutoApprove,
+  executionTuning?: { coderMaxParallel?: number; coderExperimentalModelParallel?: boolean }
 ) {
+  const coderMaxParallel = Number(executionTuning?.coderMaxParallel || 1);
   return {
     userGoal,
     status: "Running",
@@ -72,8 +81,11 @@ export function createServerInitialSession(
     events: [],
     deployment: { status: "none", url: null },
     contract: null,
+    contractSource: "model",
     spec: null,
+    designSource: "model",
     subTasks: [],
+    orchestrationSource: "model",
     testResults: "",
     qaFailures: null,
     issueTracker: [],
@@ -93,6 +105,8 @@ export function createServerInitialSession(
       autoApprove: buildServerAutoApprove(autoApprove),
     }),
     executorState: null,
+    coderMaxParallel: Number.isFinite(coderMaxParallel) ? Math.max(1, Math.min(4, Math.floor(coderMaxParallel))) : 1,
+    coderExperimentalModelParallel: Boolean(executionTuning?.coderExperimentalModelParallel),
     requiresApproval: false,
     pendingApprovalStage: null,
     pendingApprovalTicketId: "",

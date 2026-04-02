@@ -6,6 +6,7 @@ import { resolvePreferredBackend } from "../../executor/backend_resolver";
 import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
 import { ExecutorResult } from "../../executor/types";
 import { createLocalShellAdapter } from "../../skills/shell_exec";
+import { runWithHeartbeat } from "../node_heartbeat";
 
 function isRetryableTerminalExecFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
@@ -129,6 +130,24 @@ export async function terminalNode(
   const testCmd = state.spec?.testCommand || "npm test";
   const executionBackend = state.executionBackend || "docker";
   const commandExecutor = deps?.commandExecutor || createTerminalExecutor(state);
+  const buildHeartbeatState = (stage: string) => ({
+    ...state,
+    blockedReason: stage,
+    runtimeStateSnapshot: {
+      version: "v1" as const,
+      envReady: Boolean(state.envReady),
+      hostDepsReady: Boolean(state.envReady),
+      testRuntimeReady: true,
+      deployRuntimeReady: Boolean(state.containerId || state.executionBackend === "host"),
+      executionBackend: executionBackend as "docker" | "host",
+      containerId: state.containerId || undefined,
+      hostPort: state.allocatedHostPort || undefined,
+      containerPort: state.manifest?.services?.[0]?.port,
+      deploymentUrl: state.deploymentStatus?.url,
+      runtimePid: state.hostRuntimePid || undefined,
+      tokenUsage: state.runtimeStateSnapshot?.tokenUsage,
+    },
+  });
   
   await AuditLogger.log(
     WORKSPACE,
@@ -162,11 +181,18 @@ export async function terminalNode(
     requiresApproval: false,
     blocked: false,
   };
+  await saveBoulder(buildHeartbeatState("terminal_running_tests"), "terminal_stage_running_tests");
   for (let attempt = 0; attempt < 2; attempt++) {
-    result = await commandExecutor.executeIntent({
-      kind: "run_tests",
-      workspace: WORKSPACE,
-      command: executionBackend === "host" ? testCmd : `NODE_ENV=test ${testCmd}`,
+    result = await runWithHeartbeat({
+      run: async () =>
+        commandExecutor.executeIntent({
+          kind: "run_tests",
+          workspace: WORKSPACE,
+          command: executionBackend === "host" ? testCmd : `NODE_ENV=test ${testCmd}`,
+        }),
+      onHeartbeat: async () => {
+        await saveBoulder(buildHeartbeatState("terminal_running_tests"), "terminal_heartbeat_running_tests");
+      },
     });
 
     if (attempt === 0 && (result.retryable || isRetryableTerminalExecFailure(result.stderr || result.stdout))) {

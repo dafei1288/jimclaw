@@ -208,3 +208,55 @@ test("terminal maps blocked executor failures to environment gaps instead of ord
     await removeTempWorkspace(workspace);
   }
 });
+
+test("terminal emits heartbeat snapshots while tests are running", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHeartbeat = process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+
+  process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = "5";
+  try {
+    await terminalNode(
+      createBaseState({
+        executionBackend: "host",
+        spec: {
+          language: "TypeScript",
+          testCommand: "npm test",
+          filesToCreate: [],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save,
+      {
+        commandExecutor: {
+          executeIntent: async () => {
+            await new Promise((resolve) => setTimeout(resolve, 25));
+            return {
+              ok: true,
+              backend: "local_shell",
+              stdout: "PASS tests/setup.test.ts",
+              stderr: "",
+              retryable: false,
+              requiresApproval: false,
+              blocked: false,
+            };
+          },
+        },
+      }
+    );
+
+    const nodes = recorder.snapshots.map((item) => item.node);
+    assert.equal(nodes.includes("terminal_stage_running_tests"), true);
+    assert.equal(nodes.some((node) => node === "terminal_heartbeat_running_tests"), true);
+  } finally {
+    if (originalHeartbeat === undefined) {
+      delete process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS;
+    } else {
+      process.env.JIMCLAW_HEARTBEAT_INTERVAL_MS = originalHeartbeat;
+    }
+    await removeTempWorkspace(workspace);
+  }
+});
