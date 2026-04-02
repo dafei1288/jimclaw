@@ -5,8 +5,8 @@ import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeout
 import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const FIX_PLAN_CODER_TIMEOUT_MS = 20000;
-const FIX_PLAN_QA_TIMEOUT_MS = 15000;
+const FIX_PLAN_CODER_TIMEOUT_MS = 45000;
+const FIX_PLAN_QA_TIMEOUT_MS = 30000;
 
 function isRecoverableFixPlanError(error: any): boolean {
   if (

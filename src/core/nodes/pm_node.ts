@@ -1,6 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, TaskContractSchema, ConsensusCore } from "../graph_types";
+import { JimClawState, TaskContractSchema, ConsensusCore, PlanningSource } from "../graph_types";
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import {
   logPrefix,
@@ -11,7 +11,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const PM_MODEL_TIMEOUT_MS = 15000;
+const PM_MODEL_TIMEOUT_MS = 45000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (
@@ -113,7 +113,7 @@ export async function pmNode(
   emit("thinking", agents.pm.getPersona().name, "正在根据用户目标起草任务契约...");
 
   const goal = state.userGoal || "一个简单的计数器应用";
-  let contractSource = "model";
+  let contractSource: PlanningSource = "model";
   let responseContent = "";
   try {
     const response = await agents.pm.chat([
@@ -187,6 +187,7 @@ export async function pmNode(
 
   const result = {
     contract,
+    contractSource,
     requirementProtocol,
     customerApprovalState,
     consensusCore,

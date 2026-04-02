@@ -1,5 +1,5 @@
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
-import { ConsensusProgress, JimClawState } from "../graph_types";
+import { ConsensusProgress, JimClawState, PlanningSource } from "../graph_types";
 import {
   buildExecutionPlan,
   buildExecutionProtocol,
@@ -15,7 +15,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const ORCHESTRATOR_MODEL_TIMEOUT_MS = 10000;
+const ORCHESTRATOR_MODEL_TIMEOUT_MS = 45000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (
@@ -70,6 +70,7 @@ ${JSON.stringify(executionProtocol, null, 2)}
 直接输出 JSON 数组，不要额外解释。`;
 
   let rawSubTasks: any[] = [];
+  let orchestrationSource: PlanningSource = "model";
   try {
     const response = await agents.pm.chat(
       [{ role: "user", content: orchestratorPrompt }],
@@ -85,6 +86,7 @@ ${JSON.stringify(executionProtocol, null, 2)}
     if (!isRecoverableAgentError(error)) throw error;
     emit("thinking", "System", `任务拆解模型暂不可用，改用确定性子任务骨架继续执行：${error.message || error}`, {});
     rawSubTasks = generateFallbackSubTasks(spec, state.apiContract);
+    orchestrationSource = "deterministic-fallback";
   }
   const filesToCreate = spec?.filesToCreate || [];
   const createdInTasks = rawSubTasks.map((task: any) => task.fileTarget);
@@ -92,6 +94,7 @@ ${JSON.stringify(executionProtocol, null, 2)}
 
   if (rawSubTasks.length === 0 || (missingFiles.length > 0 && filesToCreate.length > 0)) {
     rawSubTasks = generateFallbackSubTasks(spec, state.apiContract);
+    orchestrationSource = "deterministic-fallback";
   }
 
   const subTasks = rawSubTasks.map((task: any) => ({
@@ -203,6 +206,9 @@ ${JSON.stringify(executionProtocol, null, 2)}
   const summary = `拆解为 ${subTasks.length} 个子任务：${fileList}${planningGaps.length > 0 ? `，缺口${planningGaps.length}项` : ""}`;
   const fullContent = `# 任务拆解纪要
 
+## 来源
+- ${orchestrationSource === "model" ? "模型生成" : "确定性降级骨架"}
+
 ## 子任务列表
 \`\`\`json
 ${JSON.stringify(subTasks, null, 2)}
@@ -222,6 +228,7 @@ ${JSON.stringify(validationReport, null, 2)}
 
   const result = {
     subTasks,
+    orchestrationSource,
     manifest: updatedManifest,
     requirementProtocol,
     executionPlan,

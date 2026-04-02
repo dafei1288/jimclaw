@@ -10,6 +10,41 @@
 
 ---
 
+## 2026-04-02 增量落地（真实回放稳定性）
+
+### 已落地
+
+1. 关键节点模型超时预算上调（减少误触发降级/阻塞）
+   - `pm`: 15s -> 45s
+   - `architect`: 20s -> 60s
+   - `architect(readme)`: 10s -> 30s
+   - `orchestrator`: 10s -> 45s
+   - `contract_sync`: 10s -> 30s
+   - `qa`: 15s -> 45s
+   - `fix_plan(coder)`: 20s -> 45s
+   - `fix_plan(qa)`: 15s -> 30s
+   - `architect_mediation`: 15s -> 45s
+
+2. CLI 新增 run 观测能力（跨长时任务）
+   - `--watch <workspacePath>`：轮询指定 run 的 `boulder.json`，输出节点/进度变化，直到终态（done / 待授权 / 待恢复 / 明确失败）。
+   - `--watch-latest`：自动选择最新 `run_*` 目录进行同样的终态观测。
+   - 支持参数：
+     - `--interval-ms`（默认 3000）
+     - `--max-wait-ms`（默认 1800000，即 30 分钟）
+
+### 推荐执行方式（真实案例）
+
+1. 前台启动一次真实任务：
+   - `npx ts-node src/index.ts --auto-approve all "图书管理系统"`
+2. 如前台会话受外部时限影响，改用观察命令持续追踪：
+   - `npx ts-node src/index.ts --watch-latest`
+3. 出现待确认挂起时（非阻塞设计）：
+   - `npx ts-node src/index.ts --approve "<workspacePath>"`
+4. 出现模型恢复挂起时：
+   - `npx ts-node src/index.ts --resume "<workspacePath>"`
+
+---
+
 ### Task 1: 补齐控制平面类型
 
 **Files:**

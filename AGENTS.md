@@ -14,6 +14,10 @@ npx ts-node src/tui.ts "your task description"
 # Run standard CLI session
 npx ts-node src/index.ts "your task description"
 
+# Watch a run until terminal state (done / pending approval / recovery / failure)
+npx ts-node src/index.ts --watch "<workspace/run_xxx>"
+npx ts-node src/index.ts --watch-latest
+
 # Run web dashboard (served at http://localhost:3000)
 npx ts-node src/server.ts
 

@@ -53,6 +53,123 @@ export function parseAutoApproveArg(raw?: string | null) {
   return result;
 }
 
+export interface RunSnapshotSummary {
+  workspacePath: string;
+  node: string;
+  isDone: boolean;
+  completedSubTasks: number;
+  totalSubTasks: number;
+  requiresApproval: boolean;
+  pendingApprovalStage?: string;
+  agentRecoveryPending: boolean;
+  deploymentStatus?: string;
+  lastFailedNode?: string;
+  lastFailureSummary?: string;
+}
+
+export function summarizeRunSnapshot(workspacePath: string, snapshot: any): RunSnapshotSummary {
+  const state = snapshot?.state || {};
+  const subTasks = Array.isArray(state.subTasks) ? state.subTasks : [];
+  const completedSubTasks = subTasks.filter((task: any) => task?.status === "completed").length;
+  return {
+    workspacePath,
+    node: String(snapshot?.node || ""),
+    isDone: state.isDone === true,
+    completedSubTasks,
+    totalSubTasks: subTasks.length,
+    requiresApproval: state.requiresApproval === true,
+    pendingApprovalStage: state.pendingApprovalStage || "",
+    agentRecoveryPending: state.agentRecoveryPending === true,
+    deploymentStatus: state.deploymentStatus?.status || "",
+    lastFailedNode: state.lastFailedNode || "",
+    lastFailureSummary: state.lastFailureSummary || "",
+  };
+}
+
+export function isRunTerminal(summary: RunSnapshotSummary): boolean {
+  if (summary.isDone) return true;
+  if (summary.requiresApproval) return true;
+  if (summary.agentRecoveryPending) return true;
+  if (summary.deploymentStatus === "failed") return true;
+  if (summary.lastFailedNode && summary.lastFailureSummary) return true;
+  return false;
+}
+
+async function resolveLatestRunPath(): Promise<string> {
+  const workspaceDir = path.join(process.cwd(), "workspace");
+  const entries = await fs.readdir(workspaceDir, { withFileTypes: true });
+  const runDirs = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run_"))
+    .map((entry) => path.join(workspaceDir, entry.name));
+  if (!runDirs.length) {
+    throw new Error("workspace 下没有可观察的 run_* 目录。");
+  }
+  const sorted = await Promise.all(
+    runDirs.map(async (dir) => ({
+      dir,
+      stat: await fs.stat(dir),
+      hasSnapshot: await fs.access(path.join(dir, "boulder.json")).then(() => true).catch(() => false),
+    }))
+  );
+  sorted.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+  const withSnapshot = sorted.find((item) => item.hasSnapshot);
+  return (withSnapshot || sorted[0]).dir;
+}
+
+async function watchRun(workspacePath: string, options?: { intervalMs?: number; maxWaitMs?: number }) {
+  const intervalMs = Math.max(500, Number(options?.intervalMs || 3000));
+  const maxWaitMs = Math.max(intervalMs, Number(options?.maxWaitMs || 30 * 60 * 1000));
+  const startedAt = Date.now();
+  let lastKey = "";
+
+  while (Date.now() - startedAt <= maxWaitMs) {
+    let snapshot: any;
+    try {
+      snapshot = await loadCurrentWorkspaceState(workspacePath);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") {
+        console.log(`[watch] 等待快照文件生成: ${workspacePath}\\boulder.json`);
+        await new Promise((resolve) => setTimeout(resolve, intervalMs));
+        continue;
+      }
+      throw error;
+    }
+    const summary = summarizeRunSnapshot(workspacePath, snapshot);
+    const key = [
+      summary.node,
+      summary.completedSubTasks,
+      summary.totalSubTasks,
+      summary.lastFailedNode,
+      summary.lastFailureSummary,
+      summary.requiresApproval,
+      summary.pendingApprovalStage,
+      summary.agentRecoveryPending,
+      summary.isDone,
+      summary.deploymentStatus,
+    ].join("|");
+
+    if (key !== lastKey) {
+      lastKey = key;
+      console.log(
+        `[watch] node=${summary.node} progress=${summary.completedSubTasks}/${summary.totalSubTasks} ` +
+        `done=${summary.isDone} approval=${summary.requiresApproval ? summary.pendingApprovalStage || "pending" : "none"} ` +
+        `recovery=${summary.agentRecoveryPending} failedNode=${summary.lastFailedNode || "-"}`
+      );
+      if (summary.lastFailureSummary) {
+        console.log(`[watch] failure=${summary.lastFailureSummary}`);
+      }
+    }
+
+    if (isRunTerminal(summary)) {
+      console.log(`[watch] 终态已到达: ${summary.workspacePath}`);
+      process.exitCode = computeSessionExitCode(snapshot.state || {});
+      return;
+    }
+    await new Promise((resolve) => setTimeout(resolve, intervalMs));
+  }
+  throw new Error(`watch 超时（>${maxWaitMs}ms），尚未观测到终态。workspace=${workspacePath}`);
+}
+
 function markApprovalApprovedForResume(state: any, stage: "requirements" | "solution" | "deploy") {
   const customerApprovalState = state?.customerApprovalState;
   if (!customerApprovalState?.checkpoints) {
@@ -167,6 +284,20 @@ async function main() {
     console.log(`\n--- Resume Completed ---`);
     console.log("Final Code Content:", finalState.code);
     process.exitCode = computeSessionExitCode(finalState);
+    return;
+  }
+
+  if (args[0] === "--watch" || args[0] === "--watch-latest") {
+    const intervalIndex = args.indexOf("--interval-ms");
+    const maxWaitIndex = args.indexOf("--max-wait-ms");
+    const intervalMs = intervalIndex >= 0 ? Number(args[intervalIndex + 1] || 0) : undefined;
+    const maxWaitMs = maxWaitIndex >= 0 ? Number(args[maxWaitIndex + 1] || 0) : undefined;
+    const workspacePath = args[0] === "--watch-latest" ? await resolveLatestRunPath() : args[1];
+    if (!workspacePath) {
+      throw new Error("用法: npx ts-node src/index.ts --watch <workspacePath> [--interval-ms 3000] [--max-wait-ms 1800000]");
+    }
+    console.log(`🔎 观察 run 状态: ${workspacePath}`);
+    await watchRun(workspacePath, { intervalMs, maxWaitMs });
     return;
   }
 

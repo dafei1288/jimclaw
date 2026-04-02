@@ -3,7 +3,7 @@ import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeout
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 import { applyProtocolPatches, buildSystemContext, buildProtocolPatchesForFixPlan, writeMeetingNote } from "../logic_utils";
 
-const ARCHITECT_MEDIATION_TIMEOUT_MS = 15000;
+const ARCHITECT_MEDIATION_TIMEOUT_MS = 45000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (

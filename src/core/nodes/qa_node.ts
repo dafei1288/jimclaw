@@ -12,7 +12,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const QA_MODEL_TIMEOUT_MS = 15000;
+const QA_MODEL_TIMEOUT_MS = 45000;
 
 /**
  * QA 节点：负责测试结果分析、定级并更新 IssueTracker

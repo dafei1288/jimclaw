@@ -1,7 +1,7 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
-import { ConsensusCore, ConsensusProgress, JimClawState, TechSpecSchema } from "../graph_types";
+import { ConsensusCore, ConsensusProgress, JimClawState, PlanningSource, TechSpecSchema } from "../graph_types";
 import {
   buildCustomerApprovalState,
   buildExecutionProtocol,
@@ -20,8 +20,8 @@ import { extractText, parseJsonFromResponse } from "../../utils/common";
 import { getTemplateEngine } from "../template_engine";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 
-const ARCHITECT_MODEL_TIMEOUT_MS = 20000;
-const ARCHITECT_README_TIMEOUT_MS = 10000;
+const ARCHITECT_MODEL_TIMEOUT_MS = 60000;
+const ARCHITECT_README_TIMEOUT_MS = 30000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (
@@ -78,6 +78,7 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
     testCommand: "npm test",
     runCommand: "npm start",
     entryPoint: "src/index.ts",
+    authScaffoldMode: "compact",
     filesToCreate,
     interfaces: "REST API",
     dependencies: {
@@ -197,7 +198,7 @@ export async function architectNode(
   let manifest: any;
   let apiContract: any;
   let readmeContent = "";
-  let designSource = "model";
+  let designSource: PlanningSource = "model";
 
   try {
     const response = await agents.architect.chat(
@@ -422,6 +423,7 @@ ${JSON.stringify(validationReport, null, 2)}
 
   const result = {
     templateId: template?.id,
+    designSource,
     spec,
     manifest,
     apiContract,

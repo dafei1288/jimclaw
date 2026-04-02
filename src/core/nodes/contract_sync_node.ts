@@ -7,7 +7,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const CONTRACT_SYNC_MODEL_TIMEOUT_MS = 10000;
+const CONTRACT_SYNC_MODEL_TIMEOUT_MS = 30000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (
