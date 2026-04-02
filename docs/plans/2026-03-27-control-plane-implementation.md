@@ -32,6 +32,15 @@
      - `--interval-ms`（默认 3000）
      - `--max-wait-ms`（默认 1800000，即 30 分钟）
 
+3. EnvGuard 宿主阻塞语义改为“可恢复挂起”
+   - 当执行控制面判断 `install_deps` 没有可用 backend（例如 `spawn EPERM`）时，
+     不再走 QA -> post_mortem 直接失败终止。
+   - 现在会标记：
+     - `agentRecoveryPending=true`
+     - `agentRecoveryNode=env_guard`
+     - `resumeFromNode=env_guard`
+   - 图路由将进入 `agent_pending` 结束当前会话，输出 `--resume` 指令等待恢复后继续。
+
 ### 推荐执行方式（真实案例）
 
 1. 前台启动一次真实任务：

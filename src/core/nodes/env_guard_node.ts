@@ -558,9 +558,14 @@ export async function envGuardNode(
           ...failurePatch,
           envReady: false,
           blockedReason: reason,
+          requiresApproval: false,
           repairLedger: ledger,
           executionBackend: selectedBackend,
           executorState,
+          agentRecoveryPending: true,
+          agentRecoveryNode: "env_guard",
+          agentRecoveryReason: executorBlockedReason,
+          resumeFromNode: "env_guard",
         },
         "env_guard_host_blocked"
       );
@@ -569,9 +574,14 @@ export async function envGuardNode(
         ...failurePatch,
         envReady: false,
         blockedReason: reason,
+        requiresApproval: false,
         repairLedger: ledger,
         executionBackend: selectedBackend,
         executorState,
+        agentRecoveryPending: true,
+        agentRecoveryNode: "env_guard",
+        agentRecoveryReason: executorBlockedReason,
+        resumeFromNode: "env_guard",
         testResults: `${state.testResults || ""}\n${reason}\n${truncateForLog(executorBlockedReason)}`.trim(),
       };
     }

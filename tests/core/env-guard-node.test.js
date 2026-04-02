@@ -472,6 +472,10 @@ test("env guard blocks host backend early when local shell execution capability 
     assert.equal(result.envReady, false);
     assert.match(result.blockedReason || "", /宿主环境阻塞/);
     assert.match(result.lastFailureSummary || "", /宿主环境阻塞/);
+    assert.equal(result.agentRecoveryPending, true);
+    assert.equal(result.agentRecoveryNode, "env_guard");
+    assert.equal(result.resumeFromNode, "env_guard");
+    assert.match(result.agentRecoveryReason || "", /no backend available|spawn EPERM/i);
     assert.equal(calls.some((command) => /docker version|jimclaw-host-probe|executor-shell-probe/i.test(command)), false);
     assert.equal(recorder.snapshots.at(-1).node, "env_guard_host_blocked");
   } finally {
