@@ -16,6 +16,20 @@ import {
 } from "../logic_utils";
 import { extractText, extractCodeFromResponse } from "../../utils/common";
 
+function isNodeLikeLanguage(language?: string): boolean {
+  const normalized = String(language || "").toLowerCase();
+  return /typescript|javascript|node/.test(normalized);
+}
+
+async function hasWorkspaceNodeModules(workspace: string): Promise<boolean> {
+  try {
+    await fs.access(path.join(workspace, "node_modules"));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function isUiLikeFile(fileTarget: string): boolean {
   const normalized = String(fileTarget || "").replace(/\\/g, "/").toLowerCase();
   return normalized.startsWith("public/") || normalized.endsWith(".html");
@@ -44,6 +58,69 @@ function isPeripheralFile(fileTarget: string): boolean {
     normalized.endsWith("docker-compose.yml") ||
     normalized.startsWith("scripts/")
   );
+}
+
+function isPlanningFallbackActive(state: JimClawState): boolean {
+  return (
+    state.designSource === "deterministic-fallback" ||
+    state.orchestrationSource === "deterministic-fallback"
+  );
+}
+
+function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return (
+    normalized === "package.json" ||
+    normalized === "tsconfig.json" ||
+    /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(normalized) ||
+    normalized === "tests/setup.test.ts" ||
+    normalized === ".env.example" ||
+    normalized === ".dockerignore" ||
+    normalized === "dockerfile" ||
+    normalized.endsWith("docker-compose.yml") ||
+    normalized === "public/index.html" ||
+    (normalized.startsWith("tests/") && /\.test\.[^.]+$/i.test(normalized)) ||
+    normalized === "readme.md" ||
+    /^scripts\/verify\.[^.]+$/i.test(normalized) ||
+    normalized === "src/errors.ts" ||
+    normalized === "src/logging/logger.ts" ||
+    normalized === "src/logger.ts" ||
+    normalized === "src/middleware/logger.ts" ||
+    normalized === "src/middleware/auth.ts" ||
+    normalized === "src/controllers/authcontroller.ts" ||
+    normalized === "src/routes/auth.ts"
+  );
+}
+
+function isCompactAuthFallbackRuntimeScaffoldFile(state: JimClawState, fileTarget: string): boolean {
+  if (!isPlanningFallbackActive(state)) return false;
+  if (state.spec?.authScaffoldMode !== "compact") return false;
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return normalized === "src/services/authservice.ts";
+}
+
+function isAcceptedFallbackValidationArtifact(state: JimClawState, fileTarget: string, generationSource?: string): boolean {
+  if (generationSource !== "deterministic_scaffold") return true;
+  return isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget);
+}
+
+function isValidationCoreFile(state: JimClawState, fileTarget: string): boolean {
+  const role = getCheckpointRole(state, fileTarget);
+  return ["entry", "route", "controller", "service", "repository", "model", "middleware"].includes(role);
+}
+
+function getLatestFileChangeEntry(
+  entries: FileChangeEntry[],
+  fileTarget: string
+): FileChangeEntry | undefined {
+  const normalized = normalizeTaskFileTarget(fileTarget);
+  for (let index = entries.length - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (normalizeTaskFileTarget(entry.file) === normalized) {
+      return entry;
+    }
+  }
+  return undefined;
 }
 
 function getReopenedFileTargets(state: JimClawState): Set<string> {
@@ -132,6 +209,19 @@ function isAgentTimeoutError(error: any): boolean {
   );
 }
 
+function eventContainsExtractableCode(event: any): boolean {
+  const candidates = [
+    event?.response,
+    event?.content,
+    event?.metadata?.response,
+    event?.metadata?.content,
+  ];
+  return candidates.some((candidate) => {
+    if (typeof candidate !== "string" || !candidate.includes("```")) return false;
+    return extractCodeFromResponse(candidate).isValid;
+  });
+}
+
 async function invokeCoderWithTaskTimeout(args: {
   agent: {
     chat: (
@@ -157,11 +247,15 @@ async function invokeCoderWithTaskTimeout(args: {
   try {
     const wrappedOnEvent = (event: any) => {
       const contentStr = String(event?.content || "");
-      if (!firstWriteObserved && event?.tool === "write_file" && contentStr.includes("Successfully wrote")) {
-        firstWriteObserved = true;
-        if (firstWriteHandle) {
-          clearTimeout(firstWriteHandle);
-          firstWriteHandle = null;
+      if (!firstWriteObserved) {
+        const wroteFile = event?.tool === "write_file" && contentStr.includes("Successfully wrote");
+        const emittedCompleteCode = eventContainsExtractableCode(event);
+        if (wroteFile || emittedCompleteCode) {
+          firstWriteObserved = true;
+          if (firstWriteHandle) {
+            clearTimeout(firstWriteHandle);
+            firstWriteHandle = null;
+          }
         }
       }
       args.onEvent(event);
@@ -233,7 +327,11 @@ function hasCompletedFile(subTasks: Array<{ fileTarget: string; status: string }
   return subTasks.some((task) => task.fileTarget.replace(/\\/g, "/") === expected && task.status === "completed");
 }
 
-function shouldRequestValidationCheckpoint(state: JimClawState, subTasks: Array<{ fileTarget: string; status: string }>): {
+function shouldRequestValidationCheckpoint(
+  state: JimClawState,
+  subTasks: Array<{ fileTarget: string; status: string }>,
+  pendingCodeLogEntries: FileChangeEntry[] = []
+): {
   requested: boolean;
   reason: string;
 } {
@@ -265,6 +363,22 @@ function shouldRequestValidationCheckpoint(state: JimClawState, subTasks: Array<
 
   for (const role of requiredRoles) {
     if (!completedRoles.has(role)) return { requested: false, reason: "" };
+  }
+
+  if (isPlanningFallbackActive(state)) {
+    const combinedCodeLog = [...(state.codeLog || []), ...pendingCodeLogEntries];
+    const validatedRoles = new Set(
+      completedTasks
+        .filter((task) => isValidationCoreFile(state, task.fileTarget))
+        .filter((task) => {
+          const latest = getLatestFileChangeEntry(combinedCodeLog, task.fileTarget);
+          return latest?.status === "written" && isAcceptedFallbackValidationArtifact(state, task.fileTarget, latest.generationSource);
+        })
+        .map((task) => getCheckpointRole(state, task.fileTarget))
+    );
+    for (const role of requiredRoles) {
+      if (!validatedRoles.has(role)) return { requested: false, reason: "" };
+    }
   }
 
   return {
@@ -558,7 +672,6 @@ function getFocusedContextFiles(
   task: { fileTarget: string; dependencies?: string[] },
   filesContent: Record<string, string>
 ): string[] {
-  const availableFiles = Object.keys(filesContent);
   const focused = new Set<string>();
 
   for (const dependency of task.dependencies || []) {
@@ -568,28 +681,32 @@ function getFocusedContextFiles(
     }
   }
 
-  if (!isTestFile(task.fileTarget)) {
-    return Array.from(focused);
-  }
-
-  const normalizedTarget = task.fileTarget.replace(/\\/g, "/");
-  const fileName = path.basename(normalizedTarget).replace(/(\.test|\.spec)\.[^.]+$/i, "");
-  const domainStem = fileName.replace(/(controller|service|route|routes|middleware)$/i, "");
-
-  for (const candidate of availableFiles) {
-    const normalizedCandidate = candidate.replace(/\\/g, "/");
-    const candidateBaseName = path.basename(normalizedCandidate, path.extname(normalizedCandidate));
-    if (candidateBaseName === fileName) {
-      focused.add(normalizedCandidate);
-      continue;
-    }
-
-    if (domainStem && candidateBaseName === domainStem) {
-      focused.add(normalizedCandidate);
-    }
-  }
-
   return Array.from(focused);
+}
+
+function buildFocusedContextSnippets(
+  task: { fileTarget: string },
+  files: string[],
+  filesContent: Record<string, string>
+): Array<{ file: string; content: string; truncated: boolean }> {
+  const isTest = isTestFile(task.fileTarget);
+  const maxPerFile = isTest ? 3000 : 8000;
+  const maxTotal = isTest ? 12000 : 24000;
+  const snippets: Array<{ file: string; content: string; truncated: boolean }> = [];
+  let remaining = maxTotal;
+
+  for (const file of files) {
+    if (remaining <= 0) break;
+    const source = filesContent[file] || "";
+    if (!source) continue;
+    const limit = Math.min(maxPerFile, remaining);
+    const truncated = source.length > limit;
+    const content = truncated ? source.slice(0, limit) : source;
+    snippets.push({ file, content, truncated });
+    remaining -= content.length;
+  }
+
+  return snippets;
 }
 
 function singularizeStem(value: string): string {
@@ -677,8 +794,21 @@ function buildRelevantApiContract(task: { fileTarget: string }, state: JimClawSt
     }
   }
 
+  const role = getProtocolFileContract(state.executionProtocol, normalizedTarget)?.role || "other";
+  const maxEndpointsByRole: Record<string, number> = {
+    service: 6,
+    controller: 8,
+    route: 8,
+    middleware: 8,
+    entry: 10,
+    test: 10,
+    other: 6,
+  };
+  const maxEndpoints = maxEndpointsByRole[role] || maxEndpointsByRole.other;
   const compactContract = {
-    endpoints: relevantEndpoints.map((endpoint) => summarizeApiEndpoint(endpoint)),
+    endpoints: relevantEndpoints
+      .slice(0, maxEndpoints)
+      .map((endpoint) => summarizeApiEndpoint(endpoint)),
   };
   return JSON.stringify(compactContract, null, 2);
 }
@@ -834,7 +964,13 @@ function validateProtocolDependencyRoles(
 
     const dependencyContract = getProtocolFileContract(protocol, targetFile);
     if (!dependencyContract) continue;
-    if (!currentContract.allowedDependencyRoles.includes(dependencyContract.role)) {
+    const allowAggregateServiceHelperDependency =
+      currentContract.role === "service" &&
+      dependencyContract.role === "service" &&
+      isAggregateExecutionServiceFile(fileTarget) &&
+      !isAggregateExecutionServiceFile(targetFile) &&
+      getExecutionDependencyStem(fileTarget) === getExecutionDependencyStem(targetFile);
+    if (!allowAggregateServiceHelperDependency && !currentContract.allowedDependencyRoles.includes(dependencyContract.role)) {
       errors.push(`${fileTarget}(${currentContract.role}) 不允许依赖 ${targetFile}(${dependencyContract.role})`);
     }
   }
@@ -916,6 +1052,7 @@ async function reconcileCompletedFilesFromDisk(
         file: task.fileTarget,
         taskTitle: task.description.slice(0, 80),
         status: "written",
+        generationSource: "recovered_disk",
       });
     }
   }
@@ -939,6 +1076,10 @@ export async function coderNode(
   const subTasks = state.subTasks || [];
   const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
   const codeLogEntries: FileChangeEntry[] = [];
+  const nodeModulesReady = isNodeLikeLanguage(state.spec?.language)
+    ? await hasWorkspaceNodeModules(WORKSPACE)
+    : true;
+  const skipPerFileQualityChecks = isNodeLikeLanguage(state.spec?.language) && !nodeModulesReady;
   let blockedReason = "";
   let blockedFailedFiles: string[] = [];
   let validationCheckpointRequested = false;
@@ -958,6 +1099,15 @@ export async function coderNode(
       }
     }
   }
+
+  await reconcileCompletedFilesFromDisk(
+    WORKSPACE,
+    subTasks as any,
+    filesContent,
+    codeLogEntries,
+    currentRetry,
+    state.executionProtocol
+  );
 
   normalizeStructuralDependencies(subTasks as any);
   let progressMade = true;
@@ -1007,8 +1157,13 @@ export async function coderNode(
       const completedFiles = Object.keys(filesContent);
       const focusedContextFiles = getFocusedContextFiles(task, filesContent);
       if (shouldUseFocusedContext(task) && focusedContextFiles.length > 0) {
+        const focusedSnippets = buildFocusedContextSnippets(task, focusedContextFiles, filesContent);
         prompt += `\n\n[测试文件直连上下文 - 只允许优先使用这些已完成文件，不要反复读取其他已完成文件]\n${focusedContextFiles.map(f => `- ${f}`).join("\n")}`;
-        prompt += `\n\n[测试文件直连上下文内容]\n${focusedContextFiles.map(f => `### ${f}\n\`\`\`\n${filesContent[f]}\n\`\`\``).join("\n\n")}`;
+        prompt += `\n\n[测试文件直连上下文内容]\n${focusedSnippets
+          .map((snippet) =>
+            `### ${snippet.file}\n\`\`\`\n${snippet.content}${snippet.truncated ? "\n/* ...上下文已截断，按依赖契约继续实现 */" : ""}\n\`\`\``
+          )
+          .join("\n\n")}`;
         prompt += `\n\n[依赖文件导出契约 - import 只能使用这里真正存在的导出]\n${buildDependencyContractText(focusedContextFiles, filesContent)}`;
         completedFiles.length = 0;
       }
@@ -1105,6 +1260,11 @@ CMD ["node", "dist/index.js"]`;
 2. **拒绝废话**：严禁在代码块前后输出任何解释性文字。对于 JSON 文件，必须确保其为严格合法的 JSON 格式。
 3. **按需引用**：严禁对当前 [行动清单] 中尚未生成的文件调用 read_file。请根据 [接口契约 (ApiContract)] 直接生成引用代码。
 4. **防御性编程**：不要因为无法读取到某个物理文件而中断任务。你应该相信契约并继续完成你的当前任务。`;
+      if (skipPerFileQualityChecks) {
+        prompt += `\n\n[阶段执行策略 - 依赖未就绪]：
+当前工作空间尚未安装 node_modules。为避免重复空检查，请在本文件实现阶段不要调用 diagnose_code 与 lint_fix。
+先完成文件写入，依赖安装后再在阶段校验统一执行类型诊断与格式化。`;
+      }
 
       let toolError: string | null = null;
       let fileWrittenByTool = false;
@@ -1123,10 +1283,28 @@ CMD ["node", "dist/index.js"]`;
       };
 
       const deterministicScaffold = getDeterministicTemplateScaffold(state, task.fileTarget);
+      const scaffoldAllowed = Boolean(
+        deterministicScaffold &&
+        (
+          !isPlanningFallbackActive(state) ||
+          isSafeDeterministicScaffoldFile(task.fileTarget) ||
+          isCompactAuthFallbackRuntimeScaffoldFile(state, task.fileTarget)
+        )
+      );
+      let generationSource: FileChangeEntry["generationSource"] | undefined;
       let extractResult;
-      if (deterministicScaffold) {
+      if (scaffoldAllowed) {
+        generationSource = "deterministic_scaffold";
         extractResult = { isValid: true, code: deterministicScaffold, error: "" };
       } else {
+        if (deterministicScaffold && isPlanningFallbackActive(state)) {
+          emit(
+            "thinking",
+            "System",
+            `[Coder] 规划已降级，核心文件 ${task.fileTarget} 禁止直接套用确定性骨架，改走模型生成`,
+            { task }
+          );
+        }
         const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any);
         const taskFirstWriteTimeoutMs = getCoderFirstWriteTimeoutMs(state, subTasks as any, task.fileTarget);
         try {
@@ -1188,7 +1366,7 @@ CMD ["node", "dist/index.js"]`;
         }
       }
 
-      if (deterministicScaffold) {
+      if (scaffoldAllowed) {
         emit("thinking", "System", `[Coder] 使用模板骨架直接生成 ${task.fileTarget}`, { task });
       }
 
@@ -1199,18 +1377,22 @@ CMD ["node", "dist/index.js"]`;
       const shouldTrustDiskOutput =
         fileWrittenByTool &&
         unauthorizedWriteTargets.size === 0 &&
-        (diagnosticsPassed || lintPassed || missingTargetDiagnostic);
+        (diagnosticsPassed || lintPassed || missingTargetDiagnostic || skipPerFileQualityChecks);
 
       if (shouldTrustDiskOutput) {
         const diskResult = await tryLoadValidatedDiskOutput(WORKSPACE, task.fileTarget, filesContent, state.executionProtocol);
         if (diskResult.ok) {
           finalCode = diskResult.code || "";
           isSuccess = true;
+          generationSource = "recovered_disk";
           toolError = null;
           formatError = null;
         } else {
           const diskError = diskResult.error || "尝试读取已由工具写入的文件失败";
-          if (missingTargetDiagnostic && /读取已由工具写入的文件失败/.test(diskError)) {
+          if (
+            (missingTargetDiagnostic && /读取已由工具写入的文件失败/.test(diskError)) ||
+            (skipPerFileQualityChecks && extractResult.isValid)
+          ) {
             toolError = null;
           } else {
             formatError = diskError;
@@ -1219,7 +1401,7 @@ CMD ["node", "dist/index.js"]`;
       }
 
       if (!isSuccess && extractResult.isValid) {
-        finalCode = extractResult.code;
+        finalCode = extractResult.code || "";
         // 1. JSON 强校验
         if (task.fileTarget.endsWith(".json")) {
           try {
@@ -1254,7 +1436,10 @@ CMD ["node", "dist/index.js"]`;
           }
         }
 
-        if (!formatError) isSuccess = true;
+        if (!formatError) {
+          isSuccess = true;
+          generationSource = generationSource || "model";
+        }
       }
 
       // 核心修复：如果纯文本提取失败，但 Agent 成功调用了 write_file 工具，则从磁盘读取结果作为最终代码
@@ -1263,6 +1448,7 @@ CMD ["node", "dist/index.js"]`;
          if (diskResult.ok) {
             finalCode = diskResult.code || "";
             isSuccess = true;
+            generationSource = "recovered_disk";
             toolError = null;
             formatError = null;
          } else {
@@ -1305,11 +1491,24 @@ CMD ["node", "dist/index.js"]`;
         await fs.writeFile(filePath, finalCode);
         task.status = "completed";
         delete task.lastError;
-        codeLogEntries.push({ round: currentRetry, file: task.fileTarget, taskTitle: task.description.slice(0, 80), status: "written" });
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "written",
+          generationSource: generationSource || "model",
+        });
         const incrementalResult = {
           code: JSON.stringify(filesContent, null, 2),
           subTasks: [...subTasks],
-          codeLog: [...(state.codeLog || []), ...codeLogEntries]
+          codeLog: [...(state.codeLog || []), ...codeLogEntries],
+          blockedReason: "",
+          testResults: "",
+          qaFailures: null,
+          lastFailedNode: "",
+          lastFailureSummary: "",
+          failureFingerprint: "",
+          sameFailureCount: 0,
         };
         await persistWriteRecoveryIntent(WORKSPACE, {
           taskId: task.id,
@@ -1324,7 +1523,7 @@ CMD ["node", "dist/index.js"]`;
         delete localRetryAttempts[task.fileTarget];
         delete localRetryArtifacts[task.fileTarget];
         progressMade = true;
-        const checkpointDecision = shouldRequestValidationCheckpoint(state, subTasks as any);
+        const checkpointDecision = shouldRequestValidationCheckpoint(state, subTasks as any, codeLogEntries);
         if (checkpointDecision.requested) {
           validationCheckpointRequested = true;
           validationCheckpointReason = checkpointDecision.reason;

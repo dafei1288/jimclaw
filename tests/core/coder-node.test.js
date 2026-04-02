@@ -796,6 +796,68 @@ test("coder trusts validated disk output over natural-language completion summar
   }
 });
 
+test("coder accepts disk write without per-file diagnose/lint when node_modules is missing in TS projects", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      filesToCreate: ["src/utils/runtime.ts"],
+      dependencies: {},
+      devDependencies: {},
+    },
+    subTasks: [
+      {
+        id: "task-008b",
+        description: "write runtime util",
+        fileTarget: "src/utils/runtime.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(_messages, onEvent) {
+            onEvent({
+              type: "tool_use",
+              tool: "write_file",
+              content: "Successfully wrote to src/utils/runtime.ts",
+              sender: "测试Coder",
+            });
+            await fs.mkdir(path.join(workspace, "src", "utils"), { recursive: true });
+            await fs.writeFile(
+              path.join(workspace, "src", "utils", "runtime.ts"),
+              "export const runtimeReady = () => true;\n",
+              "utf-8"
+            );
+            return { content: "已完成写入" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(result.codeLog.some((entry) => entry.file === "src/utils/runtime.ts" && entry.status === "written"), true);
+    assert.match(result.code || "", /runtimeReady/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder trusts validated disk output even if an early transient tool error was reported", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
@@ -975,6 +1037,56 @@ test("coder clears stale blocking state when disk reconciliation recovers the fa
     assert.equal(result.blockedReason, "");
     assert.equal(result.lastFailedNode, "");
     assert.equal(result.testResults, "");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder task snapshot clears stale blocking markers after a later successful write", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    blockedReason: "Coder 阻塞失败: src/services/bookMutationService.ts -> 首个写入超时",
+    testResults: "[Coder 阻塞失败]\n旧阻塞摘要",
+    lastFailedNode: "coder",
+    lastFailureSummary: "旧阻塞摘要",
+    qaFailures: {
+      failedFiles: ["src/services/bookMutationService.ts"],
+      testErrors: ["旧阻塞摘要"],
+      failedTestNames: [],
+    },
+    subTasks: [
+      {
+        id: "task-books-route",
+        description: "write books route",
+        fileTarget: "src/routes/books.ts",
+        dependencies: [],
+        contextRequirement: "route",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: createCoderAgent("```typescript\nimport { Router } from \"express\";\nconst router = Router();\nexport default router;\n```"),
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const taskSnapshot = recorder.snapshots.find((snapshot) => snapshot.node === "coder_task_task-books-route");
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.ok(taskSnapshot);
+    assert.equal(taskSnapshot.state.blockedReason || "", "");
+    assert.equal(taskSnapshot.state.testResults || "", "");
+    assert.equal(taskSnapshot.state.lastFailedNode || "", "");
+    assert.equal(taskSnapshot.state.lastFailureSummary || "", "");
+    assert.equal(taskSnapshot.state.qaFailures || null, null);
   } finally {
     await removeTempWorkspace(workspace);
   }
@@ -2775,6 +2887,81 @@ test("express template scaffold deterministically generates docker compose yaml"
   }
 });
 
+test("express template scaffold uses npm install in Dockerfile when no lockfile is planned", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const packageJson = JSON.stringify({
+    name: "book-manager",
+    version: "1.0.0",
+    scripts: {
+      build: "tsc",
+      start: "node dist/index.js",
+    },
+  }, null, 2);
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^4.18",
+      filesToCreate: ["Dockerfile", "package.json", "tsconfig.json", "src/index.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-package",
+        description: "package ready",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "pkg",
+        status: "completed",
+      },
+      {
+        id: "task-dockerfile",
+        description: "write dockerfile",
+        fileTarget: "Dockerfile",
+        dependencies: ["package.json"],
+        contextRequirement: "docker",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "package.json": packageJson,
+    }),
+  });
+
+  try {
+    await fs.writeFile(`${workspace}/package.json`, packageJson);
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```dockerfile\nFROM scratch\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "Dockerfile").status, "completed");
+    const dockerfileCode = await fs.readFile(`${workspace}/Dockerfile`, "utf-8");
+    assert.match(dockerfileCode, /RUN npm install/);
+    assert.doesNotMatch(dockerfileCode, /RUN npm ci\b/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("express template scaffold deterministically generates user controller test", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
@@ -2924,6 +3111,105 @@ test("test-file repair prompt narrows completed-file context to direct dependenc
     assert.match(observedPrompt, /src\/models\/user\.ts/);
     assert.doesNotMatch(observedPrompt, /- src\/routes\/bookRoutes\.ts/);
     assert.doesNotMatch(observedPrompt, /已完成的文件列表 - 可安全 import/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder allows aggregate domain service to depend on same-stem split helper services", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const requirementProtocol = buildRequirementProtocol({
+    title: "图书管理系统",
+    requirements: ["提供图书查询、新增、修改、删除能力"],
+    acceptanceCriteria: ["用户能够查询图书并完成增删改"],
+  });
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    filesToCreate: [
+      "src/errors.ts",
+      "src/models/book.ts",
+      "src/services/bookQueryService.ts",
+      "src/services/bookMutationService.ts",
+      "src/services/bookService.ts",
+    ],
+  };
+  const state = createBaseState({
+    requirementProtocol,
+    spec,
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }] },
+      { endpoints: [{ method: "GET", path: "/api/books" }, { method: "POST", path: "/api/books" }] },
+      requirementProtocol
+    ),
+    subTasks: [
+      {
+        id: "task-errors",
+        description: "errors",
+        fileTarget: "src/errors.ts",
+        dependencies: [],
+        contextRequirement: "errors",
+        status: "completed",
+      },
+      {
+        id: "task-model",
+        description: "model",
+        fileTarget: "src/models/book.ts",
+        dependencies: ["src/errors.ts"],
+        contextRequirement: "model",
+        status: "completed",
+      },
+      {
+        id: "task-query",
+        description: "query helper",
+        fileTarget: "src/services/bookQueryService.ts",
+        dependencies: ["src/models/book.ts"],
+        contextRequirement: "query",
+        status: "completed",
+      },
+      {
+        id: "task-mutation",
+        description: "mutation helper",
+        fileTarget: "src/services/bookMutationService.ts",
+        dependencies: ["src/models/book.ts"],
+        contextRequirement: "mutation",
+        status: "completed",
+      },
+      {
+        id: "task-service",
+        description: "aggregate service",
+        fileTarget: "src/services/bookService.ts",
+        dependencies: ["src/services/bookQueryService.ts", "src/services/bookMutationService.ts", "src/models/book.ts"],
+        contextRequirement: "service",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "src/errors.ts": "export class AppError extends Error {}\n",
+      "src/models/book.ts": "export interface Book { id: string; }\n",
+      "src/services/bookQueryService.ts": "export const listBooks = () => [];\n",
+      "src/services/bookMutationService.ts": "export const createBook = (input) => input;\n",
+    }),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: createCoderAgent(
+          "```typescript\nimport { listBooks } from \"./bookQueryService\";\nimport { createBook } from \"./bookMutationService\";\n\nexport const bookService = {\n  listBooks,\n  createBook,\n};\n\nexport default bookService;\n```"
+        ),
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").status, "completed");
+    assert.equal(result.codeLog.some((entry) => entry.file === "src/services/bookService.ts" && entry.status === "written"), true);
   } finally {
     await removeTempWorkspace(workspace);
   }
@@ -3713,6 +3999,521 @@ test("coder aborts oversized service generation early when no write_file occurs 
     assert.equal(result.subTasks[0].status, "failed");
     assert.match(result.subTasks[0].lastError || "", /首个写入超时/);
     assert.match(result.blockedReason || "", /首个写入超时/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder treats a complete code block response as first progress before the first-write deadline", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    coderTaskTimeoutMs: 200,
+    coderFirstWriteTimeoutMs: 30,
+    subTasks: [
+      {
+        id: "task-service",
+        description: "service from model response",
+        fileTarget: "src/services/bookService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "pending",
+      },
+    ],
+  });
+  const serviceCode = "```typescript\nexport class BookService {}\nexport const bookService = new BookService();\n```";
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(_messages, onEvent) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+            onEvent?.({ type: "response_content", sender: "测试Coder", content: serviceCode });
+            await new Promise((resolve) => setTimeout(resolve, 40));
+            return { content: serviceCode };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(result.blockedReason || "", "");
+    const written = await fs.readFile(`${workspace}/src/services/bookService.ts`, "utf-8");
+    assert.match(written, /export class BookService/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder does not auto-scaffold core service files after planning fallback, and blocks on real model timeout instead", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    filesToCreate: [
+      "src/errors.ts",
+      "src/models/book.ts",
+      "src/services/bookService.ts",
+    ],
+  };
+  const state = createBaseState({
+    coderTaskTimeoutMs: 30,
+    templateId: "express-typescript",
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec,
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      { endpoints: [{ method: "GET", path: "/api/books" }] },
+      buildRequirementProtocol({
+        title: "图书管理系统",
+        requirements: ["需要后端 API"],
+        acceptanceCriteria: ["用户能够查询图书列表"],
+      })
+    ),
+    subTasks: [
+      {
+        id: "task-errors",
+        description: "errors ready",
+        fileTarget: "src/errors.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-model",
+        description: "model ready",
+        fileTarget: "src/models/book.ts",
+        dependencies: ["src/errors.ts"],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-service",
+        description: "service ready",
+        fileTarget: "src/services/bookService.ts",
+        dependencies: ["src/errors.ts", "src/models/book.ts"],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "src/errors.ts": "export class AppError extends Error {}\nexport class NotFoundError extends AppError {}\nexport class ValidationError extends AppError {}\n",
+      "src/models/book.ts": "export interface Book { id: string; title: string; }\n",
+    }),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(_messages, _onEvent, options) {
+            chatCalls += 1;
+            return await new Promise((_resolve, reject) => {
+              options.signal.addEventListener("abort", () => {
+                reject(options.signal.reason || new Error("aborted"));
+              }, { once: true });
+            });
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 1);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").status, "failed");
+    assert.match(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").lastError || "", /单文件生成超时/);
+    assert.match(result.blockedReason || "", /单文件生成超时/);
+    assert.equal(result.qaFailures.failedFiles.includes("src/services/bookService.ts"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder allows compact fallback auth service to use deterministic scaffold without waiting for the model", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    authScaffoldMode: "compact",
+    filesToCreate: [
+      "src/services/authService.ts",
+    ],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec,
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      { endpoints: [{ method: "POST", path: "/api/auth/login" }] },
+      buildRequirementProtocol({
+        title: "图书管理系统",
+        requirements: ["需要登录认证"],
+        acceptanceCriteria: ["用户能够登录"],
+      })
+    ),
+    subTasks: [
+      {
+        id: "task-auth-service",
+        description: "auth service",
+        fileTarget: "src/services/authService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({}),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const shouldNotRun = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(result.codeLog.some((entry) => entry.file === "src/services/authService.ts" && entry.status === "written" && entry.generationSource === "deterministic_scaffold"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder allows fallback auth infrastructure files to use deterministic scaffold without waiting for the model", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const requirementProtocol = buildRequirementProtocol({
+    title: "图书管理系统",
+    requirements: ["需要登录认证"],
+    acceptanceCriteria: ["用户能够登录并获取当前用户信息"],
+  });
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    filesToCreate: [
+      "src/errors.ts",
+      "src/logging/logger.ts",
+      "src/services/authService.ts",
+      "src/middleware/auth.ts",
+      "src/controllers/authController.ts",
+      "src/routes/auth.ts",
+    ],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    requirementProtocol,
+    spec,
+    apiContract: {
+      endpoints: [
+        { method: "POST", path: "/api/auth/login" },
+        { method: "GET", path: "/api/auth/me" },
+      ],
+    },
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      {
+        endpoints: [
+          { method: "POST", path: "/api/auth/login" },
+          { method: "GET", path: "/api/auth/me" },
+        ],
+      },
+      requirementProtocol
+    ),
+    subTasks: [
+      {
+        id: "task-errors",
+        description: "errors",
+        fileTarget: "src/errors.ts",
+        dependencies: [],
+        contextRequirement: "errors",
+        status: "pending",
+      },
+      {
+        id: "task-logger",
+        description: "logger",
+        fileTarget: "src/logging/logger.ts",
+        dependencies: ["src/errors.ts"],
+        contextRequirement: "logger",
+        status: "pending",
+      },
+      {
+        id: "task-auth-service",
+        description: "auth service",
+        fileTarget: "src/services/authService.ts",
+        dependencies: ["src/errors.ts", "src/logging/logger.ts"],
+        contextRequirement: "service",
+        status: "completed",
+      },
+      {
+        id: "task-auth-middleware",
+        description: "auth middleware",
+        fileTarget: "src/middleware/auth.ts",
+        dependencies: ["src/services/authService.ts", "src/logging/logger.ts"],
+        contextRequirement: "middleware",
+        status: "pending",
+      },
+      {
+        id: "task-auth-controller",
+        description: "auth controller",
+        fileTarget: "src/controllers/authController.ts",
+        dependencies: ["src/services/authService.ts", "src/middleware/auth.ts"],
+        contextRequirement: "controller",
+        status: "pending",
+      },
+      {
+        id: "task-auth-route",
+        description: "auth route",
+        fileTarget: "src/routes/auth.ts",
+        dependencies: ["src/controllers/authController.ts", "src/middleware/auth.ts"],
+        contextRequirement: "route",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "src/services/authService.ts": "export interface AuthServiceState { sessionsByToken: Map<string, any>; usersById: Map<string, any>; }\nexport type AuthRole = 'admin';\nexport function createAuthServiceState() { return { sessionsByToken: new Map(), usersById: new Map() }; }\nexport function createUser(_state, input) { return { id: 'u', username: input.username, roles: input.roles || ['member'] }; }\nexport function assertUserActive() {}\nexport function login() { return { session: { token: 't' }, user: { id: 'u', roles: ['admin'] } }; }\n",
+    }),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const shouldNotRun = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks.every((task) => task.status === "completed"), true);
+    assert.equal(
+      result.codeLog.filter((entry) => ["src/errors.ts", "src/logging/logger.ts", "src/middleware/auth.ts", "src/controllers/authController.ts", "src/routes/auth.ts"].includes(entry.file) && entry.generationSource === "deterministic_scaffold").length,
+      5
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder allows fallback peripheral ui and test files to use deterministic scaffold without waiting for the model", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express.js ^4.18",
+    filesToCreate: [
+      "package.json",
+      "public/index.html",
+      "tests/auth.test.ts",
+    ],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    designSource: "deterministic-fallback",
+    orchestrationSource: "deterministic-fallback",
+    contract: { title: "图书管理系统" },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec,
+    executionProtocol: buildExecutionProtocol(
+      spec,
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      { endpoints: [{ method: "POST", path: "/api/auth/login" }] },
+      buildRequirementProtocol({
+        title: "图书管理系统",
+        requirements: ["需要前端与登录测试"],
+        acceptanceCriteria: ["页面可访问，鉴权测试可运行"],
+      })
+    ),
+    subTasks: [
+      {
+        id: "task-package",
+        description: "package ready",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-ui",
+        description: "ui ready",
+        fileTarget: "public/index.html",
+        dependencies: ["package.json"],
+        contextRequirement: "none",
+        status: "pending",
+      },
+      {
+        id: "task-auth-test",
+        description: "auth test ready",
+        fileTarget: "tests/auth.test.ts",
+        dependencies: ["package.json"],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "package.json": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n",
+    }),
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nthrow new Error('should not call model');\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    const uiTask = result.subTasks.find((task) => task.fileTarget === "public/index.html");
+    const authTestTask = result.subTasks.find((task) => task.fileTarget === "tests/auth.test.ts");
+    assert.equal(uiTask?.status, "completed");
+    assert.equal(authTestTask?.status, "completed");
+    const deterministicWrites = result.codeLog.filter(
+      (entry) =>
+        ["public/index.html", "tests/auth.test.ts"].includes(entry.file) &&
+        entry.generationSource === "deterministic_scaffold"
+    );
+    assert.equal(deterministicWrites.length, 2);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder recovers a previously timed-out file from disk before starting the next retry round", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const state = createBaseState({
+    retryCount: 1,
+    executionProtocol: buildExecutionProtocol(
+      {
+        language: "TypeScript",
+        framework: "Express.js ^4.18",
+        filesToCreate: ["src/services/authAccountPolicyService.ts"],
+      },
+      { services: [{ name: "app", port: 10000 }], environment: {}, sharedConfig: {} },
+      { endpoints: [] },
+      buildRequirementProtocol({
+        title: "图书管理系统",
+        requirements: ["需要认证能力"],
+        acceptanceCriteria: ["用户能够登录"],
+      })
+    ),
+    subTasks: [
+      {
+        id: "task-auth-policy",
+        description: "auth policy service",
+        fileTarget: "src/services/authAccountPolicyService.ts",
+        dependencies: [],
+        contextRequirement: "service",
+        status: "failed",
+        lastError: "首个写入超时",
+      },
+    ],
+  });
+
+  try {
+    await fs.mkdir(path.join(workspace, "src", "services"), { recursive: true });
+    await fs.writeFile(
+      path.join(workspace, "src/services/authAccountPolicyService.ts"),
+      `export function validatePassword(input: string): boolean { return input.length >= 8; }\n`,
+      "utf-8"
+    );
+
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const shouldNotRun = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.equal(result.subTasks[0].lastError, undefined);
+    assert.equal(result.codeLog.some((entry) => entry.file === "src/services/authAccountPolicyService.ts" && entry.status === "written" && entry.generationSource === "recovered_disk"), true);
   } finally {
     await removeTempWorkspace(workspace);
   }
