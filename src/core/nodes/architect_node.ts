@@ -345,6 +345,7 @@ function buildDeterministicGoOutput(
     filesToCreate = [
       "go.mod",
       "main.go",
+      "handler/health.go",
       "Dockerfile",
       "handler/health_test.go",
     ];
@@ -606,6 +607,10 @@ ${langFileConstraints}
     /^app\/routers\/__init__\.py$/,
     // Go 基础设施
     /^(go\.(mod|sum)|Makefile)$/i,
+    /^main\.go$/,
+    /^handler\//,
+    // Go 测试文件
+    /_test\.go$/,
     // Java 基础设施
     /^(pom\.xml|build\.gradle|gradle\.properties)/i,
   ];
@@ -617,8 +622,13 @@ ${langFileConstraints}
       infraPatterns.some(p => p.test(f))
     );
     // 确保至少有一个测试文件
-    const hasTest = spec.filesToCreate.some((f: string) => /^tests?\//.test(f));
-    if (!hasTest) spec.filesToCreate.push("tests/health.test.ts");
+    const hasTest = spec.filesToCreate.some((f: string) => /^tests?\//.test(f) || /_test\.go$/.test(f) || /test_.*\.py$/.test(f));
+    if (!hasTest) {
+      const lang = String(spec?.language || "").toLowerCase();
+      if (/go/.test(lang)) spec.filesToCreate.push("handler/health_test.go");
+      else if (/python/.test(lang)) spec.filesToCreate.push("tests/test_health.py");
+      else spec.filesToCreate.push("tests/health.test.ts");
+    }
     if (before !== spec.filesToCreate.length) {
       emit("thinking", "System", `[Architect] 奥卡姆剃刀：无业务端点，${before} → ${spec.filesToCreate.length} 文件（${spec.filesToCreate.join(", ")}）`, {});
     }

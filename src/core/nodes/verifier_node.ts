@@ -227,13 +227,13 @@ export async function verifierNode(
 
   if (requirementProtocol?.capabilities?.backendRequired) {
     const routeFiles = plannedFiles.filter((file) => getProtocolFileContract(state.executionProtocol, file)?.role === "route");
-    // 如果任何已完成的文件包含路由定义（app.get/app.post 等），则不需要独立 route 文件
-    let anyFileHasRoutes = entryContent && /app\.(get|post|put|delete|patch|use)\s*\(/i.test(entryContent);
+    // 如果任何已完成的文件包含路由定义（Express app.get / Gin r.GET / FastAPI @app.get 等），则不需要独立 route 文件
+    let anyFileHasRoutes = entryContent && /((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\()/im.test(entryContent);
     if (!anyFileHasRoutes) {
       for (const file of plannedFiles) {
         try {
           const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
-          if (/app\.(get|post|put|delete|patch|use)\s*\(/i.test(content)) {
+          if (/((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\()/im.test(content)) {
             anyFileHasRoutes = true;
             break;
           }

@@ -90,6 +90,16 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
     normalized === "dockerfile" ||
     normalized.endsWith("docker-compose.yml") ||
     normalized === "public/index.html" ||
+    // Go/Python 入口文件
+    normalized === "go.mod" ||
+    normalized === "main.go" ||
+    normalized === "main.py" ||
+    normalized === "app/main.py" ||
+    // Go handler 文件
+    normalized.startsWith("handler/") ||
+    // Go/Python 测试文件
+    /_test\.go$/i.test(normalized) ||
+    /^test_.*\.py$/i.test(normalized) ||
     (normalized.startsWith("tests/") && /\.test\.[^.]+$/i.test(normalized)) ||
     normalized === "readme.md" ||
     /^scripts\/verify\.[^.]+$/i.test(normalized) ||

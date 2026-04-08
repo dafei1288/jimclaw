@@ -112,14 +112,23 @@ ${JSON.stringify(executionProtocol, null, 2)}
     }
   }
 
-  const subTasks = rawSubTasks.map((task: any) => ({
-    ...task,
-    fileTarget: normalizeNodeJestTestFilePath(task.fileTarget),
-    dependencies: (task.dependencies || []).map((dep: string) => normalizeNodeJestTestFilePath(dep)),
-    status: "pending" as const,
-    // 自动推断 role：测试文件标记为 test 角色
-    role: task.role || (/^tests?\//i.test(normalizeNodeJestTestFilePath(task.fileTarget)) ? "test" : task.role || "implement"),
-  }));
+  const subTasks = rawSubTasks.map((task: any) => {
+    const normalizedTarget = normalizeNodeJestTestFilePath(task.fileTarget);
+    // 保留之前已完成的 status：如果磁盘上文件存在，保持 completed
+    const previousTask = (state.subTasks || []).find(
+      (t: any) => normalizeNodeJestTestFilePath(t.fileTarget) === normalizedTarget
+    );
+    const previousStatus = previousTask?.status;
+    const wasCompleted = previousStatus === "completed";
+    return {
+      ...task,
+      fileTarget: normalizedTarget,
+      dependencies: (task.dependencies || []).map((dep: string) => normalizeNodeJestTestFilePath(dep)),
+      status: wasCompleted ? "completed" : "pending" as const,
+      // 自动推断 role：测试文件标记为 test 角色
+      role: task.role || (/^tests?\//i.test(normalizedTarget) ? "test" : task.role || "implement"),
+    };
+  });
 
   if (requirementProtocol.capabilities.frontendRequired) {
     const hasFrontendTask = subTasks.some((task: any) => /^public\/.+/i.test(task.fileTarget));

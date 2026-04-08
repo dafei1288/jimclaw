@@ -67,7 +67,6 @@ function generateMainGo(ctx: ScaffoldContext): string {
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
