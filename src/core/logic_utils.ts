@@ -1,23 +1,23 @@
 /**
- * logic_utils.ts — JimClaw 核心逻辑工具集
+ * logic_utils.ts - JimClaw 核心逻辑工具集
  *
- * 本文件是系统各节点共享的工具函数库。按功能域组织如下：
+ * 本文件是系统各节点共享的工具函数库。按功能域组织如下:
  *
  * ┌─ 模块目录 ─────────────────────────────────────────────────────────────┐
- * │ §1  基础工具          (L36–165)    时间、日志、路径解析                    │
- * │ §2  协议构建          (L699–1487)  Requirement/Solution/Execution 协议     │
- * │ §3  协议补丁          (L1355–1487)  FixPlan/Mediation 补丁应用              │
- * │ §4  错误类型          (L1488–1568)  AppError 体系                           │
- * │ §5  认证会话          (L1570–2087)  Session/Credential/Role/AuthService     │
- * │ §6  脚手架模板        (L2090–3180)  确定性模板（Express/Python/Go）         │
- * │ §7  Express 中间件     (L3108–3925)  errorHandler/authMiddleware/logger      │
- * │ §8  测试分析          (L3928–4490)  analyzeTestProblem/stabilize/Jest 配置  │
- * │ §9  共识上下文        (L4494–5148)  buildSystemContext/buildCoderContext     │
- * │ §10 持久化与恢复       (L5149–5693)  MeetingNote/TraceIndex/Checkpoint        │
- * │ §11 容器执行           (L5695–5706)  execInContainer                         │
+ * │ §1  基础工具          (L36-165)    时间、日志、路径解析                    │
+ * │ §2  协议构建          (L699-1487)  Requirement/Solution/Execution 协议     │
+ * │ §3  协议补丁          (L1355-1487)  FixPlan/Mediation 补丁应用              │
+ * │ §4  错误类型          (L1488-1568)  AppError 体系                           │
+ * │ §5  认证会话          (L1570-2087)  Session/Credential/Role/AuthService     │
+ * │ §6  脚手架模板        (L2090-3180)  确定性模板(Express/Python/Go)         │
+ * │ §7  Express 中间件     (L3108-3925)  errorHandler/authMiddleware/logger      │
+ * │ §8  测试分析          (L3928-4490)  analyzeTestProblem/stabilize/Jest 配置  │
+ * │ §9  共识上下文        (L4494-5148)  buildSystemContext/buildCoderContext     │
+ * │ §10 持久化与恢复       (L5149-5693)  MeetingNote/TraceIndex/Checkpoint        │
+ * │ §11 容器执行           (L5695-5706)  execInContainer                         │
  * └─────────────────────────────────────────────────────────────────────────┘
  *
- * 重构说明：本文件 5700+ 行，未来应拆分为独立模块（auth_utils、scaffold_templates 等）。
+ * 重构说明:本文件 5700+ 行,未来应拆分为独立模块(auth_utils、scaffold_templates 等)。
  * 当前通过 re-export 保持向后兼容。新增函数请放在对应功能域的末尾。
  */
 
@@ -101,20 +101,20 @@ export function extractFailureEvidence(
 }
 
 /**
- * 获取北京时间（东八区）字符串
+ * 获取北京时间(东八区)字符串
  */
 export function getBeijingTime(): string {
   const date = new Date();
   const utc = date.getTime() + (date.getTimezoneOffset() * 60000);
   const beijingDate = new Date(utc + (3600000 * 8));
-  
+
   const y = beijingDate.getFullYear();
   const m = String(beijingDate.getMonth() + 1).padStart(2, '0');
   const d = String(beijingDate.getDate()).padStart(2, '0');
   const hh = String(beijingDate.getHours()).padStart(2, '0');
   const mm = String(beijingDate.getMinutes()).padStart(2, '0');
   const ss = String(beijingDate.getSeconds()).padStart(2, '0');
-  
+
   return `${y}-${m}-${d} ${hh}:${mm}:${ss}`;
 }
 
@@ -160,10 +160,10 @@ export function getEntryPoint(state: JimClawState): string {
  */
 export function getImplementationFile(state: JimClawState): string {
   const allFiles = (state.subTasks || []).map(t => t.fileTarget);
-  const implFile = allFiles.find(f => 
-    !/test|spec/i.test(f) && 
-    !f.endsWith("package.json") && 
-    !f.endsWith(".html") && 
+  const implFile = allFiles.find(f =>
+    !/test|spec/i.test(f) &&
+    !f.endsWith("package.json") &&
+    !f.endsWith(".html") &&
     !/utils|helper|lib|common/i.test(f)
   );
   return implFile || getEntryPoint(state);
@@ -214,7 +214,7 @@ function inferProtocolFileRole(fileTarget: string): ProtocolFileRole {
 }
 
 function allowedRolesForProtocolFile(role: ProtocolFileRole): ProtocolFileRole[] {
-  // 所有角色允许的通用基础依赖（types、enums、interfaces 等）
+  // 所有角色允许的通用基础依赖(types、enums、interfaces 等)
   const base: ProtocolFileRole[] = ["model", "config", "other"];
   switch (role) {
     case "entry":
@@ -730,7 +730,7 @@ export function buildRequirementProtocol(contract: TaskContract | null | undefin
 // §2  协议构建 (Requirement / Solution / Execution)
 // ═══════════════════════════════════════════════════════════════════════
 
-  // 奥卡姆剃刀：否定语境检测——如果关键词出现在“不包含/不需要/排除”等语境中，视为不需要
+  // 奥卡姆剃刀:否定语境检测--如果关键词出现在"不包含/不需要/排除"等语境中,视为不需要
   const negatePattern = /不包含|不需要|排除|不涉及|不要求|不含|无需|没有|不提供/i;
   function hasPositiveMatch(pattern: RegExp): boolean {
     for (const line of allLines) {
@@ -745,8 +745,8 @@ export function buildRequirementProtocol(contract: TaskContract | null | undefin
   const frontendRequired = hasPositiveMatch(/前端|页面|界面|ui|web|浏览器/i);
   const backendRequired = hasPositiveMatch(/后端|api|接口|服务|express|fastapi|node/i) || !frontendRequired;
   const authRequired = hasPositiveMatch(/权限|授权|认证|登录|jwt/i);
-  // “认证系统”任务中 authRequired 应为 true——但需要排除否定语境中的“权限”“授权”等
-  // 如果 title 直接提到认证/登录，即使 acceptanceCriteria 中有否定语境，仍视为需要
+  // "认证系统"任务中 authRequired 应为 true--但需要排除否定语境中的"权限""授权"等
+  // 如果 title 直接提到认证/登录,即使 acceptanceCriteria 中有否定语境,仍视为需要
   const titleAuth = /认证|登录|jwt|auth/i.test(contract?.title || "");
   const authRequiredFinal = authRequired || titleAuth;
   const auditLogRequired = hasPositiveMatch(/日志|审计|追踪/i);
@@ -862,14 +862,14 @@ export function ensureRequirementDrivenFiles(
 
   if (backendRequired) {
     // 只在 Node/TS/JS 项目中注入 Node 配置文件
-    // Python/Go/Java 狱目项目使用自己的配置文件（requirements.txt/go.mod/pom.xml）
+    // Python/Go/Java 狱目项目使用自己的配置文件(requirements.txt/go.mod/pom.xml)
     const lang = String((nextSpec as any).language || "").toLowerCase();
     if (/typescript|javascript|node/.test(lang)) {
       ensureFile("package.json");
       ensureFile("tsconfig.json");
       ensureFile("src/index.ts");
-      // CRUD 测试文件：无论 Architect 是否已规划，都确保存在
-      // （Architect 经常遗漏测试文件）
+      // CRUD 测试文件:无论 Architect 是否已规划,都确保存在
+      // (Architect 经常遗漏测试文件)
       if (singular && plural) {
         ensureFile(`tests/${plural}.test.ts`);
       }
@@ -893,7 +893,7 @@ export function ensureRequirementDrivenFiles(
 
   if (authRequired) {
     // 只在 spec 没有明确文件列表时注入 auth 分层
-    // 如果 spec 已经有文件列表（说明 Architect 已规划），不强制注入
+    // 如果 spec 已经有文件列表(说明 Architect 已规划),不强制注入
     if (!spec?.filesToCreate || spec.filesToCreate.length <= 3) {
       ensureFile("src/middleware/auth.ts");
       ensureFile("src/routes/auth.ts");
@@ -901,7 +901,7 @@ export function ensureRequirementDrivenFiles(
       ensureFile("src/services/authService.ts");
       ensureFile("tests/auth.test.ts");
     } else {
-      // Architect 已规划：只确保 middleware/auth.ts 存在（auth 必需）
+      // Architect 已规划:只确保 middleware/auth.ts 存在(auth 必需)
       ensureFile("src/middleware/auth.ts");
     }
   }
@@ -920,7 +920,7 @@ export function ensureRequirementDrivenFiles(
     ensureFile(".dockerignore");
   }
 
-  // verify.ps1 不再注入——测试由 jest/pytest 覆盖，验证脚本是冗余文件
+  // verify.ps1 不再注入--测试由 jest/pytest 覆盖,验证脚本是冗余文件
 
   if (backendRequired && pascalSingular && (!spec?.filesToCreate || spec.filesToCreate.length <= 3)) {
     const existingModelMatches = files.some((file) => new RegExp(`src/models/${pascalSingular}`, "i").test(file));
@@ -973,7 +973,7 @@ export function ensureRequirementDrivenApiContract(
   }
 
   // 只有当 requirements 文本明确提到 CRUD 相关操作时才注入实体端点
-  // 奥卡姆剃刀：如果已有足够的端点覆盖需求，不额外注入
+  // 奥卡姆剃刀:如果已有足够的端点覆盖需求,不额外注入
   const reqText = (requirementProtocol?.userIntent?.requirements || []).join(" ").toLowerCase();
   const explicitlyWantsCrud = /列表|list|查询|getAll|删除|delete|更新|update|编辑|edit/i.test(reqText);
   if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && explicitlyWantsCrud) {
@@ -983,9 +983,9 @@ export function ensureRequirementDrivenApiContract(
     ensureEndpoint("DELETE", `${basePath}/:id`, `删除${resourceLabel}`);
   }
 
-  // auth 端点：仅在 requirements 明确提到但 LLM 未生成时补充
+  // auth 端点:仅在 requirements 明确提到但 LLM 未生成时补充
   if (requirementProtocol?.capabilities?.authRequired) {
-    // 不重复注入——如果 LLM 已生成 /api/register + /api/login + /api/me，跳过
+    // 不重复注入--如果 LLM 已生成 /api/register + /api/login + /api/me,跳过
     const hasLoginEndpoint = endpointMap.has("POST /api/login") || endpointMap.has("POST /api/auth/login");
     const hasMeEndpoint = endpointMap.has("GET /api/me") || endpointMap.has("GET /api/auth/me");
     if (!hasLoginEndpoint) ensureEndpoint("POST", "/api/auth/login", "登录认证");
@@ -1015,7 +1015,7 @@ export function buildSolutionProtocol(
     return { requirement, coveredBy };
   });
   const uncoveredRequirements = (requirementProtocol?.userIntent?.requirements || []).filter((requirement) => {
-    // 跳过否定语境（“不包含”“不需要”等）
+    // 跳过否定语境("不包含""不需要"等)
     if (/不包含|不需要|排除|不涉及|不要求|不含|无需|不提供/i.test(requirement)) return false;
     if (/前端|页面|界面|ui|web/i.test(requirement)) return !frontendPlanned;
     if (/后端|api|接口|服务/i.test(requirement)) return !backendPlanned;
@@ -1131,7 +1131,7 @@ export function buildExecutionProtocol(
       recoveryRules: [
         "layout_mismatch 由 architect/orchestrator 协议回收",
         "contract_drift 由 coder 在当前文件原地修复",
-        "test_discovery_gap 优先修复测试目录与配置，而不是继续部署",
+        "test_discovery_gap 优先修复测试目录与配置,而不是继续部署",
       ],
     },
     validation: {
@@ -1150,8 +1150,8 @@ export function buildExecutionProtocol(
       acceptanceRules: [
         "声明的业务测试文件必须被实际测试配置覆盖",
         "deployment health check 必须命中协议 healthCheckPath",
-        "用户明确要求前端时，必须存在前端页面文件与可访问入口",
-        "用户明确要求前后端时，不得只交付 API 或只交付静态页面",
+        "用户明确要求前端时,必须存在前端页面文件与可访问入口",
+        "用户明确要求前后端时,不得只交付 API 或只交付静态页面",
       ],
     },
   };
@@ -1247,9 +1247,9 @@ export function findExecutionPlanGaps(
   }
 
   if (requirementProtocol?.capabilities.backendRequired) {
-    // 如果文件列表已经很小，说明 Architect 已精简规划，
-    // 入口文件可能直接包含路由定义，不需要强制 CRUD 分层
-    // 排除非业务文件（jest config, scripts, tsconfig, package.json）后再判断
+    // 如果文件列表已经很小,说明 Architect 已精简规划,
+    // 入口文件可能直接包含路由定义,不需要强制 CRUD 分层
+    // 排除非业务文件(jest config, scripts, tsconfig, package.json)后再判断
     const businessFiles = (files || []).filter(f => !/^(jest\.config|tsconfig|package|\.eslintrc|scripts\/|Dockerfile|docker-compose|README|\.gitignore|\.env|conftest|pytest|__init__|requirements)/i.test(f.path));
     const minimalPlan = businessFiles.length > 0 && businessFiles.length <= 8;
     for (const role of ["entry", ...(minimalPlan ? [] : ["route", "controller", "service", "model"] as const)] as const) {
@@ -1405,7 +1405,7 @@ export function buildProtocolPatchesForFixPlan(
           action: "replace",
           path: `files.${file}.ownedEndpoints`,
           value: ownedEndpoints,
-          reason: `${file} 是路由文件，修复时必须严格绑定到协议端点所有权`,
+          reason: `${file} 是路由文件,修复时必须严格绑定到协议端点所有权`,
         });
       }
     }
@@ -1416,7 +1416,7 @@ export function buildProtocolPatchesForFixPlan(
         action: "append",
         path: "acceptanceRules",
         value: `测试文件 ${file} 必须被 testRoots/testMatch 实际发现`,
-        reason: `${file} 是失败测试文件，修复时必须确认测试发现链路有效`,
+        reason: `${file} 是失败测试文件,修复时必须确认测试发现链路有效`,
       });
     }
 
@@ -1426,7 +1426,7 @@ export function buildProtocolPatchesForFixPlan(
         action: "replace",
         path: "entryPoint",
         value: file,
-        reason: `${file} 是入口文件，修复时必须作为运行时唯一入口`,
+        reason: `${file} 是入口文件,修复时必须作为运行时唯一入口`,
       });
     }
   }
@@ -2007,7 +2007,7 @@ export function assertUserActive(user: Pick<StoredUser, "id" | "enabled">, code 
   }
 }
 
-/** 使用用户名和密码登录，返回会话与公开用户信息。 */
+/** 使用用户名和密码登录,返回会话与公开用户信息。 */
 export function login(
   state: AuthServiceState,
   input: LoginInput,
@@ -2539,8 +2539,8 @@ export function reserve${entityPascal}(id: string): ${entityPascal} | null {
 }
 
 /**
- * 自包含的 CRUD Service scaffold——当对应的 model 文件不在 filesToCreate 中时使用。
- * 将类型定义和工厂函数全部内联到 service 文件中，避免编译错误。
+ * 自包含的 CRUD Service scaffold--当对应的 model 文件不在 filesToCreate 中时使用。
+ * 将类型定义和工厂函数全部内联到 service 文件中,避免编译错误。
  */
 function buildSelfContainedCrudServiceScaffold(entityStem: string): string {
   const singularStem = singularizeStem(entityStem) || "item";
@@ -2548,7 +2548,7 @@ function buildSelfContainedCrudServiceScaffold(entityStem: string): string {
   const entityPascal = toPascalCase(singularStem) || "Item";
   const seedInput = buildEntitySeedInputCode(singularStem);
 
-  // 内联类型定义（根据 entity 特化）
+  // 内联类型定义(根据 entity 特化)
   let interfaceBlock = "";
   if (singularStem === "book") {
     interfaceBlock = `export interface ${entityPascal} {
@@ -2884,7 +2884,7 @@ function tryExternalScaffoldProvider(
     requirementProtocol: state.requirementProtocol,
   };
 
-  // 延迟加载 scaffold 注册表（避免循环依赖）
+  // 延迟加载 scaffold 注册表(避免循环依赖)
   try {
     const { findScaffoldProvider } = require("../scaffolds") as typeof import("../scaffolds");
     const provider = findScaffoldProvider(language, framework);
@@ -2901,14 +2901,14 @@ export function getDeterministicTemplateScaffold(
   state: JimClawState,
   fileTarget: string
 ): string | null {
-  // ── 确定性 requirements.txt（裸包名，无版本约束） ──
+  // ── 确定性 requirements.txt(裸包名,无版本约束) ──
   const _reqFile = fileTarget.replace(/\\/g, "/").toLowerCase();
   if (_reqFile === "requirements.txt" && (state.spec as any)?._pinnedRequirements) {
     return (state.spec as any)._pinnedRequirements;
   }
 
   // ── 多语言 Scaffold 分发 ──
-  // 非 Express/TS 模板：尝试通过 ScaffoldProvider 注册表生成
+  // 非 Express/TS 模板:尝试通过 ScaffoldProvider 注册表生成
   if (state.templateId !== "express-typescript") {
     const providerResult = tryExternalScaffoldProvider(state, fileTarget);
     if (providerResult !== null) return providerResult;
@@ -3120,7 +3120,7 @@ yarn-error.log*
     if (modelExists) {
       return buildAggregateCrudServiceScaffold(entityStem);
     } else {
-      // model 文件不在 filesToCreate 中——生成自包含的 service（内联类型定义）
+      // model 文件不在 filesToCreate 中--生成自包含的 service(内联类型定义)
       return buildSelfContainedCrudServiceScaffold(entityStem);
     }
   }
@@ -3288,13 +3288,13 @@ export const authMiddleware: RequestHandler = (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader) {
-      res.status(401).json({ success: false, message: "未提供认证令牌，访问被拒绝" });
+      res.status(401).json({ success: false, message: "未提供认证令牌,访问被拒绝" });
       return;
     }
 
     const [scheme, token] = authHeader.split(" ");
     if (scheme !== "Bearer" || !token) {
-      res.status(401).json({ success: false, message: "认证令牌格式错误，应为 Bearer <token>" });
+      res.status(401).json({ success: false, message: "认证令牌格式错误,应为 Bearer <token>" });
       return;
     }
 
@@ -3346,7 +3346,7 @@ export function requireRole(...allowedRoles: string[]): RequestHandler {
       return;
     }
     if (!req.user.role || !allowedRoles.includes(req.user.role)) {
-      res.status(403).json({ success: false, message: "权限不足，无法访问此资源" });
+      res.status(403).json({ success: false, message: "权限不足,无法访问此资源" });
       return;
     }
     next();
@@ -3547,7 +3547,7 @@ export default app;
       <div class="hero">
         <div>
           <h1>${primaryResource.title}</h1>
-          <p>前后端一体页面，直接调用后端 API 完成${primaryResource.label}列表、添加、编辑、删除。</p>
+          <p>前后端一体页面,直接调用后端 API 完成${primaryResource.label}列表、添加、编辑、删除。</p>
         </div>
         <div class="status" id="status">正在初始化...</div>
       </div>
@@ -3611,16 +3611,16 @@ export default app;
 
       function renderRecords() {
         if (!state.records.length) {
-          els.list.innerHTML = "<div class='card'><p>暂无${primaryResource.label}，请先添加。</p></div>";
+          els.list.innerHTML = "<div class='card'><p>暂无${primaryResource.label},请先添加。</p></div>";
           return;
         }
         els.list.innerHTML = state.records.map((record) => {
           const id = record._id || record.id;
           return \`<article class="card">
             <h3>\${record.title || "未命名${primaryResource.label}"}</h3>
-            <p>负责人：\${record.author || "-"}</p>
-            <p>日期：\${(record.publishedDate || "").slice(0, 10) || "-"}</p>
-            <p>分类：\${record.genre || "-"}</p>
+            <p>负责人:\${record.author || "-"}</p>
+            <p>日期:\${(record.publishedDate || "").slice(0, 10) || "-"}</p>
+            <p>分类:\${record.genre || "-"}</p>
             <div class="actions">
               <button class="muted" type="button" onclick="window.editRecord('\${id}')">编辑</button>
               <button class="danger" type="button" onclick="window.removeRecord('\${id}')">删除</button>
@@ -3990,7 +3990,7 @@ export function analyzeTestProblem(testOutput: string, retryCount: number, hasMe
     return {
       type: 'environment_problem',
       confidence: 0.85,
-      reason: '检测到环境相关的错误（端口占用、依赖缺失等）',
+      reason: '检测到环境相关的错误(端口占用、依赖缺失等)',
       suggestedAction: '检查并修复环境问题'
     };
   }
@@ -4000,7 +4000,7 @@ export function analyzeTestProblem(testOutput: string, retryCount: number, hasMe
     return {
       type: 'architecture_problem',
       confidence: 0.8,
-      reason: isCrossFileError ? '检测到明显的跨文件接口不匹配' : `经过 ${retryCount} 次重试仍未解决，怀疑存在架构冲突`,
+      reason: isCrossFileError ? '检测到明显的跨文件接口不匹配' : `经过 ${retryCount} 次重试仍未解决,怀疑存在架构冲突`,
       suggestedAction: '触发架构师仲裁'
     };
   }
@@ -4009,7 +4009,7 @@ export function analyzeTestProblem(testOutput: string, retryCount: number, hasMe
     type: 'code_problem',
     confidence: 0.6,
     reason: '检测到明确的测试失败',
-    suggestedAction: '返回 failedFiles，让 coder 修复代码'
+    suggestedAction: '返回 failedFiles,让 coder 修复代码'
   };
 }
 
@@ -4025,7 +4025,7 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
     }
   };
 
-  // npm ETARGET: 常见于无效版本（例如 @types/mongoose@^7.0.0）
+  // npm ETARGET: 常见于无效版本(例如 @types/mongoose@^7.0.0)
   if (/No matching version found for @types\/mongoose@|ETARGET/i.test(testOutput)) {
     try {
       await runInstallCmd("npm pkg delete devDependencies.@types/mongoose", 60000);
@@ -4061,7 +4061,7 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
           try {
             await runInstallCmd("npm pkg delete devDependencies.@types/mongoose", 60000);
             await runInstallCmd("npm install --silent", 180000);
-            return { fixed: true, action: `安装 ${moduleName} 时发现 @types/mongoose 版本无效，已自动修复并重装依赖` };
+            return { fixed: true, action: `安装 ${moduleName} 时发现 @types/mongoose 版本无效,已自动修复并重装依赖` };
           } catch (fixErr: any) {
             return { fixed: false, reason: `修复缺失模块失败: ${fixErr.message || fixErr}` };
           }
@@ -4074,7 +4074,7 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
 }
 
 /**
- * 将原始错误输出归一化为“失败指纹”，用于识别自旋
+ * 将原始错误输出归一化为"失败指纹",用于识别自旋
  */
 export function buildFailureFingerprint(testOutput: string): string {
   const lines = (testOutput || "")
@@ -4124,7 +4124,7 @@ export function formatConsensusForLLM(consensus: ConsensusEntry[]): string {
   if (!consensus || consensus.length === 0) return '';
   const sections: string[] = [];
   const types: ConsensusType[] = ['requirement', 'technical', 'problem', 'solution', 'decision', 'discussion'];
-  
+
   for (const type of types) {
     const entries = consensus.filter(e => e.type === type);
     if (entries.length > 0) {
@@ -4146,12 +4146,12 @@ export function getDependencyRules(language: string, serverFile?: string, filesC
   if (lang.includes("javascript") || lang.includes("typescript")) {
     const needsCors = serverFile && filesContent?.[serverFile]?.includes("cors");
     const needsExpress = lang.includes("javascript") || lang.includes("typescript");
-    
+
     return `\n\n[package.json 依赖分类规则 - 严格执行]
-• 【dependencies】运行时必需的包：express, cors, sqlite3, pg, mongoose, axios 等
-• 【devDependencies】仅开发时需要的工具：typescript, ts-node, jest, eslint, prettier 等${needsCors ? `\n• 【本项目特别要求】cors 必须放在 dependencies 中` : ""}${needsExpress ? `\n• 【本项目特别要求】express 必须放在 dependencies 中` : ""}`;
+• 【dependencies】运行时必需的包:express, cors, sqlite3, pg, mongoose, axios 等
+• 【devDependencies】仅开发时需要的工具:typescript, ts-node, jest, eslint, prettier 等${needsCors ? `\n• 【本项目特别要求】cors 必须放在 dependencies 中` : ""}${needsExpress ? `\n• 【本项目特别要求】express 必须放在 dependencies 中` : ""}`;
   }
-  
+
   if (lang.includes("python")) {
     return `\n\n[requirements.txt 依赖规则]
 • 【运行时依赖】fastapi, uvicorn, sqlalchemy, requests, pydantic 等
@@ -4164,7 +4164,7 @@ function isInfraOwnedArtifactFile(file: string): boolean {
   const normalized = String(file || "").replace(/\\/g, "/").trim().toLowerCase();
   if (!normalized) return false;
 
-  // 冗余/无价值文件——LLM 经常生成但不对测试/运行产生贡献
+  // 冗余/无价值文件--LLM 经常生成但不对测试/运行产生贡献
   if (
     normalized === "scripts/verify.ts" ||
     normalized === "scripts/verify.js" ||
@@ -4449,7 +4449,7 @@ function inferFallbackDependencies(file: string, files: string[], runtime: Proje
 }
 
 /**
- * Fallback 子任务生成：当模型拆解失败时，基于 TechSpec 的 filesToCreate 动态生成任务链
+ * Fallback 子任务生成:当模型拆解失败时,基于 TechSpec 的 filesToCreate 动态生成任务链
  */
 export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
   const language = spec?.language || "TypeScript";
@@ -4463,10 +4463,10 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
     });
   const tasks: any[] = [];
 
-  // 1. 识别必需的基础文件（如果是 TS/JS 项目且没有在 filesToCreate 中显式包含 package.json）
+  // 1. 识别必需的基础文件(如果是 TS/JS 项目且没有在 filesToCreate 中显式包含 package.json)
   const isJS = language.toLowerCase().includes("typescript") || language.toLowerCase().includes("ts") || language.toLowerCase().includes("javascript");
   const hasPackageJson = filesToCreate.some((f: string) => f.includes("package.json"));
-  
+
   if (isJS && !hasPackageJson) {
     tasks.push({
       id: "fallback_task_pkg",
@@ -4494,7 +4494,7 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
     });
   });
 
-  // 3. 兜底逻辑：如果没有任何文件定义，至少生成一个入口
+  // 3. 兜底逻辑:如果没有任何文件定义,至少生成一个入口
   if (tasks.length === 0) {
     const isPython = language.toLowerCase().includes("python");
     const serverFile = isPython ? "main.py" : `server.${isJS ? (language.toLowerCase().includes("ts") ? "ts" : "js") : "js"}`;
@@ -4667,8 +4667,8 @@ function removeConflictingNodeTestFiles(spec: any): any {
   const filesToCreate = (spec?.filesToCreate || []).map((file: string) => String(file).replace(/\\/g, "/"));
   const devDependencies = { ...(spec?.devDependencies || {}) } as Record<string, string>;
 
-  // Jest config 变体去重：只保留 .cjs（Coder 和 Verifier 都假定 .cjs 为标准）
-  // 如果同时有 jest.config.cjs 和 jest.config.js/.ts/.mjs，去掉非 .cjs 变体
+  // Jest config 变体去重:只保留 .cjs(Coder 和 Verifier 都假定 .cjs 为标准)
+  // 如果同时有 jest.config.cjs 和 jest.config.js/.ts/.mjs,去掉非 .cjs 变体
   const hasCjs = filesToCreate.some((file: string) => /^jest\.config\.cjs$/i.test(file));
   if (hasCjs) {
     const altConfigs = filesToCreate.filter((file: string) =>
@@ -4736,7 +4736,7 @@ function requiresDomainLifecycleSplit(requirementProtocol: RequirementProtocol |
 
 function shouldUseBoundedCrudPlan(spec: any, requirementProtocol: RequirementProtocol | null | undefined): boolean {
   if (!isSimpleCrudExecutionTarget(spec, requirementProtocol)) return false;
-  // 如果 spec.filesToCreate 已经明确且较小（<=15），说明 Architect 已精简规划，不覆盖
+  // 如果 spec.filesToCreate 已经明确且较小(<=15),说明 Architect 已精简规划,不覆盖
   if ((spec?.filesToCreate?.length || 0) <= 15) return false;
   if ((spec?.filesToCreate?.length || 0) > 24) return true;
   if (requirementProtocol?.capabilities?.authRequired) return true;
@@ -4830,8 +4830,8 @@ function buildBoundedCrudFilePlan(spec: any, requirementProtocol: RequirementPro
     push(`tests/auth.test${ext}`);
   }
 
-  // scripts/verify.* 不再生成——测试由 jest/pytest 覆盖，验证脚本是冗余文件
-  // 100% 的 run 都包含它，增加 Coder 负担但不增加测试覆盖率
+  // scripts/verify.* 不再生成--测试由 jest/pytest 覆盖,验证脚本是冗余文件
+  // 100% 的 run 都包含它,增加 Coder 负担但不增加测试覆盖率
 
   return orderFilesByPreferredSequence(Array.from(boundedFiles));
 }
@@ -4867,7 +4867,7 @@ export function stabilizeSpecForExecution(
     }
   }
 
-  // ── 最终归一化：去重、排序、过滤冗余文件 ──
+  // ── 最终归一化:去重、排序、过滤冗余文件 ──
   nextSpec.filesToCreate = orderFilesByPreferredSequence(
     Array.from<string>(
       new Set(
@@ -4916,6 +4916,26 @@ function normalizeRouteContractPath(rawPath: string): string {
   return compact;
 }
 
+/**
+ * 从 contract 路径列表推断挂载前缀。
+ * 例如 ["/api/todos", "/api/todos/:id", "/api/health"] → ["/api/todos"]
+ * 逻辑：找出所有路径的最长公共资源前缀（不含参数段），
+ * 但每个 "资源集合" 单独提取（如 /api/todos 和 /api/health 是不同的集合）。
+ */
+function inferMountPrefixes(paths: string[]): string[] {
+  const prefixes = new Set<string>();
+  for (const p of paths) {
+    // 将路径按 / 分段，去掉参数段（:xxx），保留静态段
+    const segments = p.split("/").filter(s => s.length > 0 && !s.startsWith(":"));
+    if (segments.length >= 2) {
+      // 取前两个静态段作为 mount prefix：/api/todos
+      // 这覆盖了最常见的 /api/<resource> 模式
+      prefixes.add("/" + segments.slice(0, 2).join("/"));
+    }
+  }
+  return Array.from(prefixes);
+}
+
 function mergeMountPathWithRoutePath(mountPath: string, routePath: string): string {
   const normalizedMount = normalizeRouteContractPath(mountPath);
   const normalizedRoute = normalizeRouteContractPath(routePath);
@@ -4943,14 +4963,39 @@ export function findContractRouteDrift(
   );
   const mountPath = scopedOwnedEndpoints.length > 0 ? deriveRouteMountPath(scopedOwnedEndpoints, "") : "";
 
-  // 构建“无前缀版本”集合：将 /api/users/:id 也视为允许 /users/:id，
+  // 构建"无前缀版本"集合：将 /api/users/:id 也视为允许 /users/:id，
   // 容忍 coder 注册两种路径格式（带/不带 /api 前缀）
+  // 同时生成相对路由版本（路由文件内 router.get('/:id') 写法）：
+  //   GET /api/todos/:id → GET /:id, GET /todos/:id
+  //   POST /api/todos → POST /, POST /todos
   const allowedStripped = new Set<string>();
+
+  // 推断挂载基础路径：从所有 contract 路径中提取公共前缀
+  // 例如 ["/api/todos", "/api/todos/:id"] → ["/api/todos"]
+  const contractPaths = endpoints.map(ep => String(ep.path || "").trim());
+  const mountPrefixes = inferMountPrefixes(contractPaths);
+
   for (const entry of allowed) {
     allowedStripped.add(entry);
-    // 去掉常见前缀 /api /api/v1 等
+    // 去掉常见前缀 /api /api/v1 等：GET /api/todos/:id → GET /todos/:id
     const stripped = entry.replace(/^(\w+) \/api(?:\/v\d+)?\b/, "$1");
     if (stripped !== entry) allowedStripped.add(stripped);
+    // 去掉 mount 前缀，生成路由文件内的相对路径：
+    // GET /api/todos/:id → GET /:id  (去掉 /api/todos)
+    for (const prefix of mountPrefixes) {
+      if (prefix && prefix !== "/") {
+        const spaceIdx = entry.indexOf(" ");
+        if (spaceIdx > 0) {
+          const method = entry.slice(0, spaceIdx);
+          const path = entry.slice(spaceIdx + 1);
+          if (path.startsWith(prefix)) {
+            const remainder = path.slice(prefix.length) || "/";
+            const normalized = method + " " + remainder;
+            if (normalized !== entry) allowedStripped.add(normalized);
+          }
+        }
+      }
+    }
   }
 
   const routeRegex = /router\.(get|post|put|delete|patch)\s*\(\s*["'`](.+?)["'`]/gi;
@@ -4970,7 +5015,7 @@ export function findContractRouteDrift(
 }
 
 /**
- * 构建结构化三层共识上下文，供所有节点注入 system prompt
+ * 构建结构化三层共识上下文,供所有节点注入 system prompt
  */
 export function buildSystemContext(state: JimClawState): string[] {
   const core = state.consensusCore;
@@ -4993,70 +5038,70 @@ export function buildSystemContext(state: JimClawState): string[] {
 
   const lines: string[] = [];
 
-  // 第一层：核心信息
+  // 第一层:核心信息
   lines.push("[项目核心]");
-  lines.push(`• 项目：${core.projectTitle}`);
+  lines.push(`• 项目:${core.projectTitle}`);
   if (core.requirements.length > 0) {
-    lines.push(`• 需求：${core.requirements.map((r, i) => `${i + 1}. ${r}`).join("  ")}`);
+    lines.push(`• 需求:${core.requirements.map((r, i) => `${i + 1}. ${r}`).join("  ")}`);
   }
   if (core.architectureSummary) {
-    lines.push(`• 架构：${core.architectureSummary}`);
+    lines.push(`• 架构:${core.architectureSummary}`);
   }
   if (core.techStack) {
-    lines.push(`• 技术栈：${core.techStack}，端口：${core.port}`);
+    lines.push(`• 技术栈:${core.techStack},端口:${core.port}`);
   }
   if (core.framework) {
-    lines.push(`• 主框架：${core.framework}`);
+    lines.push(`• 主框架:${core.framework}`);
   }
   if (core.coreDependencies && Object.keys(core.coreDependencies).length > 0) {
     const deps = Object.entries(core.coreDependencies).map(([k, v]) => `${k}@${v}`).join(", ");
-    lines.push(`• 运行时依赖：${deps}`);
+    lines.push(`• 运行时依赖:${deps}`);
   }
   if (core.coreDevDependencies && Object.keys(core.coreDevDependencies).length > 0) {
     const devDeps = Object.entries(core.coreDevDependencies).map(([k, v]) => `${k}@${v}`).join(", ");
-    lines.push(`• 开发依赖：${devDeps}`);
+    lines.push(`• 开发依赖:${devDeps}`);
   }
   if (core.criticalDecisions.length > 0) {
-    lines.push(`• 关键决策：${core.criticalDecisions.map(d => `• ${d}`).join("  ")}`);
+    lines.push(`• 关键决策:${core.criticalDecisions.map(d => `• ${d}`).join("  ")}`);
   }
 
-  // 第二层：进度快照
+  // 第二层:进度快照
   if (progress) {
     const total = progress.completedFiles.length + progress.pendingFiles.length;
     lines.push("");
-    lines.push(`[当前进度（第 ${progress.currentRound} 轮）]`);
-    lines.push(`• 已完成（${progress.completedFiles.length}/${total} 个文件）：${progress.completedFiles.join(", ") || "无"}`);
-    lines.push(`• 待完成：${progress.pendingFiles.join(", ") || "无"}`);
+    lines.push(`[当前进度(第 ${progress.currentRound} 轮)]`);
+    lines.push(`• 已完成(${progress.completedFiles.length}/${total} 个文件):${progress.completedFiles.join(", ") || "无"}`);
+    lines.push(`• 待完成:${progress.pendingFiles.join(", ") || "无"}`);
     if (progress.openIssues.length > 0) {
-      lines.push(`• 未解决问题：${progress.openIssues.join("; ")}`);
+      lines.push(`• 未解决问题:${progress.openIssues.join("; ")}`);
     }
   }
 
   if (requirementProtocol) {
     lines.push("");
     lines.push("[需求协议]");
-    lines.push(`• frontendRequired：${requirementProtocol.capabilities.frontendRequired ? "是" : "否"}`);
-    lines.push(`• backendRequired：${requirementProtocol.capabilities.backendRequired ? "是" : "否"}`);
-    lines.push(`• authRequired：${requirementProtocol.capabilities.authRequired ? "是" : "否"}`);
-    lines.push(`• auditLogRequired：${requirementProtocol.capabilities.auditLogRequired ? "是" : "否"}`);
+    lines.push(`• frontendRequired:${requirementProtocol.capabilities.frontendRequired ? "是" : "否"}`);
+    lines.push(`• backendRequired:${requirementProtocol.capabilities.backendRequired ? "是" : "否"}`);
+    lines.push(`• authRequired:${requirementProtocol.capabilities.authRequired ? "是" : "否"}`);
+    lines.push(`• auditLogRequired:${requirementProtocol.capabilities.auditLogRequired ? "是" : "否"}`);
     if (requirementProtocol.capabilities.entities.length > 0) {
-      lines.push(`• entities：${requirementProtocol.capabilities.entities.join(", ")}`);
+      lines.push(`• entities:${requirementProtocol.capabilities.entities.join(", ")}`);
     }
     if (requirementProtocol.capabilities.uiCapabilities.length > 0) {
-      lines.push(`• uiCapabilities：${requirementProtocol.capabilities.uiCapabilities.join(", ")}`);
+      lines.push(`• uiCapabilities:${requirementProtocol.capabilities.uiCapabilities.join(", ")}`);
     }
   }
 
   if (solutionProtocol) {
     lines.push("");
     lines.push("[方案覆盖]");
-    lines.push(`• frontendPlanned：${solutionProtocol.coverage.frontendPlanned ? "是" : "否"}`);
-    lines.push(`• backendPlanned：${solutionProtocol.coverage.backendPlanned ? "是" : "否"}`);
+    lines.push(`• frontendPlanned:${solutionProtocol.coverage.frontendPlanned ? "是" : "否"}`);
+    lines.push(`• backendPlanned:${solutionProtocol.coverage.backendPlanned ? "是" : "否"}`);
     if (solutionProtocol.coverage.uncoveredRequirements.length > 0) {
-      lines.push(`• 未覆盖需求：${solutionProtocol.coverage.uncoveredRequirements.join("；")}`);
+      lines.push(`• 未覆盖需求:${solutionProtocol.coverage.uncoveredRequirements.join(";")}`);
     }
     if (solutionProtocol.coverage.uncoveredAcceptanceCriteria.length > 0) {
-      lines.push(`• 未覆盖验收：${solutionProtocol.coverage.uncoveredAcceptanceCriteria.join("；")}`);
+      lines.push(`• 未覆盖验收:${solutionProtocol.coverage.uncoveredAcceptanceCriteria.join(";")}`);
     }
   }
 
@@ -5070,17 +5115,17 @@ export function buildSystemContext(state: JimClawState): string[] {
     lines.push(`• deploy: docker=${technologyDecision.deploy.docker ? "是" : "否"} / compose=${technologyDecision.deploy.compose ? "是" : "否"}`);
   }
 
-  // 第三层：会议纪要摘要
+  // 第三层:会议纪要摘要
   if (protocol) {
     lines.push("");
     lines.push("[执行协议]");
-    lines.push(`• 版本：${protocol.version}`);
-    lines.push(`• runtime：${protocol.project.runtime}`);
-    lines.push(`• sourceRoots：${(protocol.project.workspaceLayout.sourceRoots || []).join(", ") || "无"}`);
-    lines.push(`• testRoots：${(protocol.project.workspaceLayout.testRoots || []).join(", ") || "无"}`);
-    lines.push(`• frontendRoots：${(protocol.project.workspaceLayout.frontendRoots || []).join(", ") || "无"}`);
-    lines.push(`• entryFiles：${(protocol.project.workspaceLayout.entryFiles || []).join(", ") || "无"}`);
-    lines.push(`• healthCheckPath：${protocol.runtime.healthCheckPath || "无"}`);
+    lines.push(`• 版本:${protocol.version}`);
+    lines.push(`• runtime:${protocol.project.runtime}`);
+    lines.push(`• sourceRoots:${(protocol.project.workspaceLayout.sourceRoots || []).join(", ") || "无"}`);
+    lines.push(`• testRoots:${(protocol.project.workspaceLayout.testRoots || []).join(", ") || "无"}`);
+    lines.push(`• frontendRoots:${(protocol.project.workspaceLayout.frontendRoots || []).join(", ") || "无"}`);
+    lines.push(`• entryFiles:${(protocol.project.workspaceLayout.entryFiles || []).join(", ") || "无"}`);
+    lines.push(`• healthCheckPath:${protocol.runtime.healthCheckPath || "无"}`);
   }
 
   if (validationReport) {
@@ -5119,7 +5164,7 @@ export function buildSystemContext(state: JimClawState): string[] {
     for (const note of notes) {
       lines.push(`• [${note.id}] ${note.summary}`);
     }
-    lines.push("（需要详情？调用 read_meeting_note(note_id)）");
+    lines.push("(需要详情?调用 read_meeting_note(note_id))");
   }
 
   return lines;
@@ -5136,21 +5181,21 @@ export function buildCoderExecutionContext(
 
   lines.push("[Coder 执行上下文]");
   if (core?.projectTitle) {
-    lines.push(`• 项目：${core.projectTitle}`);
+    lines.push(`• 项目:${core.projectTitle}`);
   }
   if (core?.techStack) {
-    lines.push(`• 技术栈：${core.techStack}`);
+    lines.push(`• 技术栈:${core.techStack}`);
   } else if (state.spec?.language || state.spec?.framework) {
-    lines.push(`• 技术栈：${[state.spec?.language, state.spec?.framework].filter(Boolean).join(" + ")}`);
+    lines.push(`• 技术栈:${[state.spec?.language, state.spec?.framework].filter(Boolean).join(" + ")}`);
   }
   if (core?.framework || state.spec?.framework) {
-    lines.push(`• 主框架：${core?.framework || state.spec?.framework}`);
+    lines.push(`• 主框架:${core?.framework || state.spec?.framework}`);
   }
   if (core?.port || protocol?.runtime?.listenPort) {
-    lines.push(`• 统一端口：${core?.port || protocol?.runtime?.listenPort}`);
+    lines.push(`• 统一端口:${core?.port || protocol?.runtime?.listenPort}`);
   }
   lines.push(
-    `• 执行阶段：${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
+    `• 执行阶段:${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
   );
 
   if (requirementProtocol) {
@@ -5161,15 +5206,15 @@ export function buildCoderExecutionContext(
       requirementProtocol.capabilities.auditLogRequired ? "audit" : "",
     ].filter(Boolean);
     if (flags.length > 0) {
-      lines.push(`• 需求能力：${flags.join(", ")}`);
+      lines.push(`• 需求能力:${flags.join(", ")}`);
     }
   }
 
   if (protocol) {
-    lines.push(`• runtime：${protocol.project.runtime}`);
-    lines.push(`• entry：${(protocol.project.workspaceLayout.entryFiles || []).join(", ") || "无"}`);
-    lines.push(`• testRoots：${(protocol.project.workspaceLayout.testRoots || []).join(", ") || "无"}`);
-    lines.push(`• healthCheckPath：${protocol.runtime.healthCheckPath || "无"}`);
+    lines.push(`• runtime:${protocol.project.runtime}`);
+    lines.push(`• entry:${(protocol.project.workspaceLayout.entryFiles || []).join(", ") || "无"}`);
+    lines.push(`• testRoots:${(protocol.project.workspaceLayout.testRoots || []).join(", ") || "无"}`);
+    lines.push(`• healthCheckPath:${protocol.runtime.healthCheckPath || "无"}`);
   }
 
   if (currentTask?.fileTarget) {
@@ -5184,16 +5229,16 @@ export function buildCoderExecutionContext(
       .filter(Boolean);
     lines.push("");
     lines.push("[当前任务]");
-    lines.push(`• file：${fileTarget}`);
-    lines.push(`• role：${fileContract?.role || "other"}`);
+    lines.push(`• file:${fileTarget}`);
+    lines.push(`• role:${fileContract?.role || "other"}`);
     if (dependencyLabels.length > 0) {
-      lines.push(`• directDependencies：${dependencyLabels.join(", ")}`);
+      lines.push(`• directDependencies:${dependencyLabels.join(", ")}`);
     }
     if (currentTask.contextRequirement) {
-      lines.push(`• contextRequirement：${currentTask.contextRequirement}`);
+      lines.push(`• contextRequirement:${currentTask.contextRequirement}`);
     }
     if (fileContract?.ownedEndpoints?.length) {
-      lines.push(`• ownedEndpoints：${fileContract.ownedEndpoints.join(", ")}`);
+      lines.push(`• ownedEndpoints:${fileContract.ownedEndpoints.join(", ")}`);
     }
   }
 
@@ -5259,12 +5304,12 @@ export async function recordNodeFailure(
   const noteId = `note-${nodeName}-r${round}`;
   const rawMessage = error instanceof Error ? (error.stack || error.message) : String(error);
   const firstLine = rawMessage.split(/\r?\n/).find((line) => line.trim()) || rawMessage;
-  const summary = `${nodeName} 节点异常：${trimFailureText(firstLine, 60)}`;
+  const summary = `${nodeName} 节点异常:${trimFailureText(firstLine, 60)}`;
   const fullContent = [
     `# ${nodeName} 节点异常`,
     "",
-    `- 轮次：${round}`,
-    `- 摘要：${summary}`,
+    `- 轮次:${round}`,
+    `- 摘要:${summary}`,
     "",
     "## 原始错误",
     "```text",
