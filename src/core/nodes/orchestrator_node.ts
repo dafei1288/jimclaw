@@ -15,7 +15,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const ORCHESTRATOR_MODEL_TIMEOUT_MS = 45000;
+const ORCHESTRATOR_MODEL_TIMEOUT_MS = 90000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (

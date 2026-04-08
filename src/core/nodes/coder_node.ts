@@ -1806,14 +1806,17 @@ CMD ["node", "dist/index.js"]`;
       // 测试文件专项提示
       if (task.fileTarget.includes("test") || task.fileTarget.includes("spec")) {
         prompt += `\n\n[测试文件铁律 - 必须严格遵守]：
-1. **Jest Mock 污染防护**：如果 beforeEach 中调用了 mock 函数（如 register、setup 等会触发 mockResponse.json 的函数），必须在该 beforeEach 末尾添加 mock 重置，例如：
+1. **只能 import 已存在的文件**：测试文件只能 import workspace 中已生成或由 scaffold 生成的模块。严禁 import 不存在的文件、未在 package.json 中声明的第三方包。如果需要某个工具函数，在测试文件内直接定义。
+   - 已知可用的包：express, supertest, jest/ts-jest（测试框架内置，无需 import）。
+   - 如果 package.json 中没有 uuid、axios、lodash 等包，不要在测试中 import 它们。
+2. **Jest Mock 污染防护**：如果 beforeEach 中调用了 mock 函数（如 register、setup 等会触发 mockResponse.json 的函数），必须在该 beforeEach 末尾添加 mock 重置，例如：
    \`\`\`typescript
    (mockResponse.json as jest.Mock).mockClear();
    (mockResponse.status as jest.Mock).mockClear();
    \`\`\`
    否则后续测试中 mock.calls[0][0] 会取到 setup 阶段的调用结果，导致断言失败。
-2. **TypeScript 严格模式**：项目开启了 noUnusedLocals，任何 import 的类型或变量如果未在文件中使用，必须删除，否则整个测试套件将无法运行（TS6133 错误）。
-3. **断言数据来源**：使用 mock.calls[N][0] 时，N 必须对应测试逻辑中第 N+1 次调用。如果 beforeEach 已经触发了一次调用，则测试中的第一次调用结果在 mock.calls[1][0] 而非 mock.calls[0][0]。`;
+3. **TypeScript 严格模式**：项目开启了 noUnusedLocals，任何 import 的类型或变量如果未在文件中使用，必须删除，否则整个测试套件将无法运行（TS6133 错误）。
+4. **断言数据来源**：使用 mock.calls[N][0] 时，N 必须对应测试逻辑中第 N+1 次调用。如果 beforeEach 已经触发了一次调用，则测试中的第一次调用结果在 mock.calls[1][0] 而非 mock.calls[0][0]。`;
       }
 
       prompt += `\n\n[输出质量铁律 - 必须严格遵守]：

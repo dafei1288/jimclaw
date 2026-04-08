@@ -113,10 +113,13 @@
 - [x] **QA fallback 模型** — 配置 minmax 作为第二选择（不同供应商）
 - [x] **buildFallbackChain 增强** — fallback 模式优先于 default/coding/reasoning
 
-#### Phase 2.11: 待修复
-- [ ] **Coder 测试文件幻觉** — Coder 生成的测试引用不存在的模块
-- [ ] **端到端验证** — API 额度恢复后验证 Python/TS 项目
-- [ ] **健康检查 API 测试** — 再验证基础功能仍然正常
+#### Phase 2.11: ✅ 已完成
+- [x] **端到端验证** — TS/Express CRUD API retryCount=0，健康检查 API retryCount=0，Todo CRUD API retryCount=2
+- [x] **健康检查 API 测试** — 基础功能验证通过
+- [x] **契约漂移路由文件修复** — `inferMountPrefixes()` 支持路由文件相对路径匹配
+- [x] **Architect README 超时降噪** — Promise.race 替代 agent timeout，不再打印 [Critical Error]
+- [x] **Coder 测试文件 import 约束** — 测试文件铁律新增「只能 import 已存在的文件」规则
+- [x] **Orchestrator 超时增加** — 45s → 90s，减少间歇性超时
 
 ### Phase 3：代码质量与可维护性
 
