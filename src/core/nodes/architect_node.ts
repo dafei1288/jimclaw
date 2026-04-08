@@ -690,7 +690,9 @@ ${langFileConstraints}
 
   if (!readmeContent) {
     try {
-      const readmeResponse = await agents.architect.chat(
+      // README 生成是附加功能，用 Promise.race 实现独立超时
+      // 避免通过 agent.chat 的 timeout 触发 [Critical Error] 噪音日志
+      const readmePromise = agents.architect.chat(
         [{
           role: "user",
           content: `基于以下设计，生成一份中文 README.md：
@@ -705,14 +707,21 @@ API 接口：${JSON.stringify(apiContract, null, 2)}
         {
           brief: buildSystemContext(state),
           workspaceDir: WORKSPACE,
-          timeoutMs: ARCHITECT_README_TIMEOUT_MS,
+          // 不设 agent 级超时，由 Promise.race 控制
         }
       );
+      const readmeResponse = await Promise.race([
+        readmePromise,
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error("README timeout")), ARCHITECT_README_TIMEOUT_MS)
+        ),
+      ]);
       readmeContent = extractText(readmeResponse.content);
     } catch (error: any) {
-      if (!isRecoverableAgentError(error)) throw error;
-      designSource = "deterministic-fallback";
+      // README 生成失败不影响主流程，静默 fallback
+      designSource = readmeContent ? designSource : "deterministic-fallback";
       readmeContent = `# ${state.contract?.title || "项目"}\n\n## 说明\nREADME 由确定性降级骨架生成，因为架构师 README 补充阶段超时或暂不可用。\n\n## 启动\n- npm install\n- npm test\n- npm start\n`;
+      console.warn(`[Architect] README 生成超时/失败，使用确定性 fallback (${String(error?.message || error).slice(0, 80)})`);
     }
   }
 
