@@ -340,7 +340,7 @@ export async function infraNode(
   startSpan("infra_setup");
   const round = state.retryCount || 0;
   const lang = state.spec?.language?.toLowerCase() ?? "javascript";
-  const image = lang.includes("python") ? "python:3.11" : lang.includes("go") ? "golang:1.21" : "node:20-alpine";
+  const image = lang.includes("python") ? "python:3.11" : lang.includes("go") ? "golang:1.21-alpine" : "node:20-alpine";
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
   const commandExecutor =
     deps?.commandExecutor ||

@@ -121,10 +121,16 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
   // 检测目标语言/框架
   const targetStack = detectTargetStack(goal, state.contract?.title || "");
   const isPython = targetStack.language === "Python";
+  const isGo = targetStack.language === "Go";
 
   // ── Python / FastAPI 路径 ──
   if (isPython) {
     return buildDeterministicPythonOutput(state, requirementProtocol, singular, plural, detectedPort, targetStack, isSimple);
+  }
+
+  // ── Go / Gin 路径 ──
+  if (isGo) {
+    return buildDeterministicGoOutput(state, requirementProtocol, singular, plural, detectedPort, targetStack, isSimple);
   }
 
   // ── Express / TypeScript 路径（原有逻辑） ──
@@ -321,6 +327,95 @@ function buildDeterministicPythonOutput(
   };
 }
 
+function buildDeterministicGoOutput(
+  state: JimClawState,
+  requirementProtocol: any,
+  singular: string,
+  plural: string,
+  port: number,
+  targetStack: { language: string; framework: string; templateId: string },
+  isSimple: boolean
+) {
+  const hasAuth = requirementProtocol.capabilities?.authRequired;
+
+  let filesToCreate: string[];
+  let architecture: string;
+
+  if (isSimple) {
+    filesToCreate = [
+      "go.mod",
+      "main.go",
+      "Dockerfile",
+      "handler/health_test.go",
+    ];
+    architecture = "确定性降级骨架：基于 Go Gin 的最小 API 服务。";
+  } else {
+    filesToCreate = [
+      "go.mod",
+      "main.go",
+      `handler/${plural}.go`,
+      "handler/health.go",
+      "Dockerfile",
+      `handler/${plural}_test.go`,
+      "handler/health_test.go",
+    ];
+    if (hasAuth) {
+      filesToCreate.push("handler/auth.go");
+    }
+    architecture = `确定性降级骨架：基于 Go Gin 的单体应用，围绕 ${singular} 资源提供 API 与部署入口。`;
+  }
+
+  const spec = {
+    architecture,
+    language: "Go",
+    framework: "Gin ^1.9",
+    testCommand: "go test ./... -v",
+    runCommand: `go run main.go`,
+    entryPoint: "main.go",
+    authScaffoldMode: "compact",
+    filesToCreate,
+    interfaces: "REST API",
+    dependencies: {},
+    devDependencies: {},
+    _goModule: "jimclaw-app",
+    _goGinVersion: "v1.9.1",
+  };
+
+  const manifest = {
+    services: [{ name: "api", port, description: "主应用服务" }],
+    environment: {},
+    sharedConfig: {},
+  };
+
+  const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
+  if (hasAuth) {
+    endpoints.push({ path: "/api/auth/register", method: "POST", description: "用户注册" });
+    endpoints.push({ path: "/api/auth/login", method: "POST", description: "用户登录" });
+  }
+  const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
+
+  const readme = `# ${state.contract?.title || "项目"}\n\n## 说明\n本次使用确定性降级骨架生成最小可执行方案（Go Gin）。\n\n## 启动\n- 安装依赖：\`go mod tidy\`\n- 运行测试：\`go test ./... -v\`\n- 启动服务：\`go run main.go\`\n`;
+
+  // Go 确定性骨架强制关闭不需要的能力
+  requirementProtocol = {
+    ...requirementProtocol,
+    capabilities: {
+      ...(requirementProtocol?.capabilities || {}),
+      frontendRequired: false,
+      authRequired: false,
+      auditLogRequired: false,
+    },
+  };
+
+  return {
+    requirementProtocol,
+    spec: stabilizeSpecForExecution(spec, requirementProtocol),
+    manifest,
+    apiContract,
+    readme,
+  };
+}
+
 function normalizeNodeDependencyLayout(spec: any): any {
   const language = String(spec?.language || "").toLowerCase();
   if (!/typescript|javascript|node/.test(language)) return spec;
@@ -362,6 +457,7 @@ export async function architectNode(
   // ── 动态语言/框架检测 ──
   const targetStackHint = detectTargetStack(String(state.userGoal || ""), state.contract?.title || "");
   const isHintPython = targetStackHint.language === "Python";
+  const isHintGo = targetStackHint.language === "Go";
 
   let requirementProtocol = state.requirementProtocol || buildRequirementProtocol(state.contract);
   let spec: any;
@@ -372,8 +468,8 @@ export async function architectNode(
 
   // ── 非 TypeScript 快速通道：直接走确定性路径，不调 LLM ──
   // LLM 倾向于输出 TypeScript（因训练数据偏移），强制用确定性骨架更可靠
-  if (isHintPython) {
-    emit("thinking", "System", `检测到 Python 目标，使用确定性骨架（跳过 LLM）`, {});
+  if (isHintPython || isHintGo) {
+    emit("thinking", "System", `检测到 ${targetStackHint.language} 目标，使用确定性骨架（跳过 LLM）`, {});
     const fallback = await buildDeterministicArchitectOutput(state);
     requirementProtocol = fallback.requirementProtocol;
     spec = fallback.spec;

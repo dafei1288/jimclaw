@@ -16,6 +16,7 @@ import {
 } from "./types";
 import expressTsProvider from "./express_typescript";
 import fastApiPythonProvider from "./fastapi_python";
+import "./gin_go"; // side-effect: auto-registers
 
 let initialized = false;
 
