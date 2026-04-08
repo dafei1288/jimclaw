@@ -81,6 +81,7 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
   return (
     normalized === "package.json" ||
+    normalized === "requirements.txt" ||
     normalized === "tsconfig.json" ||
     /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(normalized) ||
     normalized === "tests/setup.test.ts" ||
@@ -198,6 +199,9 @@ function isCorePhaseActive(
   state: JimClawState,
   subTasks: Array<{ fileTarget: string }> = []
 ): boolean {
+  // Python/Go/Java 项目子任务少且依赖关系清晰，不分阶段全部写完
+  const lang = (state.spec?.language || "").toLowerCase();
+  if (lang.includes("python") || lang.includes("go") || lang.includes("java")) return false;
   return (state.retryCount || 0) === 0 && !state.validationCheckpointCompleted && subTasks.length >= 10;
 }
 
@@ -224,7 +228,7 @@ function getCoderFirstWriteTimeoutMs(
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
   const isHeavyRole = normalized.includes("/services/") || normalized.includes("/controllers/") || normalized.includes("/routes/");
   if (!isHeavyRole) return 0;
-  return 45000;
+  return 90000;
 }
 
 function isAgentTimeoutError(error: any): boolean {
@@ -679,6 +683,13 @@ function areTaskDependenciesSatisfied(
 
   return dependencies.every((dependency) => {
     if (filesContent[dependency] !== undefined) return true;
+    // jest.config 变体名兼容
+    if (/jest\.config\.(js|ts|mjs)$/.test(dependency)) {
+      const cjsVariant = dependency.replace(/\.(js|ts|mjs)$/, ".cjs");
+      if (filesContent[cjsVariant] !== undefined) return true;
+      const cjsTask = subTasks.find((item) => item.fileTarget === cjsVariant);
+      if (cjsTask?.status === "completed") return true;
+    }
     const dependencyTask = subTasks.find((item) => item.fileTarget === dependency || item.id === dependency);
     return dependencyTask?.status === "completed";
   });
@@ -909,11 +920,89 @@ function resolveRelativeImportTarget(fromFile: string, importPath: string): stri
   return path.posix.normalize(path.posix.join(baseDir, importPath));
 }
 
+/**
+ * 自动剥离引用不存在文件的 import 行。
+ * 解决 Coder LLM 幻觉问题：生成的代码引用了不在 filesToCreate 中的模块。
+ * 策略：只移除 import 行本身，不尝试删除使用处代码（由后续编译校验兜底）。
+ * 仅处理相对路径 import（以 . 开头），不碰第三方库。
+ */
+function stripInvalidImports(
+  fileTarget: string,
+  content: string,
+  filesContent: Record<string, string>,
+  filesToCreate: string[]
+): string {
+  // 构建项目中存在的文件集合（含常见扩展名解析）
+  const existingFiles = new Set<string>();
+  for (const f of Object.keys(filesContent)) {
+    existingFiles.add(f.replace(/\\/g, "/"));
+  }
+  for (const f of filesToCreate) {
+    existingFiles.add(f.replace(/\\/g, "/"));
+  }
+
+  // 扩展名解析候选列表
+  const extensions = [".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"];
+
+  const lines = content.split("\n");
+  const strippedLines: string[] = [];
+  let modified = false;
+
+  for (const line of lines) {
+    // 匹配 import ... from "..." 或 import "..."
+    const importMatch = line.match(
+      /^(\s*import\s+(?:type\s+)?(?:.+?\s+from\s+)?["'])([^"']+)(["']\s*;?\s*)$/
+    );
+    if (!importMatch) {
+      strippedLines.push(line);
+      continue;
+    }
+
+    const importPath = importMatch[2];
+    // 只处理相对路径 import
+    if (!importPath.startsWith(".")) {
+      strippedLines.push(line);
+      continue;
+    }
+
+    const targetBase = resolveRelativeImportTarget(fileTarget, importPath);
+    if (!targetBase) {
+      strippedLines.push(line);
+      continue;
+    }
+
+    // 检查目标文件是否存在（含各种扩展名解析）
+    let found = existingFiles.has(targetBase);
+    if (!found) {
+      for (const ext of extensions) {
+        if (existingFiles.has(targetBase + ext)) {
+          found = true;
+          break;
+        }
+      }
+    }
+
+    if (found) {
+      strippedLines.push(line);
+    } else {
+      // 目标文件不存在——剥离此 import
+      modified = true;
+      console.warn(
+        `${logPrefix("System")} [Coder] 剥离无效 import: ${fileTarget} -> ${importPath} (目标 ${targetBase} 不存在)`
+      );
+    }
+  }
+
+  return modified ? strippedLines.join("\n") : content;
+}
+
 function validateImportContracts(
   fileTarget: string,
   content: string,
   filesContent: Record<string, string>
 ): string[] {
+  const totalFiles = Object.keys(filesContent).length;
+  const skipExportValidation = totalFiles <= 15;
   const errors: string[] = [];
   const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
   let match: RegExpExecArray | null;
@@ -936,7 +1025,13 @@ function validateImportContracts(
       .map((candidate) => candidate.replace(/\\/g, "/"))
       .find((candidate) => filesContent[candidate] !== undefined);
 
-    if (!targetFile) continue;
+    if (!targetFile) {
+      // 目标文件不存在——这是编译错误（TS2307），必须报告
+      errors.push(`${targetBase} 不存在于项目中，无法导入`);
+      continue;
+    }
+
+    if (skipExportValidation) continue;
 
     const contract = extractExportContract(filesContent[targetFile]);
     const sanitized = specifier.replace(/\s+/g, " ").trim();
@@ -973,6 +1068,9 @@ function validateProtocolDependencyRoles(
 ): string[] {
   const currentContract = getProtocolFileContract(protocol, fileTarget);
   if (!currentContract || !currentContract.allowedDependencyRoles?.length) return [];
+  // 小型项目（≤15 文件）跳过严格依赖角色校验——奥卡姆剃刀
+  const totalFiles = Object.keys(filesContent).length;
+  if (totalFiles <= 15) return [];
 
   const errors: string[] = [];
   const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
@@ -1066,10 +1164,14 @@ async function reconcileCompletedFilesFromDisk(
   filesContent: Record<string, string>,
   codeLogEntries: FileChangeEntry[],
   currentRetry: number,
-  protocol: JimClawState["executionProtocol"]
+  protocol: JimClawState["executionProtocol"],
+  qaFailedFiles?: string[]
 ): Promise<void> {
+  const qaFailedSet = new Set((qaFailedFiles || []).map(f => f.replace(/\\/g, "/")));
   for (const task of subTasks) {
     if (task.status === "completed") continue;
+    // 不要从磁盘恢复本轮 QA 标记为失败的文件——它们需要重新生成
+    if (qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"))) continue;
 
     const recovered = await tryLoadValidatedDiskOutput(workspace, task.fileTarget, filesContent, protocol);
     if (!recovered.ok) continue;
@@ -1137,6 +1239,8 @@ export async function coderNode(
       if ((localRetryAttempts[task.fileTarget] || 0) > 0) return false;
       const hasFixPlan = (state.fixPlan || []).some((plan) => plan.fileTarget === task.fileTarget);
       if (hasFixPlan) return false;
+      const hasQaFailure = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/"))).has(task.fileTarget.replace(/\\/g, "/"));
+      if (hasQaFailure) return false;
       return Boolean(resolveAllowedDeterministicScaffold(state, task.fileTarget));
     });
     const batch = readyTasks.slice(0, maxParallel);
@@ -1194,10 +1298,16 @@ export async function coderNode(
             error: `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}`,
           };
         }
+        // 自动剥离确定性 scaffold 中引用不存在文件的 import
+        const specFiles = (state.spec?.filesToCreate || []).map(f => f.replace(/\\/g, "/"));
+        const cleanedScaffold = isNodeLikeLanguage(state.spec?.language)
+          ? stripInvalidImports(task.fileTarget, scaffold, filesContent, specFiles)
+          : scaffold;
+
         return {
           ok: true as const,
           task,
-          code: scaffold,
+          code: cleanedScaffold,
           generationSource: "deterministic_scaffold" as const,
         };
       })
@@ -1351,16 +1461,21 @@ export async function coderNode(
           if (!extractResult.isValid) {
             return { ok: false as const, task, code: "", error: extractResult.error || "代码提取失败" };
           }
-          const code = extractResult.code || "";
+          let code = extractResult.code || "";
           const validationError = validateGeneratedFileContent(task.fileTarget, code);
           if (validationError) {
             return { ok: false as const, task, code: "", error: validationError };
+          }
+          // 先 strip 无效 import（引用不存在文件），再校验导出契约
+          if (isNodeLikeLanguage(state.spec?.language)) {
+            const specFiles = (state.spec?.filesToCreate || []).map(f => f.replace(/\\/g, "/"));
+            code = stripInvalidImports(task.fileTarget, code, filesContent, specFiles);
           }
           const importContractErrors = validateImportContracts(task.fileTarget, code, filesContent);
           if (importContractErrors.length > 0) {
             return { ok: false as const, task, code: "", error: `依赖导出契约校验失败: ${importContractErrors.join("; ")}` };
           }
-          const protocolDependencyErrors = validateProtocolDependencyRoles(state.executionProtocol, task.fileTarget, code, filesContent);
+                    const protocolDependencyErrors = validateProtocolDependencyRoles(state.executionProtocol, task.fileTarget, code, filesContent);
           if (protocolDependencyErrors.length > 0) {
             return { ok: false as const, task, code: "", error: `执行协议依赖角色校验失败: ${protocolDependencyErrors.join("; ")}` };
           }
@@ -1501,12 +1616,25 @@ export async function coderNode(
     filesContent,
     codeLogEntries,
     currentRetry,
-    state.executionProtocol
+    state.executionProtocol,
+    state.qaFailures?.failedFiles
   );
+
+  // ── 全局超时保护：防止 Coder process 被外部杀死而丢失已完成的工作 ──
+  const CODER_GLOBAL_TIMEOUT_MS = 10 * 60 * 1000; // 10 分钟（Python 项目需要更长）
+  const coderStartTime = Date.now();
 
   normalizeStructuralDependencies(subTasks as any);
   let progressMade = true;
   while (progressMade && !blockedReason) {
+    // 全局超时检查
+    if (Date.now() - coderStartTime > CODER_GLOBAL_TIMEOUT_MS) {
+      const completedCount = subTasks.filter((t: any) => t.status === "completed").length;
+      const totalCount = subTasks.length;
+      emit("thinking", "System", `[Coder] 全局超时（>${CODER_GLOBAL_TIMEOUT_MS / 1000}s），已完成 ${completedCount}/${totalCount}，保存进度并退出`, {});
+      console.log(`${logPrefix("System")} [Coder] 全局超时：${completedCount}/${totalCount} 文件已完成`);
+      break;
+    }
     progressMade = false;
     const parallelBatch = await runDeterministicParallelBatch();
     if (parallelBatch.progressed) {
@@ -1628,6 +1756,24 @@ export async function coderNode(
       const appPort = state.manifest?.services?.[0]?.port || 8080;
       prompt += `\n\n[硬性技术规范]：\n本项目统一使用端口 ${appPort}。如果该文件涉及服务启动、端口监听或 Docker 配置，请务必将其设置为 ${appPort}。严禁使用其他端口。`;
 
+      // Express req.params 类型安全提示
+      if (/\.(ts|js)$/i.test(task.fileTarget) && /express/i.test(state.spec?.framework || "")) {
+        prompt += `\n\n[Express 类型安全提示]：\nreq.params 的类型是 Record<string, string | string[]>（不是纯 string）。解构赋值后不可直接传给只接受 string 的函数。正确做法：使用 req.params.id as string，或 const id = String(req.params.id)。`;
+      }
+
+      // Express 入口文件导出格式约束 + 服务器启动约束
+      if (/^src\/index\.(ts|js)$/i.test(task.fileTarget) && /express/i.test(state.spec?.framework || "")) {
+        prompt += `\n\n[Express 入口文件关键约束]：
+1. 默认导出必须是 Express Application 实例：\n   正确：const app = express(); ... export default app;\n   错误：export default createApp; (函数)\n   错误：export default { app, server }; (对象)\n   错误：export default createApp(); (每次调用创建新实例)\n   原因：测试文件使用 supertest，需要 import app from "../src/index" 直接获得 Express 实例。
+
+2. 必须在模块顶层启动服务器（不能包在函数里！）：\n   正确：\n     const PORT = process.env.PORT || 3000;\n     if (process.env.NODE_ENV !== 'test') {\n       app.listen(PORT, () => console.log('Server on port', PORT));\n     }\n     export default app;\n   错误：把 app.listen 放在 startServer() 函数里但不调用它 → npm start 什么都不会发生\n   原因：npm start 执行 node dist/src/index.js，需要在加载模块时直接启动服务器。
+   注意：测试环境下 (NODE_ENV=test) 不要启动服务器，避免端口冲突。
+
+3. 必须注册根路径 GET / 处理器，返回 API 导航信息（JSON 对象）：
+   app.get('/', (req, res) => res.json({ message: '项目名 API', version: '1.0.0', endpoints: ['/api/health', '/api/users'] }));
+   原因：部署后用户访问根路径应看到可用端点，而不是 "Cannot GET /" 错误。`;
+      }
+
       // 注入缺陷工单 (Issues)
       const relatedIssues = (state.issueTracker || []).filter(i => i.status === 'open' && i.relatedFiles.includes(task.fileTarget));
       if (relatedIssues.length > 0) {
@@ -1698,12 +1844,22 @@ CMD ["node", "dist/index.js"]`;
       };
 
       const deterministicScaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
-      const scaffoldAllowed = Boolean(deterministicScaffold);
+      const qaFailedSet = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
+      const fileFailedByQa = qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"));
+      const scaffoldAllowed = Boolean(deterministicScaffold) && !fileFailedByQa;
       let generationSource: FileChangeEntry["generationSource"] | undefined;
-      let extractResult;
+      let extractResult: { isValid: boolean; code: string; error?: string } | undefined = undefined;
       if (scaffoldAllowed) {
         generationSource = "deterministic_scaffold";
         extractResult = { isValid: true, code: deterministicScaffold, error: "" };
+      } else if (fileFailedByQa && deterministicScaffold) {
+        emit(
+          "thinking",
+          "System",
+          `[Coder] ${task.fileTarget} 被 QA 标记失败，跳过确定性骨架，强制走模型生成`,
+          { task }
+        );
+        extractResult = undefined; // 强制走模型生成
       } else {
         if (deterministicScaffold && isPlanningFallbackActive(state)) {
           emit(
@@ -1802,7 +1958,7 @@ CMD ["node", "dist/index.js"]`;
           const diskError = diskResult.error || "尝试读取已由工具写入的文件失败";
           if (
             (missingTargetDiagnostic && /读取已由工具写入的文件失败/.test(diskError)) ||
-            (skipPerFileQualityChecks && extractResult.isValid)
+            (skipPerFileQualityChecks && extractResult?.isValid)
           ) {
             toolError = null;
           } else {
@@ -1811,7 +1967,7 @@ CMD ["node", "dist/index.js"]`;
         }
       }
 
-      if (!isSuccess && extractResult.isValid) {
+      if (!isSuccess && extractResult?.isValid) {
         finalCode = extractResult.code || "";
         // 1. JSON 强校验
         if (task.fileTarget.endsWith(".json")) {
@@ -1834,6 +1990,11 @@ CMD ["node", "dist/index.js"]`;
         }
 
         if (!formatError) {
+          // 先 strip 无效 import，再校验导出契约
+          if (isNodeLikeLanguage(state.spec?.language)) {
+            const specFiles = (state.spec?.filesToCreate || []).map(f => f.replace(/\\/g, "/"));
+            finalCode = stripInvalidImports(task.fileTarget, finalCode, filesContent, specFiles);
+          }
           const importContractErrors = validateImportContracts(task.fileTarget, finalCode, filesContent);
           if (importContractErrors.length > 0) {
             formatError = `依赖导出契约校验失败: ${importContractErrors.join("; ")}`;
@@ -1891,6 +2052,11 @@ CMD ["node", "dist/index.js"]`;
       }
 
       if (isSuccess && !toolError && !formatError) {
+        // 自动剥离引用不存在文件的 import（硬约束，防止 LLM 幻觉导致编译失败）
+        if (isNodeLikeLanguage(state.spec?.language)) {
+          const specFiles = (state.spec?.filesToCreate || []).map(f => f.replace(/\\/g, "/"));
+          finalCode = stripInvalidImports(task.fileTarget, finalCode, filesContent, specFiles);
+        }
         const filePath = path.join(WORKSPACE, task.fileTarget);
         const previousCode = filesContent[task.fileTarget];
         const previousStatus = task.status;
@@ -1961,13 +2127,13 @@ CMD ["node", "dist/index.js"]`;
           console.error(`${logPrefix("System")} [Coder] 任务失败 (${task.fileTarget}): ${task.lastError}`);
         }
       } else {
-        const finalFailureReason = toolError || formatError || extractResult.error || "代码提取失败或工具执行异常";
+        const finalFailureReason = toolError || formatError || extractResult?.error || "代码提取失败或工具执行异常";
         if (
           shouldRetryTaskLocally({
             attempt: taskLocalAttempt,
             toolError,
             formatError,
-            extractError: extractResult.error || "",
+            extractError: extractResult?.error || "",
             unauthorizedWriteTargets,
           })
         ) {
@@ -2003,7 +2169,21 @@ CMD ["node", "dist/index.js"]`;
     }
   }
 
-  await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol);
+  await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol, state.qaFailures?.failedFiles);
+
+  // 清理重复的 jest/vitest 配置文件——优先保留 .cjs（确定性 scaffold 生成的），删除 .js/.ts（LLM 额外生成的）
+  const configFiles = Object.keys(filesContent).map(f => f.replace(/\\/g, "/"));
+  const jestCjs = configFiles.find(f => /jest\.config\.cjs$/i.test(f));
+  if (jestCjs) {
+    for (const duplicate of configFiles.filter(f => /^jest\.config\.(js|ts|mjs)$/i.test(path.posix.basename(f)))) {
+      console.warn(`${logPrefix("System")} [Coder] 清理重复的 jest 配置: ${duplicate}（保留 ${jestCjs}）`);
+      delete filesContent[duplicate];
+      await fs.rm(path.join(WORKSPACE, duplicate), { force: true }).catch(() => undefined);
+      // 从 subTasks 中也移除
+      const idx = subTasks.findIndex(t => t.fileTarget.replace(/\\/g, "/") === duplicate);
+      if (idx >= 0) subTasks.splice(idx, 1);
+    }
+  }
 
   if (blockedReason && blockedFailedFiles.length > 0) {
     const unresolvedBlockedFiles = blockedFailedFiles.filter((fileTarget) =>
@@ -2024,7 +2204,15 @@ CMD ["node", "dist/index.js"]`;
       !hasLocalSelfHealInFlight
     ) {
       const deadlocked = pendingTasks.map((task) => {
-        const unmet = (task.dependencies || []).filter((dependency) => filesContent[dependency] === undefined);
+        const unmet = (task.dependencies || []).filter((dependency) => {
+          if (filesContent[dependency] !== undefined) return false;
+          // jest.config 变体名兼容：.js/.ts/.mjs 依赖在 .cjs 已存在时视为已满足
+          if (/jest\.config\.(js|ts|mjs)$/.test(dependency)) {
+            const cjsVariant = dependency.replace(/\.(js|ts|mjs)$/, '.cjs');
+            if (filesContent[cjsVariant] !== undefined) return false;
+          }
+          return true;
+        });
         return `${task.fileTarget} <- ${unmet.join(", ") || "无可满足依赖"}`;
       });
       blockedReason = `Coder 依赖死锁: ${deadlocked.join(" | ")}`;

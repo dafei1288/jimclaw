@@ -24,6 +24,10 @@ export function classifyExecutorFailure(input: FailureInput): ExecutorFailureTyp
   if (/spawn ENOENT|not recognized as an internal or external command|command not found/i.test(text)) {
     return "command_not_found";
   }
+  // TypeScript 编译错误（TS2307 等）是代码质量问题，不是环境问题
+  if (/\bTS\d{4}\b|tsc.*error|Cannot find module/i.test(text)) {
+    return "build_compilation_error";
+  }
   if (/timed out|timeout/i.test(text)) {
     return "timeout";
   }
@@ -47,6 +51,10 @@ export function mapExecutorFailureToValidationFailure(
 ): ValidationFailureType {
   if (failureType === "port_conflict" || failureType === "runtime_start_failed") {
     return "runtime_gap";
+  }
+  // TypeScript 编译错误是代码问题，需要 Coder 修复
+  if (failureType === "build_compilation_error") {
+    return "implementation_bug";
   }
   return "environment_gap";
 }

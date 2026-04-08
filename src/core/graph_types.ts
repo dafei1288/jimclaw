@@ -749,6 +749,10 @@ export const JimClawState = Annotation.Root({
   lastFailureSummary: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),
+  forceRebuildContainer: Annotation<boolean>({
+    reducer: (_x, y) => y ?? false,
+    default: () => false,
+  }),
   failureFingerprint: Annotation<string>({
     reducer: (x, y) => y ?? x,
   }),
@@ -821,6 +825,9 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y ?? x,
   }),
   agentRecoveryReason: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  agentRecoveryRetryCount: Annotation<number>({
     reducer: (x, y) => y ?? x,
   }),
   protocolFailures: Annotation<ProtocolFailure[]>({

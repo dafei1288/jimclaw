@@ -174,6 +174,11 @@ export class BaseAgent {
     const preferred = mode && this.models.has(mode) ? mode : "default";
     const ordered = [preferred];
 
+    // 优先使用显式配置的 fallback 模型（通常是一个不同供应商的快速模型）
+    if (this.models.has("fallback") && !ordered.includes("fallback")) {
+      ordered.push("fallback");
+    }
+
     if (preferred !== "default" && this.models.has("default")) {
       ordered.push("default");
     }

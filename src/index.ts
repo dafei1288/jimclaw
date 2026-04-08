@@ -342,6 +342,17 @@ async function main() {
 
   console.log(`\n--- Session Completed ---`);
   console.log("Final Code Content:", finalState.code);
+
+  // ── 部署成功后列出可用 API 端点 ──
+  if (finalState.deploymentStatus?.status === 'running' && finalState.apiContract?.endpoints?.length) {
+    const base = finalState.deploymentStatus.url || '';
+    console.log(`\n========== 可用 API 端点 ==========`);
+    for (const ep of finalState.apiContract.endpoints) {
+      console.log(`  ${ep.method.padEnd(7)} ${base}${ep.path}  ${ep.description || ''}`);
+    }
+    console.log(`===================================\n`);
+  }
+
   console.log("\nTeam Conversation History:");
   finalState.teamChatLog.forEach((log: any) => {
     console.log(`[${log.sender}]: ${log.content}`);

@@ -65,7 +65,7 @@ function classifyVerifierIssue(issue: string): {
   ) {
     return { failureType: "environment_gap", protocolType: "tooling_unavailable" };
   }
-  if (/未找到监听声明|入口挂载缺失|前端页面入口|健康检查/i.test(issue)) {
+  if (/未找到监听声明|入口挂载缺失|健康检查/i.test(issue)) {
     return { failureType: "runtime_gap", protocolType: "runtime_mismatch" };
   }
   if (/契约漂移|语法错误/i.test(issue)) {
@@ -193,7 +193,13 @@ export async function verifierNode(
     return new RegExp(`^${escaped}$`);
   };
 
+  // Jest config dedup: coder 会自动删除 jest.config.js/.ts/.mjs (保留 .cjs)，verifier 应跳过这些文件
+  const JEST_ALT_CONFIGS = /^(jest\.config\.(js|ts|mjs))$/i;
+  const hasJestCjs = activeFiles.some(f => /^jest\.config\.cjs$/i.test(f));
+
   for (const file of activeFiles) {
+    // 跳过被 dedup 移除的 jest 配置文件变体
+    if (hasJestCjs && JEST_ALT_CONFIGS.test(file)) continue;
     try {
       await fs.access(path.join(WORKSPACE, file));
     } catch {
@@ -209,27 +215,39 @@ export async function verifierNode(
     } catch {}
   }
 
+  // 前端检查：仅在 architect 实际规划了前端文件但缺失时报错
+  // 不再依赖 PM 的 frontendRequired（PM 经常对简单 API 产生幻觉）
   if (requirementProtocol?.capabilities?.frontendRequired) {
     const frontendFiles = plannedFiles.filter((file) => /^public\/.+/i.test(file) || /\.html$/i.test(file));
-    if (frontendFiles.length === 0) {
-      issues.push("需求覆盖失败：用户要求前端，但 filesToCreate 中不存在任何前端页面文件");
-    }
-    if (entryContent) {
-      const hasFrontendMount = /express\.static\(|res\.sendFile\(|app\.get\(\s*["'`]\/["'`]/.test(entryContent);
-      if (!hasFrontendMount) {
-        issues.push(`需求覆盖失败：入口文件 ${entryFile} 未提供前端页面入口（静态目录或根路径页面）`);
-      }
+    // 只有 architect 规划了前端但文件不存在时才报错
+    if (frontendFiles.length === 0 && plannedFiles.some(f => /^public|^static|^frontend|^client|^src\/pages/i.test(f))) {
+      issues.push("需求覆盖失败：规划中包含前端文件但未生成");
     }
   }
 
   if (requirementProtocol?.capabilities?.backendRequired) {
     const routeFiles = plannedFiles.filter((file) => getProtocolFileContract(state.executionProtocol, file)?.role === "route");
-    if (routeFiles.length === 0) {
+    // 如果任何已完成的文件包含路由定义（app.get/app.post 等），则不需要独立 route 文件
+    let anyFileHasRoutes = entryContent && /app\.(get|post|put|delete|patch|use)\s*\(/i.test(entryContent);
+    if (!anyFileHasRoutes) {
+      for (const file of plannedFiles) {
+        try {
+          const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
+          if (/app\.(get|post|put|delete|patch|use)\s*\(/i.test(content)) {
+            anyFileHasRoutes = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+    if (routeFiles.length === 0 && !anyFileHasRoutes) {
       issues.push("需求覆盖失败：用户要求后端 API，但未规划任何 route 文件");
     }
     if (entryContent) {
       for (const routeFile of routeFiles) {
         if (/routes\/health\./i.test(routeFile)) continue;
+        // 跳过 __init__.py 文件（Python 包初始化文件，不是路由模块）
+        if (/__init__\.py$/i.test(routeFile)) continue;
         const stem = path.basename(routeFile, path.extname(routeFile)).replace(/routes?$/i, "");
         if (stem && !new RegExp(stem, "i").test(entryContent)) {
           issues.push(`入口挂载缺失：${entryFile} 未挂载路由文件 ${routeFile}`);
@@ -239,8 +257,12 @@ export async function verifierNode(
   }
 
   const testFilePatterns = /test|spec/i;
-  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(/;
+  // conftest.py 和 pytest.ini 是 pytest 配置/fixture 文件，不是测试文件
+  const nonTestFiles = /^(conftest\.py|pytest\.ini|pytest\.cfg|setup\.cfg|tox\.ini|pyproject\.toml)$/i;
+  // 支持 Jest (expect/toBe/toEqual)、pytest (assert 语句)、Go (t.Error/t.Fatal/assert) 风格
+  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(|^\s*assert\s|t\.Errorf?\(|t\.Fatalf?\(/m;
   for (const file of activeFiles) {
+    if (nonTestFiles.test(path.basename(file))) continue;
     if (testFilePatterns.test(path.basename(file))) {
       try {
         const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");

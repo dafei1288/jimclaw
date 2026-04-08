@@ -45,6 +45,7 @@ export const EXECUTOR_FAILURE_TYPES = [
   "timeout",
   "port_conflict",
   "runtime_start_failed",
+  "build_compilation_error",
 ] as const;
 export type ExecutorFailureType = (typeof EXECUTOR_FAILURE_TYPES)[number];
 

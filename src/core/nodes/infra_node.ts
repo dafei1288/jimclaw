@@ -340,7 +340,7 @@ export async function infraNode(
   startSpan("infra_setup");
   const round = state.retryCount || 0;
   const lang = state.spec?.language?.toLowerCase() ?? "javascript";
-  const image = lang.includes("python") ? "python:3.11-slim" : "node:20-alpine";
+  const image = lang.includes("python") ? "python:3.11" : lang.includes("go") ? "golang:1.21" : "node:20-alpine";
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
   const commandExecutor =
     deps?.commandExecutor ||
@@ -414,7 +414,7 @@ export async function infraNode(
             commandExecutor.executeIntent({
               kind: "install_deps",
               workspace: WORKSPACE,
-              command: "npm install --silent",
+              command: "npm install --loglevel=error",
               requiresNetwork: true,
             }),
           onHeartbeat: async () => {
@@ -672,14 +672,37 @@ export async function infraNode(
       );
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
-  } else {
+  }
+
+  // ── 容器复用策略 (Fix D) ──
+  // 简化：直接复用已有容器（不重建），但每次都重新安装依赖
+  const existingContainerId = state.containerId || "";
+  if (existingContainerId && !state.forceRebuildContainer && round > 0) {
+    // 在宿主机执行 docker inspect 检查容器是否在运行
+    const inspectRaw = await ShellExecuteSkill.config.run({
+      command: `docker inspect --format '{{.State.Running}}' ${existingContainerId}`,
+      timeout: 5000,
+    }).catch(() => "");
+    if (/true/i.test(inspectRaw.trim())) {
+      // 容器在运行，复用容器，继续走依赖安装流程
+      containerId = existingContainerId;
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 复用已有容器 ${existingContainerId.slice(0, 12)}, 继续安装依赖`);
+      // 注意：不 return，继续走下面的依赖安装流程
+    } else {
+      // 容器不在运行，走正常创建
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 容器 ${existingContainerId.slice(0, 12)} 已停止, 重建`);
+    }
+  }
+
+  // ── 正常创建流程（非 compose 路径） ──
+  if (!hasCompose) {
     // 3. 安全清理并启动单容器 (带端口映射)
     await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName}` }).catch(() => {});
     let startOut = "";
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
       startOut = await ShellExecuteSkill.config.run({
-        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" -w /app ${image} tail -f /dev/null`,
+        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} -w /app ${image} tail -f /dev/null`,
         timeout: 60000,
       });
       containerId = extractContainerId(startOut);
@@ -733,7 +756,7 @@ export async function infraNode(
       );
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
-  }
+  } // end !hasCompose
 
   let hasPackageJson = false;
   let packageJsonContent = "";
@@ -764,6 +787,51 @@ export async function infraNode(
       });
     }
 
+    // Python: pip install (Fix B — 不用 --no-cache-dir，允许缓存)
+    let hasRequirementsTxt = false;
+    try {
+      await fs.access(path.join(WORKSPACE, "requirements.txt"));
+      hasRequirementsTxt = true;
+    } catch {}
+
+    if (hasRequirementsTxt) {
+      await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (pip install)`);
+      // pip install 使用更长的超时（900s），用 execInContainer 直接执行避免 runInfraContainerCommand 的重试逻辑
+      // （pip 无断点续传，重试只会从头下载浪费时间）
+      const pipOut = await runWithHeartbeat({
+        run: async () => {
+          const raw = await execInContainer(containerId, "pip install -r requirements.txt", { timeout: 900000 });
+          if (isCommandFailureOutput(raw)) throw new Error(`pip install 失败：${parseSkillOutput(raw) || raw}`);
+          return raw;
+        },
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${pipOut}`);
+    }
+
+    // Go: go mod tidy
+    let hasGoMod = false;
+    try {
+      await fs.access(path.join(WORKSPACE, "go.mod"));
+      hasGoMod = true;
+    } catch {}
+    if (hasGoMod) {
+      await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (go mod tidy)`);
+      const goOut = await runWithHeartbeat({
+        run: async () =>
+          runInfraContainerCommand(WORKSPACE, containerId, "go mod tidy", "go mod tidy", 300000),
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${goOut}`);
+    }
+
+    // Node: npm install
     if (hasPackageJson) {
       await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (npm install)`);
@@ -773,11 +841,11 @@ export async function infraNode(
             ? runInfraContainerCommand(
                 WORKSPACE,
                 containerId,
-                "NODE_ENV=development npm install --include=dev --silent",
+                "NODE_ENV=development npm install --include=dev --loglevel=error",
                 "npm install",
                 300000
               )
-            : runInfraContainerCommand(WORKSPACE, containerId, "npm install --silent", "npm install", 300000),
+            : runInfraContainerCommand(WORKSPACE, containerId, "npm install --loglevel=error", "npm install", 300000),
         onHeartbeat: async () => {
           await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
         },

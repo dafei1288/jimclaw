@@ -34,7 +34,7 @@ function createDockerTestAdapter(containerId: string) {
       }
       let raw = "";
       try {
-        raw = await execInContainer(containerId, intent.command || "", { timeout: 90000 });
+        raw = await execInContainer(containerId, intent.command || "", { timeout: 180000 });
       } catch (error: any) {
         raw = String(error?.message || error || "");
       }

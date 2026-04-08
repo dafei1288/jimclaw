@@ -36,7 +36,14 @@ export async function persistenceNode(
       await ShellExecuteSkill.config.run({ command: `docker rm -f ${state.containerId} 2>/dev/null || true` });
     }
   }
-  const result = { isDone: true };
+  // 只有当上游（QA/deploy）已确认成功、或服务确实在运行时才标记 isDone=true
+  // 否则保留上游的 isDone 值（可能是 false），避免伪成功
+  const wasDeployed = state.deploymentStatus?.status === "running";
+  const isDone = wasDeployed ? true : (state.isDone ?? false);
+  if (!isDone) {
+    console.log(`[Persistence] 任务未成功完成（deploy=${state.deploymentStatus?.status || "无"}），标记 isDone=false`);
+  }
+  const result = { isDone };
   await saveBoulder({ ...state, ...result }, "persistence");
   return result;
 }

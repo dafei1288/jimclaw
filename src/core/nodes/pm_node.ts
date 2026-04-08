@@ -11,7 +11,7 @@ import {
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
-const PM_MODEL_TIMEOUT_MS = 45000;
+const PM_MODEL_TIMEOUT_MS = 90000;
 
 function isRecoverableAgentError(error: unknown): error is AgentTimeoutError | AgentServiceUnavailableError | AgentResourceExhaustedError {
   return (
@@ -33,23 +33,59 @@ function inferFallbackResource(goal: string): { title: string; label: string } {
 
 function buildDeterministicContract(goal: string) {
   const inferred = inferFallbackResource(goal);
+  // 根据用户目标的复杂度决定需求范围
+  const normalizedGoal = String(goal || "").toLowerCase();
+  const isSimple = /简单|simple|basic|health|健康|hello|hello.?world|ping/i.test(normalizedGoal);
+  const wantsAuth = /认证|auth|权限|登录|角色|保护/i.test(normalizedGoal);
+  const wantsFrontend = /前端|页面|frontend|page|ui|界面/i.test(normalizedGoal);
+  const wantsAudit = /审计|日志|audit|log/i.test(normalizedGoal);
+
+  if (isSimple) {
+    // 简单目标：只生成核心需求
+    return condenseContractForExecution(goal, {
+      title: inferred.title,
+      requirements: [
+        `提供${inferred.label}核心 REST API，支持基础的数据操作。`,
+        `提供可执行的单元测试覆盖核心功能。`,
+        `提供 Docker 部署配置，可通过 docker-compose 启动并完成基础健康检查。`,
+      ],
+      acceptanceCriteria: [
+        `核心 API 端点返回正确的状态码和数据结构。`,
+        `npm test 全部通过。`,
+        `docker-compose up 后服务可正常响应健康检查。`,
+      ],
+    });
+  }
+
+  // 标准目标：根据用户意图按需组装
+  const requirements = [
+    `提供${inferred.label}列表、详情、新增、修改、删除等基础管理能力，支持后端 API。`,
+    `提供可执行验证脚本，覆盖${inferred.label}查询、写操作等关键流程。`,
+    `提供 Docker 部署所需的基础运行说明与配置。`,
+  ];
+  const acceptanceCriteria = [
+    `可以通过 API 查询${inferred.label}列表与详情。`,
+    `验证脚本执行后能输出通过/失败结果。`,
+    `项目可以通过 Docker 或本地命令启动并完成基础健康检查。`,
+  ];
+
+  if (wantsFrontend) {
+    requirements.push(`提供前端页面，与后端 API 协同工作。`);
+    acceptanceCriteria.push(`用户可以通过页面操作${inferred.label}。`);
+  }
+  if (wantsAuth) {
+    requirements.push(`提供基础认证与未授权访问拦截能力，确保核心写操作受保护。`);
+    acceptanceCriteria.push(`未授权请求返回 401 或 403。`);
+  }
+  if (wantsAudit) {
+    requirements.push(`提供关键写操作审计日志。`);
+    acceptanceCriteria.push(`关键写操作会生成可查询的日志记录。`);
+  }
+
   return condenseContractForExecution(goal, {
     title: inferred.title,
-    requirements: [
-      `提供${inferred.label}列表、详情、新增、修改、删除等基础管理能力，支持前端页面与后端 API 协同工作。`,
-      `提供基础认证、角色权限控制与未授权访问拦截能力，确保核心写操作受保护。`,
-      `提供统一错误处理、输入校验与关键写操作审计日志，避免出现脏数据和静默失败。`,
-      `提供可执行验证脚本，覆盖${inferred.label}查询、写操作、认证校验与异常处理等关键流程。`,
-      `提供 Docker 部署所需的基础运行说明与配置，使项目可以被启动、验证与恢复。`,
-    ],
-    acceptanceCriteria: [
-      `用户可以通过页面或 API 查询${inferred.label}列表与详情。`,
-      `已认证用户可以新增、修改、删除${inferred.label}，未授权请求返回 401 或 403。`,
-      `非法输入会返回统一错误结构，不会造成服务崩溃或脏数据写入。`,
-      `关键写操作会生成可查询的审计日志记录。`,
-      `验证脚本执行后能输出通过/失败结果，并覆盖${inferred.label}读写与认证流程。`,
-      `项目可以通过 Docker 或本地命令启动并完成基础健康检查。`,
-    ],
+    requirements,
+    acceptanceCriteria,
   });
 }
 
@@ -119,11 +155,11 @@ export async function pmNode(
     const response = await agents.pm.chat([
       { role: "user", content: `请为以下目标定义任务契约：${goal}。
 要求：
-1. 深入分析用户目标，将功能拆解为具体的、可实现的 requirements。
-2. 确保每个 requirement 都有对应的 acceptanceCriteria，且 criteria 必须是可验证的（例如：用户能够通过 XXX API 搜索到 YYY）。
-3. 必须包含一个可测试的验证脚本。
-4. 必须考虑边界情况和错误处理。
-5. 必须涵盖用户权限管理、日志审计等非功能性需求（如果适用）。
+1. 分析用户目标，将功能拆解为具体的、可实现的 requirements。
+2. 确保每个 requirement 都有对应的 acceptanceCriteria，且 criteria 必须是可验证的（例如：GET /health 返回 200）。
+3. 必须包含可测试的验证脚本。
+4. 只包含用户明确要求的功能，不要自行添加认证、权限、审计、前端等功能。
+5. requirements 数量控制在 3-5 条，聚焦 MVP 核心功能。
 
 请严格按照以下 JSON 格式输出：
 {

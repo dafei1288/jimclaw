@@ -161,7 +161,7 @@ export async function qaNode(
     const hits = new Set<string>();
     const dependencyGap =
       /cannot find module\s+['"]([^'"./][^'"]*)['"]|module not found|missing dependency|依赖缺失|未安装依赖|package\.json|npm install|pnpm install|yarn install|runtime dependency/i;
-    const tsConfigGap = /tsconfig|compileroptions|typescript|ts\d{4}|noUnusedLocals|moduleResolution/i;
+    const tsConfigGap = /tsconfig|compileroptions|moduleResolution|noUnusedLocals|strictNullChecks|strictPropertyInitialization|\bTS170\b|\bTS180\b|\bTS5053\b|\bTS6053\b/i;
     const jestGap = /jest|ts-jest|@types\/jest|jest\.config/i;
     const vitestGap = /vitest|vite\.config|vitest\.config/i;
 
@@ -822,12 +822,13 @@ ${JSON.stringify(issues, null, 2)}
     sameFailureCount: isDone ? 0 : sameFailureCount,
     qaFailures: isDone ? null : {
       // 合并 LLM 识别的文件 + 静态从测试输出提取的失败测试文件（双保险）
+      // 过滤掉配置文件（tsconfig.json, jest.config.* 等），它们不应被归因为编译错误的目标
       failedFiles: Array.from(new Set([
         ...issues.filter(i => i.status === 'open').flatMap(i => i.relatedFiles),
         ...failingTestFiles,
         ...compileFailureFiles,
         ...reopenFiles,
-      ])),
+      ])).filter(f => !/^(tsconfig\.json|jest\.config\.[a-z]+|vitest\.config\.[a-z]+|\.eslintrc)/i.test(f)),
       testErrors: issues.filter(i => i.status === 'open').map(i => `${i.title}: ${i.description}`),
       failedTestNames: []
     },
