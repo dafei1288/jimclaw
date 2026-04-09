@@ -17,6 +17,8 @@ import {
 import expressTsProvider from "./express_typescript";
 import fastApiPythonProvider from "./fastapi_python";
 import "./gin_go"; // side-effect: auto-registers
+import "./spring_java"; // side-effect: auto-registers
+import "./axum_rust"; // side-effect: auto-registers
 
 let initialized = false;
 

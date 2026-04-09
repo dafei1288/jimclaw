@@ -228,12 +228,12 @@ export async function verifierNode(
   if (requirementProtocol?.capabilities?.backendRequired) {
     const routeFiles = plannedFiles.filter((file) => getProtocolFileContract(state.executionProtocol, file)?.role === "route");
     // 如果任何已完成的文件包含路由定义（Express app.get / Gin r.GET / FastAPI @app.get 等），则不需要独立 route 文件
-    let anyFileHasRoutes = entryContent && /((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\()/im.test(entryContent);
+    let anyFileHasRoutes = entryContent && /((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\(|@(Get|Post|Put|Delete|Patch)Mapping\s*\(|#\[route\()/im.test(entryContent);
     if (!anyFileHasRoutes) {
       for (const file of plannedFiles) {
         try {
           const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
-          if (/((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\()/im.test(content)) {
+          if (/((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\(|@(Get|Post|Put|Delete|Patch)Mapping\s*\(|#\[route\()/im.test(content)) {
             anyFileHasRoutes = true;
             break;
           }
@@ -260,7 +260,7 @@ export async function verifierNode(
   // conftest.py 和 pytest.ini 是 pytest 配置/fixture 文件，不是测试文件
   const nonTestFiles = /^(conftest\.py|pytest\.ini|pytest\.cfg|setup\.cfg|tox\.ini|pyproject\.toml)$/i;
   // 支持 Jest (expect/toBe/toEqual)、pytest (assert 语句)、Go (t.Error/t.Fatal/assert) 风格
-  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(|^\s*assert\s|t\.Errorf?\(|t\.Fatalf?\(/m;
+  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(|^\s*assert\s|t\.Errorf?\(|t\.Fatalf?\(|assertThat\(|assertEquals\(|assertTrue\(|assert_eq!|assert_ne!|andExpect\(|\.value\(/m;
   for (const file of activeFiles) {
     if (nonTestFiles.test(path.basename(file))) continue;
     if (testFilePatterns.test(path.basename(file))) {

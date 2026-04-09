@@ -340,7 +340,7 @@ export async function infraNode(
   startSpan("infra_setup");
   const round = state.retryCount || 0;
   const lang = state.spec?.language?.toLowerCase() ?? "javascript";
-  const image = lang.includes("python") ? "python:3.11" : lang.includes("go") ? "golang:1.21-alpine" : "node:20-alpine";
+  const image = lang.includes("python") ? "python:3.11" : lang.includes("go") ? "golang:1.21-alpine" : lang.includes("java") ? "maven:3.9-eclipse-temurin-17" : lang.includes("rust") ? "rust:1.75" : "node:20-alpine";
   const containerName = `jimclaw_${path.basename(WORKSPACE)}`;
   const commandExecutor =
     deps?.commandExecutor ||
@@ -829,6 +829,44 @@ export async function infraNode(
         },
       });
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${goOut}`);
+    }
+
+    // Java: Maven dependency resolution
+    let hasPomXml = false;
+    try {
+      await fs.access(path.join(WORKSPACE, "pom.xml"));
+      hasPomXml = true;
+    } catch {}
+    if (hasPomXml) {
+      await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (mvn dependency:go-offline)`);
+      const mvnOut = await runWithHeartbeat({
+        run: async () =>
+          runInfraContainerCommand(WORKSPACE, containerId, "mvn dependency:go-offline -B", "mvn deps", 600000),
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${mvnOut}`);
+    }
+
+    // Rust: cargo build
+    let hasCargoToml = false;
+    try {
+      await fs.access(path.join(WORKSPACE, "Cargo.toml"));
+      hasCargoToml = true;
+    } catch {}
+    if (hasCargoToml) {
+      await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing dependencies (cargo build)`);
+      const cargoOut = await runWithHeartbeat({
+        run: async () =>
+          runInfraContainerCommand(WORKSPACE, containerId, "cargo build", "cargo build", 600000),
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_deps"), "infra_setup_heartbeat_install");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Install Output:**\n${cargoOut}`);
     }
 
     // Node: npm install

@@ -104,6 +104,17 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
     // Python 包初始化和配置文件（允许空内容）
     /^__init__\.(py|ts|js)$/i.test(path.basename(normalized)) ||
     /^(conftest\.py|pytest\.ini)$/i.test(path.basename(normalized)) ||
+    // Java 基础设施文件
+    normalized === "pom.xml" ||
+    normalized.endsWith("application.properties") ||
+    normalized.endsWith("application.java") ||
+    /controller.*\.java$/i.test(normalized) ||
+    /controller.*test\.java$/i.test(normalized) ||
+    // Rust 基础设施文件
+    normalized === "cargo.toml" ||
+    normalized === "src/main.rs" ||
+    normalized.startsWith("src/handlers/") ||
+    /_test\.rs$/i.test(normalized) ||
     normalized === "readme.md" ||
     /^scripts\/verify\.[^.]+$/i.test(normalized) ||
     normalized === "src/errors.ts" ||
@@ -214,7 +225,7 @@ function isCorePhaseActive(
 ): boolean {
   // Python/Go/Java 项目子任务少且依赖关系清晰，不分阶段全部写完
   const lang = (state.spec?.language || "").toLowerCase();
-  if (lang.includes("python") || lang.includes("go") || lang.includes("java")) return false;
+  if (lang.includes("python") || lang.includes("go") || lang.includes("java") || lang.includes("rust")) return false;
   return (state.retryCount || 0) === 0 && !state.validationCheckpointCompleted && subTasks.length >= 10;
 }
 

@@ -189,10 +189,11 @@ function inferProtocolFileRole(fileTarget: string): ProtocolFileRole {
     /^package\.json$|^tsconfig\.json$|^pom\.xml$|^cargo\.toml$|^build\.gradle(?:\.kts)?$|^settings\.gradle(?:\.kts)?$|^gradle\.properties$|jest\.config\./.test(normalized)
   ) return "config";
   if (normalized.endsWith("/dockerfile") || normalized === "dockerfile" || normalized.endsWith("docker-compose.yml")) return "infra";
-  if (normalized.includes("/tests/") || normalized.includes("/__tests__/") || /^tests?\//.test(normalized) || /\.test\.[^.]+$/.test(normalized) || /\.spec\.[^.]+$/.test(normalized)) return "test";
+  if (normalized.includes("/tests/") || normalized.includes("/__tests__/") || normalized.includes("/test/java/") || /^tests?\//.test(normalized) || /\.test\.[^.]+$/.test(normalized) || /\.spec\.[^.]+$/.test(normalized) || /(?:test|tests)\.java$/i.test(normalized) || /_test\.rs$/i.test(normalized)) return "test";
   if (normalized.includes("/routes/") || normalized.includes("/routers/")) return "route";
-  if (normalized.includes("/controllers/")) return "controller";
+  if (normalized.includes("/controllers/") || /controller\.java$/i.test(normalized)) return "controller";
   if (normalized.includes("/services/")) return "service";
+  if (normalized.includes("/handlers/")) return "controller";  // Go/Rust handler = controller
   if (normalized.includes("/repositories/")) return "repository";
   if (normalized.includes("/models/")) return "model";
   if (normalized.includes("/middleware/")) return "middleware";
@@ -888,6 +889,20 @@ export function ensureRequirementDrivenFiles(
         ensureFile(`app/routers/${plural}.py`);
         ensureFile(`tests/test_${plural}.py`);
       }
+    } else if (/java/.test(lang)) {
+      // Java/Spring Boot: pom.xml + Application + Controller
+      ensureFile("pom.xml");
+      ensureFile("src/main/resources/application.properties");
+      ensureFile("src/main/java/com/example/app/Application.java");
+      ensureFile("src/main/java/com/example/app/HealthController.java");
+      ensureFile("src/test/java/com/example/app/HealthControllerTest.java");
+    } else if (/rust/.test(lang)) {
+      // Rust/Axum: Cargo.toml + main.rs + handlers
+      ensureFile("Cargo.toml");
+      ensureFile("src/main.rs");
+      ensureFile("src/handlers/mod.rs");
+      ensureFile("src/handlers/health.rs");
+      ensureFile("tests/health_test.rs");
     }
   }
 

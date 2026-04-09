@@ -67,6 +67,9 @@ function detectTargetStack(userGoal: string, contractTitle: string): { language:
     const framework = /fastapi/.test(text) ? "FastAPI" : /flask/.test(text) ? "Flask" : /django/.test(text) ? "Django" : "FastAPI";
     return { language: "Python", framework: `${framework} ^0.104`, templateId: "fastapi-python" };
   }
+  if (/rust|axum|actix|cargo/.test(text)) {
+    return { language: "Rust", framework: "Axum ^0.7", templateId: "axum-rust" };
+  }
   if (/java|spring|gradle|maven/.test(text)) {
     return { language: "Java", framework: "Spring Boot ^3.0", templateId: "spring-java" };
   }
@@ -122,6 +125,8 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
   const targetStack = detectTargetStack(goal, state.contract?.title || "");
   const isPython = targetStack.language === "Python";
   const isGo = targetStack.language === "Go";
+  const isJava = targetStack.language === "Java";
+  const isRust = targetStack.language === "Rust";
 
   // ── Python / FastAPI 路径 ──
   if (isPython) {
@@ -131,6 +136,16 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
   // ── Go / Gin 路径 ──
   if (isGo) {
     return buildDeterministicGoOutput(state, requirementProtocol, singular, plural, detectedPort, targetStack, isSimple);
+  }
+
+  // ── Java / Spring Boot 路径 ──
+  if (isJava) {
+    return buildDeterministicJavaOutput(state, requirementProtocol, singular, plural, detectedPort, targetStack, isSimple);
+  }
+
+  // ── Rust / Axum 路径 ──
+  if (isRust) {
+    return buildDeterministicRustOutput(state, requirementProtocol, singular, plural, detectedPort, targetStack, isSimple);
   }
 
   // ── Express / TypeScript 路径（原有逻辑） ──
@@ -163,7 +178,7 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
       "Dockerfile",
       "docker-compose.yml",
     ];
-    if (requirementProtocol.capabilities.authRequired) filesToCreate.push("src/middleware/auth.ts");
+    if (requirementProtocol?.capabilities?.authRequired) filesToCreate.push("src/middleware/auth.ts");
     architecture = `确定性降级骨架：基于 Express + TypeScript 的单体应用，围绕 ${singular} 资源提供 API 与部署入口。`;
   }
 
@@ -180,7 +195,7 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
     dependencies: {
       express: "^5.0.0",
       cors: "^2.8.5",
-      ...(requirementProtocol.capabilities.authRequired ? { jsonwebtoken: "^9.0.2" } : {}),
+      ...(requirementProtocol?.capabilities?.authRequired ? { jsonwebtoken: "^9.0.2" } : {}),
     },
     devDependencies: {
       typescript: "^5.0.0",
@@ -202,7 +217,7 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
 
   // 奥卡姆剃刀：API 端点只包含需求中明确提到的
   const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
-  if (requirementProtocol.capabilities.authRequired) {
+  if (requirementProtocol?.capabilities?.authRequired) {
     endpoints.push({ path: "/api/auth/login", method: "POST", description: "用户登录" });
   }
   const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
@@ -417,6 +432,140 @@ function buildDeterministicGoOutput(
   };
 }
 
+// ── Java / Spring Boot 确定性输出 ──
+function buildDeterministicJavaOutput(
+  state: JimClawState,
+  requirementProtocol: any,
+  singular: string,
+  plural: string,
+  port: number,
+  targetStack: { language: string; framework: string; templateId: string },
+  isSimple: boolean
+): any {
+  const pkgPath = "src/main/java/com/example/app";
+  const testPkgPath = "src/test/java/com/example/app";
+  const pascalSingular = singular.charAt(0).toUpperCase() + singular.slice(1);
+  const pascalPlural = plural.charAt(0).toUpperCase() + plural.slice(1);
+
+  let filesToCreate: string[];
+  let architecture: string;
+
+  if (isSimple) {
+    filesToCreate = [
+      "pom.xml",
+      "src/main/resources/application.properties",
+      `${pkgPath}/Application.java`,
+      `${pkgPath}/HealthController.java`,
+      `${testPkgPath}/HealthControllerTest.java`,
+      "Dockerfile",
+    ];
+    architecture = `Spring Boot 3 + Maven 确定性骨架：最小健康检查 API 服务`;
+  } else {
+    filesToCreate = [
+      "pom.xml",
+      "src/main/resources/application.properties",
+      `${pkgPath}/Application.java`,
+      `${pkgPath}/HealthController.java`,
+      `${pkgPath}/${pascalPlural}Controller.java`,
+      `${testPkgPath}/HealthControllerTest.java`,
+      `${testPkgPath}/${pascalPlural}ControllerTest.java`,
+      "Dockerfile",
+    ];
+    architecture = `Spring Boot 3 + Maven 确定性骨架：${singular} CRUD API 服务，内存存储`;
+  }
+
+  const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
+  const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
+  const spec = {
+    language: targetStack.language,
+    framework: targetStack.framework,
+    testCommand: "mvn test -B",
+    runCommand: "mvn spring-boot:run",
+    entryPoint: `${pkgPath}/Application.java`,
+    filesToCreate,
+    dependencies: [],
+    devDependencies: [],
+  };
+  const manifest = {
+    services: [{ name: "java-api", port }],
+    environment: { PORT: String(port) },
+  };
+  const readme = `# ${state.contract?.title || "Java API"}\n\nSpring Boot 3 确定性骨架项目。\n\n## 运行\n\n\`\`\`bash\nmvn spring-boot:run\n\`\`\`\n\n## 测试\n\n\`\`\`bash\nmvn test\n\`\`\`\n`;
+
+  return {
+    spec: stabilizeSpecForExecution(spec, requirementProtocol),
+    manifest,
+    apiContract,
+    readme,
+  };
+}
+
+// ── Rust / Axum 确定性输出 ──
+function buildDeterministicRustOutput(
+  state: JimClawState,
+  requirementProtocol: any,
+  singular: string,
+  plural: string,
+  port: number,
+  targetStack: { language: string; framework: string; templateId: string },
+  isSimple: boolean
+): any {
+  const snakeSingular = singular.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "");
+  const snakePlural = plural.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "");
+
+  let filesToCreate: string[];
+  let architecture: string;
+
+  if (isSimple) {
+    filesToCreate = [
+      "Cargo.toml",
+      "src/main.rs",
+      "src/handlers/mod.rs",
+      "src/handlers/health.rs",
+      "tests/health_test.rs",
+      "Dockerfile",
+    ];
+    architecture = `Rust + Axum 确定性骨架：最小健康检查 API 服务`;
+  } else {
+    filesToCreate = [
+      "Cargo.toml",
+      "src/main.rs",
+      "src/handlers/mod.rs",
+      "src/handlers/health.rs",
+      `src/handlers/${snakePlural}.rs`,
+      "tests/health_test.rs",
+      `tests/${snakePlural}_test.rs`,
+      "Dockerfile",
+    ];
+    architecture = `Rust + Axum 确定性骨架：${singular} CRUD API 服务，内存存储`;
+  }
+
+  const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
+  const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
+  const spec = {
+    language: targetStack.language,
+    framework: targetStack.framework,
+    testCommand: "cargo test -- --nocapture",
+    runCommand: "cargo run",
+    entryPoint: "src/main.rs",
+    filesToCreate,
+    dependencies: [],
+    devDependencies: [],
+  };
+  const manifest = {
+    services: [{ name: "rust-api", port }],
+    environment: { PORT: String(port) },
+  };
+  const readme = `# ${state.contract?.title || "Rust API"}\n\nAxum 确定性骨架项目。\n\n## 运行\n\n\`\`\`bash\ncargo run\n\`\`\`\n\n## 测试\n\n\`\`\`bash\ncargo test\n\`\`\`\n`;
+
+  return {
+    spec: stabilizeSpecForExecution(spec, requirementProtocol),
+    manifest,
+    apiContract,
+    readme,
+  };
+}
+
 function normalizeNodeDependencyLayout(spec: any): any {
   const language = String(spec?.language || "").toLowerCase();
   if (!/typescript|javascript|node/.test(language)) return spec;
@@ -459,6 +608,8 @@ export async function architectNode(
   const targetStackHint = detectTargetStack(String(state.userGoal || ""), state.contract?.title || "");
   const isHintPython = targetStackHint.language === "Python";
   const isHintGo = targetStackHint.language === "Go";
+  const isHintJava = targetStackHint.language === "Java";
+  const isHintRust = targetStackHint.language === "Rust";
 
   let requirementProtocol = state.requirementProtocol || buildRequirementProtocol(state.contract);
   let spec: any;
@@ -469,7 +620,7 @@ export async function architectNode(
 
   // ── 非 TypeScript 快速通道：直接走确定性路径，不调 LLM ──
   // LLM 倾向于输出 TypeScript（因训练数据偏移），强制用确定性骨架更可靠
-  if (isHintPython || isHintGo) {
+  if (isHintPython || isHintGo || isHintJava || isHintRust) {
     emit("thinking", "System", `检测到 ${targetStackHint.language} 目标，使用确定性骨架（跳过 LLM）`, {});
     const fallback = await buildDeterministicArchitectOutput(state);
     requirementProtocol = fallback.requirementProtocol;
@@ -613,6 +764,15 @@ ${langFileConstraints}
     /_test\.go$/,
     // Java 基础设施
     /^(pom\.xml|build\.gradle|gradle\.properties)/i,
+    /^src\/main\/resources\//,
+    /Controller\.java$/i,
+    /Test\.java$/i,
+    /Application\.java$/i,
+    // Rust 基础设施
+    /^Cargo\.(toml|lock)$/i,
+    /^src\/main\.rs$/,
+    /^src\/handlers\//,
+    /_test\.rs$/,
   ];
 
   if (apiResourceNames.size === 0) {
@@ -622,11 +782,13 @@ ${langFileConstraints}
       infraPatterns.some(p => p.test(f))
     );
     // 确保至少有一个测试文件
-    const hasTest = spec.filesToCreate.some((f: string) => /^tests?\//.test(f) || /_test\.go$/.test(f) || /test_.*\.py$/.test(f));
+    const hasTest = spec.filesToCreate.some((f: string) => /^tests?\//.test(f) || /_test\.go$/.test(f) || /test_.*\.py$/.test(f) || /Test\.java$/.test(f) || /_test\.rs$/.test(f));
     if (!hasTest) {
       const lang = String(spec?.language || "").toLowerCase();
       if (/go/.test(lang)) spec.filesToCreate.push("handler/health_test.go");
       else if (/python/.test(lang)) spec.filesToCreate.push("tests/test_health.py");
+      else if (/java/.test(lang)) spec.filesToCreate.push("src/test/java/com/example/app/HealthControllerTest.java");
+      else if (/rust/.test(lang)) spec.filesToCreate.push("tests/health_test.rs");
       else spec.filesToCreate.push("tests/health.test.ts");
     }
     if (before !== spec.filesToCreate.length) {
@@ -758,25 +920,25 @@ ${langFileConstraints}
       evidence: [`未覆盖验收：${criteria}`],
     })),
   ];
-  if (requirementProtocol.capabilities.frontendRequired && !solutionProtocol.coverage.frontendPlanned) {
+  if (requirementProtocol?.capabilities?.frontendRequired && !solutionProtocol.coverage.frontendPlanned) {
     planningFindings.push({
       summary: "方案未覆盖需求：用户要求前端，但方案中缺少前端页面入口",
       evidence: ["frontendRequired=true", `filesToCreate=${JSON.stringify(spec.filesToCreate || [])}`],
     });
   }
-  if (requirementProtocol.capabilities.backendRequired && !solutionProtocol.coverage.backendPlanned) {
+  if (requirementProtocol?.capabilities?.backendRequired && !solutionProtocol.coverage.backendPlanned) {
     planningFindings.push({
       summary: "方案未覆盖需求：用户要求后端 API，但方案中缺少后端入口或接口规划",
       evidence: ["backendRequired=true", `filesToCreate=${JSON.stringify(spec.filesToCreate || [])}`, `apiEndpoints=${JSON.stringify(apiContract.endpoints || [])}`],
     });
   }
-  if (requirementProtocol.capabilities.authRequired && !solutionProtocol.coverage.authPlanned) {
+  if (requirementProtocol?.capabilities?.authRequired && !solutionProtocol.coverage.authPlanned) {
     planningFindings.push({
       summary: "方案未覆盖需求：用户要求认证能力，但方案中缺少认证模块规划",
       evidence: ["authRequired=true"],
     });
   }
-  if (requirementProtocol.capabilities.auditLogRequired && !solutionProtocol.coverage.auditLogPlanned) {
+  if (requirementProtocol?.capabilities?.auditLogRequired && !solutionProtocol.coverage.auditLogPlanned) {
     planningFindings.push({
       summary: "方案未覆盖需求：用户要求日志审计，但方案中缺少日志模块规划",
       evidence: ["auditLogRequired=true"],
