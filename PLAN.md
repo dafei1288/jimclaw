@@ -121,6 +121,29 @@
 - [x] **Coder 测试文件 import 约束** — 测试文件铁律新增「只能 import 已存在的文件」规则
 - [x] **Orchestrator 超时增加** — 45s → 90s，减少间歇性超时
 
+#### Phase 2.12: Go/Gin E2E + Python 回归 ✅ 已完成
+- [x] **Go/Gin 健康检查 E2E** — retryCount=0, ~3min, PASS (commit 44cc117)
+- [x] **Go/Gin Todo CRUD E2E** — retryCount=0, ~6min, 8/8 files, TestHealthCheck+TestTodoCRUD PASS (commit 6960dd1)
+- [x] **Python/FastAPI 健康检查回归** — retryCount=0, ~5min, 4/4 tests PASS (commit 6960dd1)
+- [x] **7 个根因修复**：
+  1. Architect 奥卡姆剃刀过滤 Go handler/main.go → 添加 Go infraPatterns
+  2. `isSafeDeterministicScaffoldFile` 不认 Go/Python 文件 → 扩展安全列表
+  3. `buildDeterministicGoOutput` isSimple 漏 handler/health.go → 补上
+  4. Scaffold `main.go` unused import `fmt` → 移除
+  5. **Verifier 路由检测只认 Express `app.get()`** → 扩展支持 Gin `r.GET()`/FastAPI
+  6. **Orchestrator 每次重置 subTask status 为 pending** → 保留 completed
+  7. Architect 默认测试文件硬编码 TS → 按 language 推 Go/Python/TS
+  8. `__init__.py`/`conftest.py` 空内容被 coder 拒绝 → 允许空内容
+
+#### Phase 2.13: 多语言 E2E 成功率统计
+| 语言/框架 | 成功/总次数 | 成功率 | 最近结果 |
+|-----------|------------|--------|----------|
+| TypeScript/Express | 4/5 | **80%** | CRUD retryCount=2, 健康检查 retryCount=0 |
+| Go/Gin | 2/2 | **100%** | 健康检查 retryCount=0, CRUD retryCount=0 |
+| Python/FastAPI | 1/1 | **100%** | 健康检查 retryCount=0 |
+
+> Go 的前 9 次失败全部是修复过程中同一健康检查需求的调试运行，修复后 2 次全新运行（健康检查+CRUD）均首轮通过。
+
 ### Phase 3：代码质量与可维护性
 
 > 不是直接提升成功率，但降低后续维护成本和引入 bug 的风险
