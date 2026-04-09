@@ -123,7 +123,9 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
     normalized === "src/middleware/logger.ts" ||
     normalized === "src/middleware/auth.ts" ||
     normalized === "src/controllers/authcontroller.ts" ||
-    normalized === "src/routes/auth.ts"
+    normalized === "src/routes/auth.ts" ||
+    // 前端文件（混合项目）
+    normalized.startsWith("frontend/")
   );
 }
 

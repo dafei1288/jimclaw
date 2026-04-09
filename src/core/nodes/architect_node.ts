@@ -61,20 +61,25 @@ function isSimpleApiGoal(goal: string): boolean {
  * 检测用户目标中提到的语言/框架偏好
  * 返回 { language, framework, templateId }
  */
-function detectTargetStack(userGoal: string, contractTitle: string): { language: string; framework: string; templateId: string } {
+function detectTargetStack(userGoal: string, contractTitle: string): { language: string; framework: string; templateId: string; frontend?: "Vue" | "React" | "Svelte" } {
   const text = String(userGoal + " " + (contractTitle || "")).toLowerCase();
+  // 检测混合项目（前端 + 后端）
+  const hasVue = /vue|前端页面|前端界面/.test(text);
+  const hasReact = /react/.test(text);
+  const frontend = hasVue ? "Vue" : hasReact ? "React" : undefined;
+
   if (/python|flask|fastapi|django/.test(text)) {
     const framework = /fastapi/.test(text) ? "FastAPI" : /flask/.test(text) ? "Flask" : /django/.test(text) ? "Django" : "FastAPI";
-    return { language: "Python", framework: `${framework} ^0.104`, templateId: "fastapi-python" };
+    return { language: "Python", framework: `${framework} ^0.104`, templateId: "fastapi-python", frontend };
   }
   if (/rust|axum|actix|cargo/.test(text)) {
-    return { language: "Rust", framework: "Axum ^0.7", templateId: "axum-rust" };
+    return { language: "Rust", framework: "Axum ^0.7", templateId: "axum-rust", frontend };
   }
   if (/java|spring|gradle|maven/.test(text)) {
-    return { language: "Java", framework: "Spring Boot ^3.0", templateId: "spring-java" };
+    return { language: "Java", framework: "Spring Boot ^3.0", templateId: "spring-java", frontend };
   }
   if (/go|gin|fiber/.test(text)) {
-    return { language: "Go", framework: "Gin ^1.9", templateId: "gin-go" };
+    return { language: "Go", framework: "Gin ^1.9", templateId: "gin-go", frontend };
   }
   // 默认 Express + TypeScript
   return { language: "TypeScript", framework: "Express.js ^5.0", templateId: "express-typescript" };
@@ -237,7 +242,7 @@ function buildDeterministicPythonOutput(
   singular: string,
   plural: string,
   port: number,
-  targetStack: { language: string; framework: string; templateId: string },
+  targetStack: { language: string; framework: string; templateId: string; frontend?: string },
   isSimple: boolean
 ) {
   const fwName = /flask/i.test(targetStack.framework) ? "Flask" : /django/i.test(targetStack.framework) ? "Django" : "FastAPI";
@@ -277,6 +282,10 @@ function buildDeterministicPythonOutput(
     architecture = `确定性降级骨架：基于 Python ${fwName} 的单体应用，围绕 ${singular} 资源提供 API 与部署入口。`;
   }
 
+  // 混合项目：追加前端文件
+  const frontendFiles_py = buildFrontendFiles(targetStack);
+  if (frontendFiles_py) filesToCreate.push(...frontendFiles_py);
+
   const spec = {
     architecture,
     language: "Python",
@@ -295,6 +304,7 @@ function buildDeterministicPythonOutput(
       httpx: ">=0.25.0",
     },
     devDependencies: {},
+    frontend: buildFrontendSpec(targetStack),
     // 确定性 requirements.txt 内容——裸包名，无版本约束
     // pip 会自动安装最新兼容版本，避免约束冲突和下载慢
     _pinnedRequirements: [
@@ -311,6 +321,10 @@ function buildDeterministicPythonOutput(
     environment: {},
     sharedConfig: {},
   };
+
+  // 混合项目：追加前端文件
+  const frontendFiles_go = buildFrontendFiles(targetStack);
+  if (frontendFiles_go) filesToCreate.push(...frontendFiles_go);
 
   const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
   if (hasAuth) {
@@ -348,7 +362,7 @@ function buildDeterministicGoOutput(
   singular: string,
   plural: string,
   port: number,
-  targetStack: { language: string; framework: string; templateId: string },
+  targetStack: { language: string; framework: string; templateId: string; frontend?: string },
   isSimple: boolean
 ) {
   const hasAuth = requirementProtocol.capabilities?.authRequired;
@@ -393,6 +407,7 @@ function buildDeterministicGoOutput(
     interfaces: "REST API",
     dependencies: {},
     devDependencies: {},
+    frontend: buildFrontendSpec(targetStack),
     _goModule: "jimclaw-app",
     _goGinVersion: "v1.9.1",
   };
@@ -433,13 +448,51 @@ function buildDeterministicGoOutput(
 }
 
 // ── Java / Spring Boot 确定性输出 ──
+// ── 混合项目：前端文件注入 ──
+function buildFrontendFiles(targetStack: { language: string; framework: string; templateId: string; frontend?: string }): string[] | null {
+  if (!targetStack.frontend) return null;
+  const fw = targetStack.frontend.toLowerCase();
+  if (fw === "vue") {
+    return [
+      "frontend/package.json",
+      "frontend/vite.config.ts",
+      "frontend/tsconfig.json",
+      "frontend/tsconfig.node.json",
+      "frontend/vitest.config.ts",
+      "frontend/index.html",
+      "frontend/src/main.ts",
+      "frontend/src/App.vue",
+      "frontend/src/env.d.ts",
+      "frontend/src/components/HealthCheck.vue",
+      "frontend/tests/HealthCheck.test.ts",
+    ];
+  }
+  return null;
+}
+
+function buildFrontendSpec(targetStack: { language: string; framework: string; templateId: string; frontend?: string }): any | undefined {
+  if (!targetStack.frontend) return undefined;
+  const fw = targetStack.frontend;
+  if (fw === "Vue") {
+    return {
+      language: "TypeScript",
+      framework: "Vue",
+      buildCommand: "cd frontend && npm run build",
+      testCommand: "cd frontend && npx vitest run",
+      outputDir: "frontend/dist",
+      sourceDir: "frontend",
+    };
+  }
+  return undefined;
+}
+
 function buildDeterministicJavaOutput(
   state: JimClawState,
   requirementProtocol: any,
   singular: string,
   plural: string,
   port: number,
-  targetStack: { language: string; framework: string; templateId: string },
+  targetStack: { language: string; framework: string; templateId: string; frontend?: string },
   isSimple: boolean
 ): any {
   const pkgPath = "src/main/java/com/example/app";
@@ -476,6 +529,11 @@ function buildDeterministicJavaOutput(
 
   const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
   const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
+
+  // 混合项目：追加前端文件
+  const frontendFiles = buildFrontendFiles(targetStack);
+  if (frontendFiles) filesToCreate.push(...frontendFiles);
+
   const spec = {
     language: targetStack.language,
     framework: targetStack.framework,
@@ -485,12 +543,13 @@ function buildDeterministicJavaOutput(
     filesToCreate,
     dependencies: [],
     devDependencies: [],
+    frontend: buildFrontendSpec(targetStack),
   };
   const manifest = {
     services: [{ name: "java-api", port }],
     environment: { PORT: String(port) },
   };
-  const readme = `# ${state.contract?.title || "Java API"}\n\nSpring Boot 3 确定性骨架项目。\n\n## 运行\n\n\`\`\`bash\nmvn spring-boot:run\n\`\`\`\n\n## 测试\n\n\`\`\`bash\nmvn test\n\`\`\`\n`;
+  const readme = `# ${state.contract?.title || "Java API"}\n\nSpring Boot 3 确定性骨架项目。\n\n## 运行\n\n\\\`\\\`\\\`bash\nmvn spring-boot:run\n\\\`\\\`\\\`\n\n## 测试\n\n\\\`\\\`\\\`bash\nmvn test\n\\\`\\\`\\\`\n`;
 
   return {
     spec: stabilizeSpecForExecution(spec, requirementProtocol),
@@ -507,7 +566,7 @@ function buildDeterministicRustOutput(
   singular: string,
   plural: string,
   port: number,
-  targetStack: { language: string; framework: string; templateId: string },
+  targetStack: { language: string; framework: string; templateId: string; frontend?: string },
   isSimple: boolean
 ): any {
   const snakeSingular = singular.replace(/([A-Z])/g, "_$1").toLowerCase().replace(/^_/, "");
@@ -551,6 +610,7 @@ function buildDeterministicRustOutput(
     filesToCreate,
     dependencies: [],
     devDependencies: [],
+    frontend: buildFrontendSpec(targetStack),
   };
   const manifest = {
     services: [{ name: "rust-api", port }],
@@ -773,6 +833,8 @@ ${langFileConstraints}
     /^src\/main\.rs$/,
     /^src\/handlers\//,
     /_test\.rs$/,
+    // 前端文件（混合项目）
+    /^frontend\//,
   ];
 
   if (apiResourceNames.size === 0) {

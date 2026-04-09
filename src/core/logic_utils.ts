@@ -743,7 +743,7 @@ export function buildRequirementProtocol(contract: TaskContract | null | undefin
     return false;
   }
 
-  const frontendRequired = hasPositiveMatch(/前端|页面|界面|ui|web|浏览器/i);
+  const frontendRequired = hasPositiveMatch(/前端|页面|界面|ui|web|浏览器|vue|react|svelte/i);
   const backendRequired = hasPositiveMatch(/后端|api|接口|服务|express|fastapi|node/i) || !frontendRequired;
   const authRequired = hasPositiveMatch(/权限|授权|认证|登录|jwt/i);
   // "认证系统"任务中 authRequired 应为 true--但需要排除否定语境中的"权限""授权"等
@@ -2901,7 +2901,15 @@ function tryExternalScaffoldProvider(
 
   // 延迟加载 scaffold 注册表(避免循环依赖)
   try {
-    const { findScaffoldProvider } = require("../scaffolds") as typeof import("../scaffolds");
+    const { findScaffoldProvider, getScaffoldProviderById } = require("../scaffolds") as typeof import("../scaffolds");
+    // 前端文件：使用前端 scaffold provider
+    if (normalizedTarget.startsWith("frontend/")) {
+      const feProvider = getScaffoldProviderById("vue-typescript");
+      if (feProvider && feProvider.canHandle(ctx, normalizedTarget)) {
+        return feProvider.generate(ctx, normalizedTarget);
+      }
+      return null;
+    }
     const provider = findScaffoldProvider(language, framework);
     if (!provider) return null;
     if (!provider.canHandle(ctx, normalizedTarget)) return null;

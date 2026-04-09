@@ -22,6 +22,15 @@ export const TaskContractSchema = z.object({
 /**
  * 技术方案：架构师下发给开发的实现指南
  */
+export interface FrontendSpec {
+  language: "TypeScript" | "JavaScript";
+  framework: "Vue" | "React" | "Svelte";
+  buildCommand: string;   // e.g. "npm run build"
+  testCommand: string;    // e.g. "npm test"
+  outputDir: string;      // e.g. "dist"
+  sourceDir: string;      // e.g. "frontend"
+}
+
 export interface TechSpec {
   architecture: string;
   language: string;
@@ -32,10 +41,21 @@ export interface TechSpec {
   filesToCreate: string[];
   interfaces: string;
   authScaffoldMode?: "split" | "compact";
+  /** 混合项目的前端配置（Vue/React + Java/Python/Go/Rust） */
+  frontend?: FrontendSpec;
   // 架构师定义的核心依赖，Coder 以此为基准，可按需追加，但不得擅自移动分类
   dependencies: Record<string, string>;     // 运行时依赖，如 { "express": "^4.18.2" }
   devDependencies: Record<string, string>;  // 开发依赖，如 { "typescript": "^5.3.3" }
 }
+
+export const FrontendSpecSchema = z.object({
+  language: z.enum(["TypeScript", "JavaScript"]),
+  framework: z.enum(["Vue", "React", "Svelte"]),
+  buildCommand: z.string(),
+  testCommand: z.string(),
+  outputDir: z.string(),
+  sourceDir: z.string(),
+});
 
 export const TechSpecSchema = z.object({
   architecture: z.string(),
@@ -47,6 +67,7 @@ export const TechSpecSchema = z.object({
   filesToCreate: z.array(z.string()),
   interfaces: z.string(),
   authScaffoldMode: z.enum(["split", "compact"]).optional(),
+  frontend: FrontendSpecSchema.optional(),
   dependencies: z.record(z.string(), z.string()).optional(),
   devDependencies: z.record(z.string(), z.string()).optional(),
 });

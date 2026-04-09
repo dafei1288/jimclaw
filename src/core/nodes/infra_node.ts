@@ -903,6 +903,83 @@ export async function infraNode(
         await AuditLogger.log(WORKSPACE, "Infrastructure", `**Build Output:**\n${buildOut}`);
       }
     }
+
+    // ── 混合项目：前端 Node.js 安装 + 前端依赖 ──
+    const hasFrontendPkg = await (async () => {
+      try { await fs.access(path.join(WORKSPACE, "frontend", "package.json")); return true; } catch { return false; }
+    })();
+    if (hasFrontendPkg) {
+      // 在后端容器内安装 Node.js（如果尚不存在）
+      const nodeCheck = await execInContainer(containerId, "which node 2>/dev/null || echo 'not-found'");
+      if (nodeCheck.includes("not-found")) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing Node.js in backend container for frontend build`);
+        let installNodeCmd = "";
+        // 检测容器 OS — alpine 用 apk，Debian/Ubuntu 用 apt-get
+        const osCheck = await execInContainer(containerId, "cat /etc/os-release 2>/dev/null || echo unknown");
+        if (osCheck.includes("Alpine")) {
+          installNodeCmd = "apk add --no-cache nodejs npm";
+        } else if (osCheck.includes("Ubuntu")) {
+          installNodeCmd = "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y -qq nodejs";
+        } else {
+          // Debian 或其他
+          installNodeCmd = "apt-get update -qq && apt-get install -y -qq nodejs npm";
+        }
+        const nodeInstallOut = await runWithHeartbeat({
+          run: async () => execInContainer(containerId, installNodeCmd, { timeout: 120000 }),
+          onHeartbeat: async () => {
+            await saveBoulder(buildHeartbeatState("container_installing_nodejs"), "infra_setup_heartbeat_install");
+          },
+        });
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Node.js Install Output:**\n${nodeInstallOut}`);
+      }
+
+      // 安装前端依赖
+      await saveBoulder(buildHeartbeatState("container_installing_frontend_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing frontend dependencies (cd frontend && npm install)`);
+      const frontendInstallOut = await runWithHeartbeat({
+        run: async () => {
+          const out = await execInContainer(containerId, "cd frontend && npm install --loglevel=error", { timeout: 300000 });
+          if (isCommandFailureOutput(out)) throw new Error(`前端 npm install 失败：${out}`);
+          return out;
+        },
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_installing_frontend_deps"), "infra_setup_heartbeat_install");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output:**\n${frontendInstallOut}`);
+
+      // 构建前端（生成 dist/ 目录）
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && npm run build)`);
+      const frontendBuildOut = await runWithHeartbeat({
+        run: async () => {
+          const out = await execInContainer(containerId, "cd frontend && npm run build", { timeout: 300000 });
+          if (isCommandFailureOutput(out)) throw new Error(`前端 build 失败：${out}`);
+          return out;
+        },
+        onHeartbeat: async () => {
+          await saveBoulder(buildHeartbeatState("container_building_frontend"), "infra_setup_heartbeat_build");
+        },
+      });
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Build Output:**\n${frontendBuildOut}`);
+
+      // 将前端构建产物复制到后端静态资源目录
+      const lang = state.spec?.language?.toLowerCase() ?? "";
+      let staticCopyCmd = "";
+      if (lang.includes("java")) {
+        // Spring Boot: 复制到 src/main/resources/static/
+        staticCopyCmd = "mkdir -p src/main/resources/static && cp -r frontend/dist/* src/main/resources/static/ 2>/dev/null || true";
+      } else if (lang.includes("python")) {
+        // FastAPI: 不自动复制——用 StaticFiles mount
+        staticCopyCmd = "mkdir -p static && cp -r frontend/dist/* static/ 2>/dev/null || true";
+      } else if (lang.includes("go")) {
+        // Gin: 复制到 ./static/
+        staticCopyCmd = "mkdir -p static && cp -r frontend/dist/* static/ 2>/dev/null || true";
+      } else {
+        staticCopyCmd = "mkdir -p public && cp -r frontend/dist/* public/ 2>/dev/null || true";
+      }
+      await execInContainer(containerId, staticCopyCmd);
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Copied frontend dist to static dir`);
+    }
   } catch (e: any) {
     const errorMsg = `[基础设施异常] ${e.message || e}`;
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Critical Error:** ${errorMsg}`);
