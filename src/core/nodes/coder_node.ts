@@ -101,6 +101,9 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
     /_test\.go$/i.test(normalized) ||
     /^test_.*\.py$/i.test(normalized) ||
     (normalized.startsWith("tests/") && /\.test\.[^.]+$/i.test(normalized)) ||
+    // Python 包初始化和配置文件（允许空内容）
+    /^__init__\.(py|ts|js)$/i.test(path.basename(normalized)) ||
+    /^(conftest\.py|pytest\.ini)$/i.test(path.basename(normalized)) ||
     normalized === "readme.md" ||
     /^scripts\/verify\.[^.]+$/i.test(normalized) ||
     normalized === "src/errors.ts" ||
@@ -457,8 +460,13 @@ function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: r
 function validateGeneratedFileContent(fileTarget: string, content: string): string | null {
   const trimmed = content.trim();
   const ext = path.extname(fileTarget).toLowerCase();
+  const basename = path.basename(fileTarget);
 
   if (!trimmed) {
+    // Python 包初始化文件和配置文件允许为空
+    if (/^__init__\.(py|ts|js)$/i.test(basename) || /^(conftest\.py|pytest\.ini|\.gitkeep|\.env\.example)$/i.test(basename)) {
+      return null;
+    }
     return "生成内容为空，不能作为有效文件提交";
   }
 
