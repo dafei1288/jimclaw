@@ -67,13 +67,12 @@ function generateMainRs(ctx: ScaffoldContext): string {
 
   const hasCrud = ctx.declaredFiles.has(`src/handlers/${snakePlural}.rs`);
 
-  let modDecl = "mod health;";
-  let useHandlers = "use health::health_check;";
+  let modDecl = "";
+  let useHandlers = "use handlers::health::health_check;";
   let crudRoutes = "";
 
   if (hasCrud) {
-    modDecl += `\nmod ${snakePlural};`;
-    useHandlers += `\nuse ${snakePlural}::{create_${snakeSingular}, list_${snakePlural}, get_${snakeSingular}, update_${snakeSingular}, delete_${snakeSingular}};`;
+    useHandlers += `\nuse handlers::${snakePlural}::{create_${snakeSingular}, list_${snakePlural}, get_${snakeSingular}, update_${snakeSingular}, delete_${snakeSingular}};`;
     crudRoutes = `
         .route("/api/${plural}", axum::routing::get(list_${snakePlural}).post(create_${snakeSingular}))
         .route("/api/${plural}/:id", axum::routing::get(get_${snakeSingular}).put(update_${snakeSingular}).delete(delete_${snakeSingular}))`;
@@ -125,8 +124,14 @@ async fn root() -> &'static str {
 }
 
 function generateHandlersModRs(ctx: ScaffoldContext): string {
-  return `pub mod health;
+  const plural = inferPlural(ctx);
+  const snakePlural = toSnakeCase(plural);
+  const hasCrud = ctx.declaredFiles.has(`src/handlers/${snakePlural}.rs`);
+  let modules = `pub mod health;
 `;
+  if (hasCrud) modules += `pub mod ${snakePlural};
+`;
+  return modules;
 }
 
 function generateHealthRs(ctx: ScaffoldContext): string {
@@ -204,10 +209,8 @@ pub struct ${pascalSingular} {
     pub updated_at: Option<String>,
 }
 
-lazy_static::lazy_static! {
-    pub static ref STORE: Mutex<HashMap<String, ${pascalSingular}>> = Mutex::new(HashMap::new());
-    pub static ref SEQ: Mutex<u64> = Mutex::new(1);
-}
+static STORE: std::sync::LazyLock<Mutex<HashMap<String, ${pascalSingular}>>> = std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static SEQ: std::sync::LazyLock<Mutex<u64>> = std::sync::LazyLock::new(|| Mutex::new(1));
 
 pub async fn list_${snakePlural}(State(_state): State<Arc<AppState>>) -> Json<Vec<${pascalSingular}>> {
     let store = STORE.lock().unwrap();
