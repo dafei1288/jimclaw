@@ -938,7 +938,7 @@ export async function infraNode(
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing frontend dependencies (cd frontend && npm install)`);
       const frontendInstallOut = await runWithHeartbeat({
         run: async () => {
-          const out = await execInContainer(containerId, "cd frontend && npm install --loglevel=error", { timeout: 300000 });
+          const out = await execInContainer(containerId, "cd frontend && npm install --loglevel=error", { timeout: 600000 });
           if (isCommandFailureOutput(out)) throw new Error(`前端 npm install 失败：${out}`);
           return out;
         },

@@ -131,8 +131,10 @@ ${JSON.stringify(executionProtocol, null, 2)}
   });
 
   if (requirementProtocol.capabilities.frontendRequired) {
+    // 混合项目（spec.frontend 存在）已通过 scaffold 生成 frontend/ 目录，不需要 public/index.html
+    const isMixedProject = Boolean((spec as any)?.frontend);
     const hasFrontendTask = subTasks.some((task: any) => /^public\/.+/i.test(task.fileTarget));
-    if (!hasFrontendTask) {
+    if (!isMixedProject && !hasFrontendTask) {
       subTasks.push({
         id: "task-frontend-index-inject",
         fileTarget: "public/index.html",

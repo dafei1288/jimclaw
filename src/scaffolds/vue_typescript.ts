@@ -50,7 +50,8 @@ function generatePackageJson(ctx: ScaffoldContext): string {
   }, null, 2);
 }
 
-function generateViteConfig(_ctx: ScaffoldContext): string {
+function generateViteConfig(ctx: ScaffoldContext): string {
+  const backendPort = ctx.port || 8080;
   return `import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 
@@ -59,7 +60,7 @@ export default defineConfig({
   server: {
     proxy: {
       '/api': {
-        target: 'http://localhost:__BACKEND_PORT__',
+        target: 'http://localhost:${backendPort}',
         changeOrigin: true,
       },
     },
