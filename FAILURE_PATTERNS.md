@@ -1,0 +1,171 @@
+# 失败模式库（Failure Patterns）
+
+> JimClaw 内部 agents + 外部 assistant 共同维护。每条 pattern 格式固定，agent 可程序化消费。
+> 
+> 命名规范：`FP-{NNN}`。标签用于自动匹配相关 pattern 注入 agent prompt。
+
+---
+
+## FP-001: npm scripts 在 Docker `sh -c` 中找不到命令
+
+- **症状**: `sh: xxx: not found` (exit code 127)
+- **根因**: `npm run <script>` 通过 `sh -c` 执行时，`node_modules/.bin` 不在 PATH。在非 Node 基础镜像（maven、golang、python）中更常见，因为这些镜像没有 Node 的全局 PATH 配置。
+- **影响范围**: 所有混合项目（后端非 Node + 前端 Vue/React）
+- **修复**: 用 `npx <cmd>` 代替裸命令，或在 `npm run build` 前加 `PATH=./node_modules/.bin:$PATH`
+- **预防**: `infra_node` 的前端 build 命令始终用 `npx` 前缀
+- **首次发现**: 2026-04-10, `run_1775806547907`
+- **标签**: `docker`, `npm`, `frontend`, `exit-127`, `infra`
+
+---
+
+## FP-002: verifier 把配置文件误判为测试文件
+
+- **症状**: `vitest.config.ts 未找到断言语句（如 expect()、assert.）`
+- **根因**: 文件名含 `test`（如 `vitest.config.ts`、`jest.config.ts`）被 `testFilePatterns` 正则匹配
+- **修复**: `nonTestFiles` 排除列表扩展到包含 `vitest.config.*`、`vite.config.*`、`jest.config.*`
+- **预防**: 每次新增配置文件格式时同步更新 `nonTestFiles`
+- **首次发现**: 2026-04-10
+- **标签**: `verifier`, `config-file`, `false-positive`
+
+---
+
+## FP-003: 非 Node 项目 `ensureRequirementDrivenFiles` 直接返回空
+
+- **症状**: Java/Python/Go/Rust 项目缺少测试文件，Maven 报 `No tests to run`
+- **根因**: `ensureRequirementDrivenFiles()` 检测到非 Node 语言后直接 `return`，跳过了所有文件注入逻辑（包括测试文件）
+- **修复**: 为 Java/Python/Go/Rust 各自添加基础文件注入分支
+- **预防**: 修改通用函数时检查所有分支
+- **首次发现**: 2026-04-10, `run_1775804713445`
+- **标签**: `architect`, `filesToCreate`, `multi-language`, `logic-utils`
+
+---
+
+## FP-004: Python conftest.py 使用 httpx 导致 FastAPI async handler 测试失败
+
+- **症状**: `ClientState.UNOPENED` 错误，8/8 tests ERROR at setup
+- **根因**: `httpx.Client` + `ASGITransport` 不兼容 FastAPI async handler
+- **修复**: 改用 `starlette.testclient.TestClient`（同步封装，最简单可靠）
+- **预防**: Python scaffold 的 conftest.py 固定使用 `TestClient`
+- **首次发现**: 2026-04-10
+- **标签**: `python`, `fastapi`, `testing`, `conftest`
+
+---
+
+## FP-005: pytest.ini 含 asyncio_mode=auto 但未安装 pytest-asyncio
+
+- **症状**: `PytestConfigWarning: unknown config option: asyncio_mode`
+- **根因**: scaffold 生成的 `pytest.ini` 包含了非异步项目不需要的配置
+- **修复**: 移除 `asyncio_mode=auto`
+- **预防**: 只在检测到 async 需求时才注入 pytest-asyncio 配置
+- **首次发现**: 2026-04-10
+- **标签**: `python`, `pytest`, `config-file`
+
+---
+
+## FP-006: ts-node 10.9.2 + TypeScript 5.9.3 的 Debug Failure
+
+- **症状**: `Debug Failure. Output generation failed` — ts-node 的 `transpileModule` 偶发编译器断言错误
+- **根因**: ts-node 10.9.2 与 TypeScript 5.9.3 的兼容性问题（不是模型 API 问题）
+- **修复**: 在 `transpileModule` 调用周围加 try-catch，不崩溃整个 coder_node
+- **预防**: 此为外部依赖问题，无法根治。缓解措施：try-catch + retry + 预写入阶段减少编译次数
+- **首次发现**: 2026-04-10
+- **标签**: `ts-node`, `typescript`, `runtime-crash`, `external-dep`
+
+---
+
+## FP-007: infra build 失败被静默吞掉
+
+- **症状**: 前端 `npm run build` 失败 (exit 127)，但流程继续走到 deploy，用户看到 404
+- **根因**: `infra_node` 中 `isCommandFailureOutput` 只匹配 `Command failed with exit code \d+` 格式，不匹配 stderr 中的错误。错误被 try-catch 吞掉后 infra 继续。
+- **修复**: (1) build 失败必须终止流程 (2) 增加 `post_deploy_verify` 节点
+- **预防**: **infra 阶段的任何 build 失败都应终止**。宁可 false positive，不要 false negative。
+- **首次发现**: 2026-04-10, `run_1775806547907`
+- **标签**: `infra`, `build`, `silent-failure`, `critical`
+
+---
+
+## FP-008: QA 验证盲区 — 不检查部署后服务
+
+- **症状**: 后端 API 通过但前端页面 404，QA 不报错
+- **根因**: QA 只分析 `testResults` 文本，从不实际访问部署的服务。前端 build 失败在 QA 视野之外。
+- **修复**: 增加 `post_deploy_verify` 节点，在 deploy 后对所有用户可见端点做 HTTP 检查
+- **预防**: 质量验证不能只看单元测试输出，必须有端到端可达性验证
+- **首次发现**: 2026-04-10
+- **标签**: `qa`, `deploy`, `verification`, `critical`
+
+---
+
+## FP-009: Java/Rust TechSpec 缺 Zod 必填字段
+
+- **症状**: `ZodError` — `dependencies`/`devDependencies` 为 `[]` 而非 `{}`，缺 `architecture`/`interfaces`
+- **根因**: 确定性快速路径直接构造对象，未对齐 `TechSpecSchema` 的字段类型要求
+- **修复**: 补全所有必填字段
+- **预防**: 新增确定性 builder 时，用 Zod schema 验证输出
+- **首次发现**: 2026-04-10
+- **标签**: `architect`, `zod`, `schema`, `multi-language`
+
+---
+
+## FP-010: 混合项目 orchestrator 注入多余 public/index.html
+
+- **症状**: 混合项目（Vue + Java）的 filesToCreate 中同时有 `public/index.html` 和 `frontend/index.html`
+- **根因**: orchestrator 的通用逻辑检测到 `frontendRequired` 就注入 `public/index.html`，没检查是否已有 `frontend/` 目录
+- **修复**: 当 `spec.frontend` 存在时跳过 `public/index.html` 注入
+- **预防**: 混合项目的前端文件全部在 `frontend/` 子目录
+- **首次发现**: 2026-04-10
+- **标签**: `orchestrator`, `mixed-project`, `duplicate-file`
+
+---
+
+## FP-011: vite.config.ts 含硬编码占位符
+
+- **症状**: 前端 proxy target 为 `http://localhost:__BACKEND_PORT__`
+- **根因**: scaffold 模板使用了占位符，运行时没替换
+- **修复**: `buildFrontendFiles()` 中用实际端口替换占位符
+- **预防**: scaffold 模板中的占位符必须有对应的替换逻辑
+- **首次发现**: 2026-04-10
+- **标签**: `scaffold`, `frontend`, `placeholder`, `mixed-project`
+
+---
+
+## FP-012: Docker 容器重建导致所有依赖重装
+
+- **症状**: 混合项目 retry 时 15+ 分钟重建容器（重新安装 Maven 依赖 + Node.js + npm）
+- **根因**: infra_node 在 retry 时 `docker rm -f` 再 `docker run`，缓存卷只能缓解部分问题
+- **修复**: (已部分缓解) 缓存卷 + 容器复用检查。根本解决需要持久化构建缓存层
+- **预防**: infra_node 优先复用现有容器
+- **首次发现**: 2026-04-10
+- **标签**: `docker`, `infra`, `performance`, `mixed-project`
+
+---
+
+## FP-013: agent_pending 重试正则与 isAgentRecoveryError 不同步
+
+- **症状**: `withNodeGuard` 识别 `Debug Failure` 为可恢复 → `agent_pending`，但 `isRetryable` 正则不匹配，导致 agent_pending 立即放弃
+- **根因**: 两处正则表达式各自维护，新增错误类型时只改了一处
+- **修复**: 两处正则同步更新
+- **预防**: `isRetryable` 正则应直接引用 `isAgentRecoveryError` 的 pattern，或统一为一处定义
+- **首次发现**: 2026-04-10
+- **标签**: `agent-pending`, `regex`, `sync-bug`, `graph`
+
+---
+
+## FP-014: conftest.py/pytest.ini 被 QA 标记后走 LLM 重写导致死循环
+
+- **症状**: QA 标记 conftest.py 失败 → coder 用 LLM 重写 → 代码提取失败 → QA 再标记 → 循环
+- **根因**: 配置文件太短，LLM 代码提取容易失败
+- **修复**: 加入 `isStructuralConfigFile()` 保护，QA 标记失败后始终用 scaffold 内容
+- **预防**: 小型配置文件不应走 LLM 重写路径
+- **首次发现**: 2026-04-10
+- **标签**: `coder`, `qa`, `config-file`, `death-loop`
+
+---
+
+## FP-015: 宣布成功前不验证实际用户体验
+
+- **症状**: 只检查 `curl /api/health` 返回 200 就宣布成功，用户访问 `http://host:port/` 得到 404
+- **根因**: 没有标准化的验证清单，验证者凭感觉检查
+- **修复**: 建立 LESSONS.md 中的验证清单 + post_deploy_verify 节点
+- **预防**: 每次宣布成功前必须执行完整验证清单
+- **首次发现**: 2026-04-10
+- **标签**: `process`, `verification`, `critical`, `meta`
