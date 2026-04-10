@@ -83,6 +83,7 @@ function isPlanningFallbackActive(state: JimClawState): boolean {
  */
 function isStructuralConfigFile(fileTarget: string): boolean {
   const n = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  const basename = path.basename(n);
   return (
     n === "cargo.toml" ||
     n === "go.mod" ||
@@ -97,7 +98,10 @@ function isStructuralConfigFile(fileTarget: string): boolean {
     n.endsWith("application.properties") ||
     n.endsWith("tsconfig.json") ||
     n.endsWith("tsconfig.node.json") ||
-    /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(n)
+    /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(n) ||
+    // Python 测试基础设施文件：conftest.py/pytest.ini 不应被 LLM 重写
+    basename === "conftest.py" ||
+    basename === "pytest.ini"
   );
 }
 

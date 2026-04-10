@@ -75,7 +75,6 @@ function buildRequirementsTxt(ctx: ScaffoldContext): string {
 function buildPytestIni(): string {
   return `[pytest]
 testpaths = tests
-asyncio_mode = auto
 `;
 }
 
@@ -614,7 +613,21 @@ class FastApiPythonProvider implements ScaffoldProvider {
 
     // conftest.py
     if (normalizedTarget === "conftest.py") {
-      return `import pytest\n`;
+      return [
+        "import pytest",
+        "from httpx import ASGITransport, Client",
+        "",
+        "from app.main import app",
+        "",
+        "",
+        "@pytest.fixture",
+        "def client():",
+        "    \"\"\"提供同步 HTTP 测试客户端，基于 httpx ASGITransport 直接调用 FastAPI 应用。\"\"\"",
+        "    transport = ASGITransport(app=app)",
+        "    with Client(transport=transport, base_url=\"http://test\") as c:",
+        "        yield c",
+        "",
+      ].join("\n");
     }
 
     // Dockerfile
