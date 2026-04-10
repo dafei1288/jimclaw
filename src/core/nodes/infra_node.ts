@@ -702,7 +702,7 @@ export async function infraNode(
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
       startOut = await ShellExecuteSkill.config.run({
-        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} -w /app ${image} tail -f /dev/null`,
+        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} ${lang.includes("go") ? "-v jimclaw_go_cache:/go/pkg/mod" : ""} ${lang.includes("java") ? "-v jimclaw_maven_cache:/root/.m2" : ""} ${lang.includes("rust") ? "-v jimclaw_cargo_cache:/usr/local/cargo/registry" : ""} -w /app ${image} tail -f /dev/null`,
         timeout: 60000,
       });
       containerId = extractContainerId(startOut);

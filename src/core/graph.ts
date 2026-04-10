@@ -31,8 +31,17 @@ function logPrefix(agentName: string = "System"): string {
   return `[${getBeijingTime()}] [${agentName}]`;
 }
 
+/**
+ * 判断错误是否可自动恢复（模型 API 不可用 / ts-node 瞬时编译错误）
+ * ts-node 的 "Debug Failure. Output generation failed" 是 TypeScript 编译器内存/瞬时问题，
+ * 重试大概率能成功，不应直接标记为 crash 终止整个流程。
+ */
 function isAgentRecoveryError(error: unknown): error is AgentServiceUnavailableError | AgentResourceExhaustedError | AgentTimeoutError {
-  return error instanceof AgentServiceUnavailableError || error instanceof AgentResourceExhaustedError || error instanceof AgentTimeoutError;
+  if (error instanceof AgentServiceUnavailableError || error instanceof AgentResourceExhaustedError || error instanceof AgentTimeoutError) return true;
+  // ts-node 瞬时编译错误：TypeScript "Debug Failure" 系列可重试
+  const msg = error instanceof Error ? error.message : String(error || "");
+  if (/Debug Failure/i.test(msg)) return true;
+  return false;
 }
 
 export function hasPendingExecutorApproval(state: JimClawState): boolean {
