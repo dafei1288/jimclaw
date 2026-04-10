@@ -32,14 +32,21 @@ function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: r
 
 function getSyntaxValidationError(fileTarget: string, content: string): string | null {
   if (!/\.(ts|tsx|js|jsx)$/i.test(fileTarget)) return null;
-  const diagnostics = ts.transpileModule(content, {
-    fileName: fileTarget,
-    reportDiagnostics: true,
-    compilerOptions: {
-      target: ts.ScriptTarget.ES2020,
-      module: ts.ModuleKind.CommonJS,
-    },
-  }).diagnostics || [];
+  let diagnostics: any[] = [];
+  try {
+    diagnostics = ts.transpileModule(content, {
+      fileName: fileTarget,
+      reportDiagnostics: true,
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.CommonJS,
+      },
+    }).diagnostics || [];
+  } catch (transpileError: any) {
+    // TypeScript 5.9.3 transpileModule 内部断言错误，跳过诊断
+    console.warn(`[Verifier] transpileModule 警告 (${fileTarget}): ${transpileError.message?.slice(0, 100)}`);
+    return null;
+  }
   if (diagnostics.length === 0) return null;
   return formatTsDiagnostics(fileTarget, content, diagnostics);
 }

@@ -251,6 +251,7 @@ export async function createJimClawGraph(agents: {
     try {
       return await handler(state);
     } catch (error: any) {
+      console.error(`[withNodeGuard] ${nodeName} threw:`, error.message?.slice(0, 200), error.stack?.split('\n').slice(0, 3).join('\n'));
       try {
         const { failure, meetingNotes } = await recordNodeFailure(WORKSPACE, state, nodeName, error);
         if (isAgentRecoveryError(error)) {
@@ -324,14 +325,16 @@ export async function createJimClawGraph(agents: {
     .addNode("agent_pending", async (s: JimClawState) => {
       const retryCount = (s.agentRecoveryRetryCount || 0) + 1;
       const reason = s.agentRecoveryReason || "";
+      const isDebugFailure = /Debug Failure/i.test(reason);
       const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
-      const maxRetries = 3;
+      const maxRetries = isDebugFailure ? 5 : 3; // ts-node 编译器瞬时错误需要更多重试
 
       if (isRetryable && retryCount <= maxRetries) {
-        // 可重试的临时故障：等待 2 秒后重试
+        // 可重试的临时故障：等待后重试（Debug Failure 需要更长延迟让 ts-node GC）
+        const delay = isDebugFailure ? 5000 : 2000;
         console.log(`[AgentPending] 第 ${retryCount}/${maxRetries} 次重试: ${s.agentRecoveryNode} (${reason.slice(0, 80)})`);
         emit("thinking", "System", `模型服务临时不可用（${reason.slice(0, 60)}），第 ${retryCount}/${maxRetries} 次重试...`, {});
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        await new Promise(resolve => setTimeout(resolve, delay));
         return {
           agentRecoveryPending: false,
           agentRecoveryRetryCount: retryCount,
@@ -411,8 +414,9 @@ export async function createJimClawGraph(agents: {
   workflow.addConditionalEdges("agent_pending", (state: JimClawState) => {
     const retryCount = state.agentRecoveryRetryCount || 0;
     const reason = state.agentRecoveryReason || "";
+    const isDebugFailure = /Debug Failure/i.test(reason);
     const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
-    const maxRetries = 3;
+    const maxRetries = isDebugFailure ? 5 : 3;
 
     if (isRetryable && retryCount <= maxRetries) {
       const targetNode = state.agentRecoveryNode || "pm";
