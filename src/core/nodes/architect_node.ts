@@ -537,12 +537,14 @@ function buildDeterministicJavaOutput(
   const spec = {
     language: targetStack.language,
     framework: targetStack.framework,
+    architecture,
+    interfaces: "REST API",
     testCommand: "mvn test -B",
     runCommand: "mvn spring-boot:run",
     entryPoint: `${pkgPath}/Application.java`,
     filesToCreate,
-    dependencies: [],
-    devDependencies: [],
+    dependencies: {},
+    devDependencies: {},
     frontend: buildFrontendSpec(targetStack),
   };
   const manifest = {
@@ -604,12 +606,14 @@ function buildDeterministicRustOutput(
   const spec = {
     language: targetStack.language,
     framework: targetStack.framework,
+    architecture,
+    interfaces: "REST API",
     testCommand: "cargo test -- --nocapture",
     runCommand: "cargo run",
     entryPoint: "src/main.rs",
     filesToCreate,
-    dependencies: [],
-    devDependencies: [],
+    dependencies: {},
+    devDependencies: {},
     frontend: buildFrontendSpec(targetStack),
   };
   const manifest = {
