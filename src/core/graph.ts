@@ -251,7 +251,6 @@ export async function createJimClawGraph(agents: {
     try {
       return await handler(state);
     } catch (error: any) {
-      console.error(`[withNodeGuard] ${nodeName} threw:`, error.message?.slice(0, 200), error.stack?.split('\n').slice(0, 3).join('\n'));
       try {
         const { failure, meetingNotes } = await recordNodeFailure(WORKSPACE, state, nodeName, error);
         if (isAgentRecoveryError(error)) {
