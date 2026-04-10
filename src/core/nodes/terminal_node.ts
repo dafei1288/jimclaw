@@ -249,7 +249,7 @@ export async function terminalNode(
     };
   }
 
-  const rawOutput = result.stdout || result.stderr || "";
+  let rawOutput = result.stdout || result.stderr || "";
   await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${rawOutput}`);
 
   // ── 混合项目：前端测试 ──
@@ -283,8 +283,9 @@ export async function terminalNode(
         lastFailureSummary: combinedEvidence.hasBlockingFailure ? state.lastFailureSummary : "",
       };
     } catch (e: any) {
-      // 前端测试失败不影响后端——追加错误信息继续
+      // 前端测试失败——追加错误信息到 rawOutput，让后续 evidence 检测到失败
       const feError = `\n\n--- Frontend Tests (ERROR) ---\n${e.message || e}`;
+      rawOutput += feError;
       await AuditLogger.log(WORKSPACE, "Terminal", `**Frontend Test Error:** ${feError}`);
     }
   }

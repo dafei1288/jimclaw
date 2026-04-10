@@ -324,7 +324,7 @@ export async function createJimClawGraph(agents: {
     .addNode("agent_pending", async (s: JimClawState) => {
       const retryCount = (s.agentRecoveryRetryCount || 0) + 1;
       const reason = s.agentRecoveryReason || "";
-      const isRetryable = /Connection error|超时|502/i.test(reason);
+      const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
       const maxRetries = 3;
 
       if (isRetryable && retryCount <= maxRetries) {
@@ -411,7 +411,7 @@ export async function createJimClawGraph(agents: {
   workflow.addConditionalEdges("agent_pending", (state: JimClawState) => {
     const retryCount = state.agentRecoveryRetryCount || 0;
     const reason = state.agentRecoveryReason || "";
-    const isRetryable = /Connection error|超时|502/i.test(reason);
+    const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
     const maxRetries = 3;
 
     if (isRetryable && retryCount <= maxRetries) {
@@ -428,9 +428,14 @@ export async function createJimClawGraph(agents: {
     coder: "coder",
     env_guard: "env_guard",
     infra_setup: "infra_setup",
+    terminal: "terminal",
+    verifier: "verifier",
     qa: "qa",
     fix_plan: "fix_plan",
+    architect_mediation: "architect_mediation",
     deploy: "deploy",
+    post_mortem: "post_mortem",
+    persistence: "persistence",
     __end__: END,
   });
   workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => "env_guard"), {
