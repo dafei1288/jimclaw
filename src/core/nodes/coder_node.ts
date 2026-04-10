@@ -1680,6 +1680,40 @@ export async function coderNode(
   const coderStartTime = Date.now();
 
   normalizeStructuralDependencies(subTasks as any);
+
+  // ── 预写入阶段：所有有 scaffold 内容的文件直接写盘，跳过 LLM ──
+  // 减少 LLM 调用次数，降低 Debug Failure 风险，加速执行
+  const qaFailedSet_preWrite = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
+  let preWrittenCount = 0;
+  for (const task of subTasks as any[]) {
+    if (task.status === "completed") continue;
+    const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
+    if (!scaffold) continue;
+    const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
+    const isProtected = isStructuralConfigFile(task.fileTarget);
+    if (fileFailed && !isProtected) continue; // QA 失败且非配置文件，留给 LLM 修复
+    const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
+    if (validationError) continue;
+    // 写盘
+    const filePath = path.join(WORKSPACE, task.fileTarget);
+    try {
+      await fs.mkdir(path.dirname(filePath), { recursive: true });
+      await fs.writeFile(filePath, scaffold, "utf-8");
+      filesContent[task.fileTarget] = scaffold;
+      task.status = "completed";
+      preWrittenCount++;
+    } catch (e: any) {
+      emit("thinking", "System", `[Coder] 预写入 ${task.fileTarget} 失败: ${e.message}`, {});
+    }
+  }
+  if (preWrittenCount > 0) {
+    emit("thinking", "System", `[Coder] 预写入阶段：直接写盘 ${preWrittenCount} 个确定性文件，跳过 LLM`, {});
+    await reconcileCompletedFilesFromDisk(
+      WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry,
+      state.executionProtocol, state.qaFailures?.failedFiles
+    );
+  }
+
   let progressMade = true;
   while (progressMade && !blockedReason) {
     // 全局超时检查
