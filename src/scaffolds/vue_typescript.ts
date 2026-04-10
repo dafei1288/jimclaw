@@ -30,7 +30,7 @@ function generatePackageJson(ctx: ScaffoldContext): string {
     type: "module",
     scripts: {
       dev: "vite",
-      build: "vue-tsc -b && vite build",
+      build: "vite build",
       test: "vitest run",
       "test:watch": "vitest",
     },
