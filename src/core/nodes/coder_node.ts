@@ -77,6 +77,30 @@ function isPlanningFallbackActive(state: JimClawState): boolean {
   );
 }
 
+/**
+ * 配置/基础设施文件 — 由 scaffold 确定性生成，LLM 重写不会更好只会更差。
+ * 这些文件即使被 QA 标记为失败，也始终使用 scaffold 内容，跳过 LLM。
+ */
+function isStructuralConfigFile(fileTarget: string): boolean {
+  const n = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return (
+    n === "cargo.toml" ||
+    n === "go.mod" ||
+    n === "go.sum" ||
+    n === "pom.xml" ||
+    n === "build.gradle" ||
+    n === "requirements.txt" ||
+    n === "package.json" ||
+    n === "dockerfile" ||
+    n.endsWith("/dockerfile") ||
+    n.endsWith("docker-compose.yml") ||
+    n.endsWith("application.properties") ||
+    n.endsWith("tsconfig.json") ||
+    n.endsWith("tsconfig.node.json") ||
+    /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(n)
+  );
+}
+
 function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
   return (
@@ -1880,7 +1904,9 @@ CMD ["node", "dist/index.js"]`;
       const deterministicScaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
       const qaFailedSet = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
       const fileFailedByQa = qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"));
-      const scaffoldAllowed = Boolean(deterministicScaffold) && !fileFailedByQa;
+      // 配置文件（Cargo.toml, go.mod, pom.xml 等）即使被 QA 标记也始终使用 scaffold
+      const isProtectedConfig = isStructuralConfigFile(task.fileTarget) && Boolean(deterministicScaffold);
+      const scaffoldAllowed = Boolean(deterministicScaffold) && (!fileFailedByQa || isProtectedConfig);
       let generationSource: FileChangeEntry["generationSource"] | undefined;
       let extractResult: { isValid: boolean; code: string; error?: string } | undefined = undefined;
       if (scaffoldAllowed) {
