@@ -615,17 +615,15 @@ class FastApiPythonProvider implements ScaffoldProvider {
     if (normalizedTarget === "conftest.py") {
       return [
         "import pytest",
-        "from httpx import ASGITransport, Client",
+        "from starlette.testclient import TestClient",
         "",
         "from app.main import app",
         "",
         "",
         "@pytest.fixture",
         "def client():",
-        "    \"\"\"提供同步 HTTP 测试客户端，基于 httpx ASGITransport 直接调用 FastAPI 应用。\"\"\"",
-        "    transport = ASGITransport(app=app)",
-        "    with Client(transport=transport, base_url=\"http://test\") as c:",
-        "        yield c",
+        "    \"\"\"提供同步 HTTP 测试客户端，基于 Starlette TestClient 直接调用 FastAPI 应用。\"\"\"",
+        "    return TestClient(app)",
         "",
       ].join("\n");
     }
