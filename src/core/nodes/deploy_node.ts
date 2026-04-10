@@ -667,12 +667,15 @@ export async function deployNode(
     for (const ep of apiEndpoints.slice(0, 10)) {
       const epPath = String(ep.path || "").replace(/:([^/]+)/g, "1"); // 替换路径参数
       try {
+        // FP-0016: 避免 curl -o /dev/null 在 MSYS 下 exit 23，改用 -D- 获取状态行
         const epOut = await ShellExecuteSkill.config.run({
-          command: `curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:${hostPort}${epPath}`,
+          command: `curl -s -D- -o /dev/null --max-time 3 http://127.0.0.1:${hostPort}${epPath} 2>/dev/null | head -1`,
           workDir: WORKSPACE,
-          timeout: 5000,
+          timeout: 8000,
         });
-        const code = String(epOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim().split("\n").pop()?.trim() || String(epOut).trim();
+        const rawOut = String(epOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
+        const httpMatch = rawOut.match(/HTTP\/\S+\s+(\d+)/);
+        const code = httpMatch ? httpMatch[1] : rawOut.split("\n").pop()?.trim() || "";
         const ok = /^[23]\d\d$/.test(code);
         verificationResults.push(`  ${epPath} → HTTP ${code} ${ok ? "✅" : "❌"}`);
         if (!ok) allEndpointsOk = false;

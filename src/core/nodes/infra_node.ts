@@ -82,6 +82,8 @@ function isCommandFailureOutput(raw: string): boolean {
   if (/sh:.*:\s*not found/i.test(s)) return true;
   if (/command not found/i.test(s)) return true;
   if (/\berror\b.*\bfailed\b/i.test(s) && /\bexit\b/i.test(s)) return true;
+  // 超时也算失败
+  if (/Command timed out after/i.test(s)) return true;
   return false;
 }
 
@@ -956,11 +958,11 @@ export async function infraNode(
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output:**\n${frontendInstallOut}`);
 
       // 构建前端（生成 dist/ 目录）
-      // FP-001: 用 npx vite build 而不是 npm run build，避免 sh -c 环境下 node_modules/.bin 不在 PATH
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && npx vite build)`);
+      // FP-001: 直接用 node_modules/.bin/vite 避免 npx 下载延迟
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && ./node_modules/.bin/vite build)`);
       const frontendBuildOut = await runWithHeartbeat({
         run: async () => {
-          const out = await execInContainer(containerId, "cd frontend && npx vite build", { timeout: 300000 });
+          const out = await execInContainer(containerId, "cd frontend && ./node_modules/.bin/vite build", { timeout: 300000 });
           if (isCommandFailureOutput(out)) throw new Error(`前端 build 失败：${out}`);
           return out;
         },
