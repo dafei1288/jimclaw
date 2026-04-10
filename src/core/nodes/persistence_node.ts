@@ -2,6 +2,8 @@ import { JimClawState } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import * as fs from "fs/promises";
 import * as path from "path";
+import { execFile } from "child_process";
+import { promisify } from "util";
 
 /**
  * Persistence 节点：负责资源清理和最终状态持久化
@@ -45,5 +47,27 @@ export async function persistenceNode(
   }
   const result = { isDone };
   await saveBoulder({ ...state, ...result }, "persistence");
+
+  // ── FP 回归检测：每次运行结束自动检查所有已知 failure patterns ──
+  try {
+    const execFileAsync = promisify(execFile);
+    const scriptPath = path.resolve(process.cwd(), "scripts", "fp_regression_check.ts");
+    const tsNode = path.resolve(process.cwd(), "node_modules", ".bin", "ts-node");
+    const { stdout, stderr } = await execFileAsync(tsNode, [scriptPath, WORKSPACE], {
+      timeout: 30000,
+      cwd: process.cwd(),
+    }).catch(() => ({ stdout: "", stderr: "" }));
+    if (stdout) {
+      // 输出关键结果
+      const lines = stdout.split("\n").filter(l => /❌|✅.*FP-|总计|通过|失败/.test(l));
+      for (const line of lines) {
+        console.log(`[FP-Check] ${line.trim()}`);
+      }
+    }
+  } catch (e: any) {
+    // fp_regression_check 失败不应阻塞 persistence
+    console.log(`[FP-Check] 回归检测异常（不阻塞）: ${e.message}`);
+  }
+
   return result;
 }

@@ -75,7 +75,14 @@ function isRetryableContainerExecFailure(raw: string): boolean {
 }
 
 function isCommandFailureOutput(raw: string): boolean {
-  return /^Command failed with (exit code\s+\d+|error:)/i.test(String(raw || "").trim());
+  const s = String(raw || "").trim();
+  if (/^Command failed with (exit code\s+\d+|error:)/i.test(s)) return true;
+  // FP-007: 额外检测 exit 127 (command not found) 和常见错误模式
+  if (/exit code\s*127/i.test(s)) return true;
+  if (/sh:.*:\s*not found/i.test(s)) return true;
+  if (/command not found/i.test(s)) return true;
+  if (/\berror\b.*\bfailed\b/i.test(s) && /\bexit\b/i.test(s)) return true;
+  return false;
 }
 
 function extractContainerId(raw: string): string {
@@ -949,10 +956,11 @@ export async function infraNode(
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output:**\n${frontendInstallOut}`);
 
       // 构建前端（生成 dist/ 目录）
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && npm run build)`);
+      // FP-001: 用 npx vite build 而不是 npm run build，避免 sh -c 环境下 node_modules/.bin 不在 PATH
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && npx vite build)`);
       const frontendBuildOut = await runWithHeartbeat({
         run: async () => {
-          const out = await execInContainer(containerId, "cd frontend && npm run build", { timeout: 300000 });
+          const out = await execInContainer(containerId, "cd frontend && npx vite build", { timeout: 300000 });
           if (isCommandFailureOutput(out)) throw new Error(`前端 build 失败：${out}`);
           return out;
         },

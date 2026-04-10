@@ -656,23 +656,87 @@ export async function deployNode(
   }
 
   if (isAccessible) {
-    const msg = `🚀 服务部署成功并已通过连通性校验！访问地址: ${publicUrl}`;
+    // ── FP-008: Post-deploy 验证 — 不只检查 health check，验证所有公开端点 ──
+    const verificationResults: string[] = [];
+    let allEndpointsOk = true;
+
+    // 1) 验证所有 API 端点（GET 请求）
+    const apiEndpoints = (state.apiContract?.endpoints || []).filter(
+      (ep: any) => String(ep.method || "").toUpperCase() === "GET"
+    );
+    for (const ep of apiEndpoints.slice(0, 10)) {
+      const epPath = String(ep.path || "").replace(/:([^/]+)/g, "1"); // 替换路径参数
+      try {
+        const epOut = await ShellExecuteSkill.config.run({
+          command: `curl -s -o /dev/null -w "%{http_code}" --max-time 3 http://127.0.0.1:${hostPort}${epPath}`,
+          workDir: WORKSPACE,
+          timeout: 5000,
+        });
+        const code = String(epOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim().split("\n").pop()?.trim() || String(epOut).trim();
+        const ok = /^[23]\d\d$/.test(code);
+        verificationResults.push(`  ${epPath} → HTTP ${code} ${ok ? "✅" : "❌"}`);
+        if (!ok) allEndpointsOk = false;
+      } catch {
+        verificationResults.push(`  ${epPath} → ERROR ❌`);
+        allEndpointsOk = false;
+      }
+    }
+
+    // 2) 混合项目：验证前端页面可访问
+    const frontendSpec = (state.spec as any)?.frontend;
+    let frontendAccessible = false;
+    if (frontendSpec) {
+      try {
+        const feOut = await ShellExecuteSkill.config.run({
+          command: `curl -s --max-time 3 http://127.0.0.1:${hostPort}/`,
+          workDir: WORKSPACE,
+          timeout: 5000,
+        });
+        const html = String(feOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "");
+        frontendAccessible = /<html|<div|<!doctype/i.test(html) && html.length > 100;
+        verificationResults.push(`  / (前端页面) → ${frontendAccessible ? "HTML ✅" : "非 HTML ❌ (" + html.slice(0, 60) + ")"}`);
+        if (!frontendAccessible) allEndpointsOk = false;
+      } catch {
+        verificationResults.push(`  / (前端页面) → ERROR ❌`);
+        allEndpointsOk = false;
+      }
+    }
+
+    // 输出验证报告
+    if (verificationResults.length > 0) {
+      const report = `部署后端点验证:\n${verificationResults.join("\n")}`;
+      console.log(`[System] ${report}`);
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Post-deploy Verification:**\n${report}`);
+    }
+
+    // 前端不可达 → 报告失败（但不回退，只是记录，让 QA/下一轮能处理）
+    const frontendWarning = (frontendSpec && !frontendAccessible)
+      ? `⚠️ 前端页面 http://127.0.0.1:${hostPort}/ 不可访问（非 HTML 响应）。后端 API 已部署成功。`
+      : "";
+
+    const msg = allEndpointsOk
+      ? `🚀 服务部署成功并已通过连通性校验！访问地址: ${publicUrl}`
+      : `⚠️ 服务已部署，但部分端点验证失败。访问地址: ${publicUrl}\n${frontendWarning}`;
     console.log(`[System] ${msg}`);
-    await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** Deployment Verified Success`);
+    await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** ${allEndpointsOk ? "Deployment Verified Success" : "Deployment Partial Success — " + verificationResults.filter(r => r.includes("❌")).join("; ")}`);
     const note = await writeMeetingNote(
       WORKSPACE,
       `note-deploy-r${round}`,
       "deploy",
       round,
-      `Deploy 第${round}轮：部署成功`,
-      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：成功\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n`
+      allEndpointsOk
+        ? `Deploy 第${round}轮：部署成功（所有端点验证通过）`
+        : `Deploy 第${round}轮：部分端点验证失败`,
+      `# Deploy 第${round}轮\n\n## 部署结论\n- 状态：${allEndpointsOk ? "成功" : "部分失败"}\n- URL：${publicUrl}\n- 健康检查：${healthCheckTarget}\n- 宿主机端口：${hostPort}\n- 容器端口：${targetInternalPort}\n- 命令：${runCmd}\n${verificationResults.length > 0 ? "\n## 端点验证\n" + verificationResults.join("\n") : ""}\n`
     );
     const result = {
       executionBackend,
       deploymentStatus: { url: publicUrl, status: "running" as const },
+      // FP-008: 前端不可达时标记为未完成
+      ...(frontendSpec ? { postDeployVerification: { frontendAccessible, frontendUrl: `http://127.0.0.1:${hostPort}/` } } : {}),
       meetingNotes: [note],
-      lastFailedNode: "",
-      lastFailureSummary: "",
+      lastFailedNode: allEndpointsOk ? "" : (frontendAccessible ? "" : "deploy"),
+      lastFailureSummary: allEndpointsOk ? "" : frontendWarning,
     };
     await saveBoulder({ ...state, ...result }, "deploy");
     return result;

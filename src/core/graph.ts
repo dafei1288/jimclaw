@@ -95,6 +95,11 @@ export function getVerifierNextNode(state: JimClawState): "coder" | "architect" 
 
 export function getInfraNextNode(state: JimClawState): "terminal" | "qa" {
   const output = `${state.testResults || ""}\n${state.lastFailureSummary || ""}\n${state.blockedReason || ""}`;
+  // FP-007: infra 阶段的任何失败都不应该路由到 terminal
+  // 之前 bug: containerId 已设置但 build 失败 → 路由到 terminal → 测试跑在残缺环境上
+  if (/基础设施异常|build 失败|not found|exit code\s*127/i.test(output)) {
+    return "qa";
+  }
   // TypeScript 编译错误（TS2307 等）是代码问题，需要 Coder 修复，路由到 QA
   if (/\bTS\d{4}\b|Cannot find module/i.test(output)) {
     return "qa";
