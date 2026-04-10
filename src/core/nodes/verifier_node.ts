@@ -265,7 +265,8 @@ export async function verifierNode(
 
   const testFilePatterns = /test|spec/i;
   // conftest.py 和 pytest.ini 是 pytest 配置/fixture 文件，不是测试文件
-  const nonTestFiles = /^(conftest\.py|pytest\.ini|pytest\.cfg|setup\.cfg|tox\.ini|pyproject\.toml)$/i;
+  // vitest.config/vite.config/jest.config 等是构建/测试配置，也不是测试文件
+  const nonTestFiles = /^(conftest\.py|pytest\.ini|pytest\.cfg|setup\.cfg|tox\.ini|pyproject\.toml|vitest\.config\.(ts|js|mjs)|vite\.config\.(ts|js|mjs)|jest\.config\.(cjs|js|ts))$/i;
   // 支持 Jest (expect/toBe/toEqual)、pytest (assert 语句)、Go (t.Error/t.Fatal/assert) 风格
   const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(|^\s*assert\s|t\.Errorf?\(|t\.Fatalf?\(|assertThat\(|assertEquals\(|assertTrue\(|assert_eq!|assert_ne!|andExpect\(|\.value\(/m;
   for (const file of activeFiles) {

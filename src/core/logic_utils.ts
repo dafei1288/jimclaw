@@ -835,8 +835,46 @@ export function ensureRequirementDrivenFiles(
 
   // ── 非 Node/JS/TS 项目跳过所有文件注入 ──
   const language = String(nextSpec.language || "").toLowerCase();
-  if (!/typescript|javascript|node/.test(language)) {
-    // Python/Java/Go 项目不需要注入 package.json, tsconfig.json 等
+  const isNode = /typescript|javascript|node/.test(language);
+  if (!isNode) {
+    // Python/Java/Go/Rust 项目：注入语言特定的基础文件
+    const { singular: s_np, plural: p_np } = getPrimaryEntityStems(requirementProtocol);
+    const ensureFile_np = (target: string) => {
+      if (!fileSet.has(target)) {
+        files.push(target);
+        fileSet.add(target);
+      }
+    };
+    if (/python/.test(language)) {
+      ensureFile_np("requirements.txt");
+      ensureFile_np("app/__init__.py");
+      ensureFile_np("app/main.py");
+      if ((!spec?.filesToCreate || spec.filesToCreate.length <= 3) && s_np && p_np) {
+        ensureFile_np(`app/routers/${p_np}.py`);
+        ensureFile_np(`tests/test_${p_np}.py`);
+      }
+    } else if (/java/.test(language)) {
+      ensureFile_np("pom.xml");
+      ensureFile_np("src/main/resources/application.properties");
+      ensureFile_np("src/main/java/com/example/app/Application.java");
+      ensureFile_np("src/main/java/com/example/app/HealthController.java");
+      ensureFile_np("src/test/java/com/example/app/HealthControllerTest.java");
+    } else if (/go/.test(language)) {
+      ensureFile_np("go.mod");
+      ensureFile_np("main.go");
+      ensureFile_np("handler/health.go");
+      ensureFile_np("handler/health_test.go");
+      if ((!spec?.filesToCreate || spec.filesToCreate.length <= 3) && s_np && p_np) {
+        ensureFile_np(`handler/${p_np}.go`);
+        ensureFile_np(`handler/${p_np}_test.go`);
+      }
+    } else if (/rust/.test(language)) {
+      ensureFile_np("Cargo.toml");
+      ensureFile_np("src/main.rs");
+      ensureFile_np("src/handlers/mod.rs");
+      ensureFile_np("src/handlers/health.rs");
+      ensureFile_np("tests/health_test.rs");
+    }
     return { ...nextSpec, filesToCreate: files };
   }
 
