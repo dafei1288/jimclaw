@@ -1,0 +1,88 @@
+{
+  "llm_configs": {
+    "openai_fast": {
+      "provider": "openai",
+      "modelName": "gpt-5.4",
+      "baseUrl": "https://codex-api.packycode.com/v1",
+      "apiKey": "process.env.PACKY_CODEX_API_KEY",
+      "temperature": 0.2
+    },
+    "openai_dmx": {
+      "provider": "openai",
+      "modelName": "gpt-5.4",
+      "baseUrl": "https://www.dmxapi.cn/v1",
+      "apiKey": "process.env.DMX_API_KEY",
+      "temperature": 0.2
+    },
+    "claude_opus_coder": {
+      "provider": "openai",
+      "modelName": "claude-opus-4-6",
+      "baseUrl": "https://www.dmxapi.cn/v1",
+      "apiKey": "process.env.DMX_API_KEY",
+      "temperature": 0
+    },
+    "glm5_coding": {
+      "provider": "openai",
+      "modelName": "glm-5",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4/",
+      "apiKey": "process.env.ZHIPU_API_KEY",
+      "temperature": 0
+    },
+    "deepseek_reasoning": {
+      "provider": "deepseek",
+      "modelName": "deepseek-reasoner",
+      "baseUrl": "https://api.deepseek.com/v1",
+      "apiKey": "process.env.DEEPSEEK_API_KEY",
+      "temperature": 0
+    },
+    "minmax": {
+      "provider": "anthropic",
+      "modelName": "MiniMax-M2.5",
+      "baseUrl": "https://api.minimaxi.com/anthropic",
+      "apiKey": "process.env.MINMAX_API_KEY",
+      "temperature": 0.1
+    },
+    "glm": {
+      "provider": "openai",
+      "modelName": "GLM-4.7",
+      "baseUrl": "https://open.bigmodel.cn/api/paas/v4/",
+      "apiKey": "process.env.ZHIPU_API_KEY",
+      "temperature": 0
+    },
+    "coding_plan": {
+      "provider": "openai",
+      "modelName": "glm-5",
+      "baseUrl": "https://open.bigmodel.cn/api/coding/paas/v4/",
+      "apiKey": "process.env.ZHIPU_API_KEY",
+      "temperature": 0
+    }
+  },
+  "agents": {
+    "pm": {
+      "default": "openai_dmx",
+      "fallback": "minmax"
+    },
+    "architect": {
+      "default": "openai_dmx",
+      "reasoning": "deepseek_reasoning",
+      "fallback": "minmax"
+    },
+    "coder": {
+      "default": "openai_dmx",
+      "coding": "glm5_coding",
+      "reasoning": "deepseek_reasoning"
+    },
+    "qa": {
+      "default": "openai_dmx",
+      "coding": "openai_dmx",
+      "fallback": "minmax"
+    }
+  },
+  "global": {
+    "maxRetries": 8,
+    "workspaceDir": "./workspace",
+    "enableEvolution": true,
+    "coderMaxParallel": 2,
+    "coderExperimentalModelParallel": false
+  }
+}
