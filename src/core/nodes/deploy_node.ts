@@ -627,11 +627,16 @@ export async function deployNode(
     await saveBoulder(buildHeartbeatState(`deploy_healthcheck_attempt_${i + 1}`), "deploy_heartbeat_healthcheck");
     for (const candidate of healthCheckCandidates) {
       try {
-        const curlOut = await ShellExecuteSkill.config.run({ 
-          command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${candidate.target}`,
+        // FP-0016: 避免 curl -o /dev/null 在 MSYS 下 exit 23，用 -D- + head 获取状态行
+        const curlOut = await ShellExecuteSkill.config.run({
+          command: `curl -s -D- -o /dev/null --max-time 2 ${candidate.target} 2>/dev/null | head -1`,
+          workDir: WORKSPACE,
           timeout: 5000
         });
-        const codeMatch = curlOut.match(/\b(200|201|204|301|302|404)\b/);
+        const rawCurl = String(curlOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
+        const httpMatch = rawCurl.match(/HTTP\/\S+\s+(\d+)/);
+        const code = httpMatch ? httpMatch[1] : "";
+        const codeMatch = code && /^(200|201|204|301|302|404)$/.test(code);
         if (codeMatch) {
           isAccessible = true;
           if (candidate.target !== healthCheckTarget) {
@@ -644,7 +649,7 @@ export async function deployNode(
           }
           break;
         }
-        lastError = `HTTP Code: ${curlOut}`;
+        lastError = `HTTP Code: ${code || rawCurl}`;
       } catch (e: any) {
         lastError = e.message || String(e);
       }

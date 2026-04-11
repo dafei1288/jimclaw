@@ -83,11 +83,14 @@ export class DeployService {
       let isAccessible = false;
       for (let i = 0; i < 10; i++) {
         try {
-          const curlOut = await ShellExecuteSkill.config.run({ 
-            command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${dynamicUrl}`,
+          const curlOut = await ShellExecuteSkill.config.run({
+            command: `curl -s -D- -o /dev/null --max-time 2 ${dynamicUrl} 2>/dev/null | head -1`,
+            workDir: process.cwd(),
             timeout: 5000
           });
-          const code = curlOut.replace(/Output:/g, "").trim();
+          const rawCurl = String(curlOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
+          const httpMatch = rawCurl.match(/HTTP\/\S+\s+(\d+)/);
+          const code = httpMatch ? httpMatch[1] : "";
           if (code === "200" || code === "301" || code === "302") {
             isAccessible = true;
             break;
