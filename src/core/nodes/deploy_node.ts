@@ -690,14 +690,15 @@ export async function deployNode(
     let frontendAccessible = false;
     if (frontendSpec) {
       try {
+        // 先检查 /index.html（SPA 入口），如果成功则前端可访问
         const feOut = await ShellExecuteSkill.config.run({
-          command: `curl -s --max-time 3 http://127.0.0.1:${hostPort}/`,
+          command: `curl -s --max-time 3 http://127.0.0.1:${hostPort}/index.html`,
           workDir: WORKSPACE,
           timeout: 5000,
         });
         const html = String(feOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "");
         frontendAccessible = /<html|<div|<!doctype/i.test(html) && html.length > 100;
-        verificationResults.push(`  / (前端页面) → ${frontendAccessible ? "HTML ✅" : "非 HTML ❌ (" + html.slice(0, 60) + ")"}`);
+        verificationResults.push(`  /index.html (前端页面) → ${frontendAccessible ? "HTML ✅" : "非 HTML ❌ (" + html.slice(0, 60) + ")"}`);
         if (!frontendAccessible) allEndpointsOk = false;
       } catch {
         verificationResults.push(`  / (前端页面) → ERROR ❌`);
@@ -714,7 +715,7 @@ export async function deployNode(
 
     // 前端不可达 → 报告失败（但不回退，只是记录，让 QA/下一轮能处理）
     const frontendWarning = (frontendSpec && !frontendAccessible)
-      ? `⚠️ 前端页面 http://127.0.0.1:${hostPort}/ 不可访问（非 HTML 响应）。后端 API 已部署成功。`
+      ? `⚠️ 前端页面 http://127.0.0.1:${hostPort}/index.html 不可访问（非 HTML 响应）。后端 API 已部署成功。`
       : "";
 
     const msg = allEndpointsOk
@@ -736,7 +737,7 @@ export async function deployNode(
       executionBackend,
       deploymentStatus: { url: publicUrl, status: "running" as const },
       // FP-008: 前端不可达时标记为未完成
-      ...(frontendSpec ? { postDeployVerification: { frontendAccessible, frontendUrl: `http://127.0.0.1:${hostPort}/` } } : {}),
+      ...(frontendSpec ? { postDeployVerification: { frontendAccessible, frontendUrl: `http://127.0.0.1:${hostPort}/index.html` } } : {}),
       meetingNotes: [note],
       lastFailedNode: allEndpointsOk ? "" : (frontendAccessible ? "" : "deploy"),
       lastFailureSummary: allEndpointsOk ? "" : frontendWarning,

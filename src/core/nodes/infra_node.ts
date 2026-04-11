@@ -509,13 +509,80 @@ export async function infraNode(
       };
     }
 
+    // ── 混合项目：在宿主机构建前端（npm install + vite build）──
+    const hasFrontendPkg = await (async () => {
+      try { await fs.access(path.join(WORKSPACE, "frontend", "package.json")); return true; } catch { return false; }
+    })();
+    if (hasFrontendPkg) {
+      const frontendDir = path.join(WORKSPACE, "frontend");
+      await saveBoulder(buildHeartbeatState("host_installing_frontend_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 宿主机安装前端依赖 (cd frontend && npm install)`);
+      try {
+        const feInstallOut = await ShellExecuteSkill.config.run({
+          command: "npm install --loglevel=error",
+          workDir: frontendDir,
+          timeout: 120000,
+        });
+        const feInstallRaw = parseSkillOutput(String(feInstallOut));
+        if (isCommandFailureOutput(feInstallRaw)) throw new Error(`前端 npm install 失败: ${feInstallRaw}`);
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output (host):**\n${feInstallRaw}`);
+
+        // vite build
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 宿主机构建前端 (cd frontend && npx vite build)`);
+        const feBuildOut = await ShellExecuteSkill.config.run({
+          command: "npx vite build",
+          workDir: frontendDir,
+          timeout: 60000,
+        });
+        const feBuildRaw = parseSkillOutput(String(feBuildOut));
+        if (isCommandFailureOutput(feBuildRaw)) throw new Error(`前端 vite build 失败: ${feBuildRaw}`);
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Build Output (host):**\n${feBuildRaw}`);
+
+        // 复制到源码 resources 目录
+        const lang = state.spec?.language?.toLowerCase() ?? "";
+        let staticRelDir = "";
+        if (lang.includes("java")) {
+          staticRelDir = "src/main/resources/static";
+        } else if (lang.includes("python") || lang.includes("go")) {
+          staticRelDir = "static";
+        } else {
+          staticRelDir = "public";
+        }
+        // 用 execSync 直接复制（避免 ShellExecuteSkill 在 Windows 上的路径问题）
+        const { execSync } = require("child_process");
+        const absStaticDir = path.join(WORKSPACE, staticRelDir);
+        execSync(`mkdir -p "${staticRelDir}"`, { cwd: WORKSPACE, stdio: "pipe" });
+        const distDir = path.join(WORKSPACE, "frontend", "dist");
+        const distFiles = await fs.readdir(distDir);
+        for (const f of distFiles) {
+          const src = path.join(distDir, f);
+          const dst = path.join(absStaticDir, f);
+          await fs.cp(src, dst, { recursive: true });
+        }
+        // Java: 配置 Spring Boot 从文件系统读静态资源（不依赖 classpath）
+        if (lang.includes("java")) {
+          try {
+            const propsPath = path.join(WORKSPACE, "src/main/resources/application.properties");
+            let props = await fs.readFile(propsPath, "utf-8");
+            if (!props.includes("static-locations")) {
+              props += `\n# 混合项目：从文件系统加载前端静态资源\nspring.web.resources.static-locations=file:./src/main/resources/static/\n`;
+              await fs.writeFile(propsPath, props, "utf-8");
+            }
+          } catch {}
+        }
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Copied frontend dist to ${staticRelDir}/`);
+      } catch (feErr: any) {
+        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Warning:** 前端构建异常，跳过: ${feErr.message}`);
+      }
+    }
+
     const note = await writeMeetingNote(
       WORKSPACE,
       `note-infra_setup-r${round}`,
       "infra_setup",
       round,
       `Infra 第${round}轮：宿主机环境与依赖已就绪`,
-      `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：成功\n- 后端：host\n- 宿主机端口：${hostPort}\n- 运行目录：${WORKSPACE}\n`
+      `# Infra 第${round}轮\n\n## 基础设施结论\n- 状态：成功\n- 后端：host\n- 前端：${hasFrontendPkg ? '已构建' : '无'}\n- 宿主机端口：${hostPort}\n- 运行目录：${WORKSPACE}\n`
     );
 
     return {
@@ -913,81 +980,70 @@ export async function infraNode(
       }
     }
 
-    // ── 混合项目：前端 Node.js 安装 + 前端依赖 ──
+    // ── 混合项目：在宿主机上构建前端（npm install + vite build），产物通过 volume 天然在容器内 ──
     const hasFrontendPkg = await (async () => {
       try { await fs.access(path.join(WORKSPACE, "frontend", "package.json")); return true; } catch { return false; }
     })();
     if (hasFrontendPkg) {
-      // 在后端容器内安装 Node.js（如果尚不存在）
-      const nodeCheck = await execInContainer(containerId, "which node 2>/dev/null || echo 'not-found'");
-      if (nodeCheck.includes("not-found")) {
-        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing Node.js in backend container for frontend build`);
-        let installNodeCmd = "";
-        // 检测容器 OS — alpine 用 apk，Debian/Ubuntu 用 apt-get
-        const osCheck = await execInContainer(containerId, "cat /etc/os-release 2>/dev/null || echo unknown");
-        if (osCheck.includes("Alpine")) {
-          installNodeCmd = "apk add --no-cache nodejs npm";
-        } else if (osCheck.includes("Ubuntu")) {
-          installNodeCmd = "curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y -qq nodejs";
-        } else {
-          // Debian 或其他
-          installNodeCmd = "apt-get update -qq && apt-get install -y -qq nodejs npm";
-        }
-        const nodeInstallOut = await runWithHeartbeat({
-          run: async () => execInContainer(containerId, installNodeCmd, { timeout: 120000 }),
-          onHeartbeat: async () => {
-            await saveBoulder(buildHeartbeatState("container_installing_nodejs"), "infra_setup_heartbeat_install");
-          },
-        });
-        await AuditLogger.log(WORKSPACE, "Infrastructure", `**Node.js Install Output:**\n${nodeInstallOut}`);
-      }
+      const frontendDir = path.join(WORKSPACE, "frontend");
 
-      // 安装前端依赖
-      await saveBoulder(buildHeartbeatState("container_installing_frontend_deps"), "infra_setup_stage_installing");
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Installing frontend dependencies (cd frontend && npm install)`);
+      // 宿主机上安装前端依赖（宿主机有 Node.js，速度快，不存在容器内网络问题）
+      await saveBoulder(buildHeartbeatState("host_installing_frontend_deps"), "infra_setup_stage_installing");
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 在宿主机安装前端依赖 (cd frontend && npm install)`);
       const frontendInstallOut = await runWithHeartbeat({
         run: async () => {
-          const out = await execInContainer(containerId, "cd frontend && npm install --loglevel=error", { timeout: 600000 });
-          if (isCommandFailureOutput(out)) throw new Error(`前端 npm install 失败：${out}`);
-          return out;
+          const out = await ShellExecuteSkill.config.run({
+            command: "npm install --loglevel=error",
+            workDir: frontendDir,
+            timeout: 120000,
+          });
+          const raw = parseSkillOutput(String(out));
+          if (isCommandFailureOutput(raw)) throw new Error(`前端 npm install 失败：${raw}`);
+          return raw;
         },
         onHeartbeat: async () => {
-          await saveBoulder(buildHeartbeatState("container_installing_frontend_deps"), "infra_setup_heartbeat_install");
+          await saveBoulder(buildHeartbeatState("host_installing_frontend_deps"), "infra_setup_heartbeat_install");
         },
       });
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output:**\n${frontendInstallOut}`);
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Install Output (host):**\n${frontendInstallOut}`);
 
-      // 构建前端（生成 dist/ 目录）
-      // FP-001: 直接用 node_modules/.bin/vite 避免 npx 下载延迟
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Building frontend (cd frontend && ./node_modules/.bin/vite build)`);
+      // 宿主机上构建前端（生成 dist/ 目录，纯静态文件，平台无关）
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 在宿主机构建前端 (cd frontend && npx vite build)`);
       const frontendBuildOut = await runWithHeartbeat({
         run: async () => {
-          const out = await execInContainer(containerId, "cd frontend && ./node_modules/.bin/vite build", { timeout: 300000 });
-          if (isCommandFailureOutput(out)) throw new Error(`前端 build 失败：${out}`);
-          return out;
+          const out = await ShellExecuteSkill.config.run({
+            command: "npx vite build",
+            workDir: frontendDir,
+            timeout: 60000,
+          });
+          const raw = parseSkillOutput(String(out));
+          if (isCommandFailureOutput(raw)) throw new Error(`前端 vite build 失败：${raw}`);
+          return raw;
         },
         onHeartbeat: async () => {
-          await saveBoulder(buildHeartbeatState("container_building_frontend"), "infra_setup_heartbeat_build");
+          await saveBoulder(buildHeartbeatState("host_building_frontend"), "infra_setup_heartbeat_build");
         },
       });
-      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Build Output:**\n${frontendBuildOut}`);
+      await AuditLogger.log(WORKSPACE, "Infrastructure", `**Frontend Build Output (host):**\n${frontendBuildOut}`);
 
-      // 将前端构建产物复制到后端静态资源目录
+      // 在容器内将构建产物复制到后端静态资源目录（dist/ 通过 volume mount 已存在于容器内）
       const lang = state.spec?.language?.toLowerCase() ?? "";
       let staticCopyCmd = "";
       if (lang.includes("java")) {
         // Spring Boot: 复制到 src/main/resources/static/
         staticCopyCmd = "mkdir -p src/main/resources/static && cp -r frontend/dist/* src/main/resources/static/ 2>/dev/null || true";
       } else if (lang.includes("python")) {
-        // FastAPI: 不自动复制——用 StaticFiles mount
         staticCopyCmd = "mkdir -p static && cp -r frontend/dist/* static/ 2>/dev/null || true";
       } else if (lang.includes("go")) {
-        // Gin: 复制到 ./static/
         staticCopyCmd = "mkdir -p static && cp -r frontend/dist/* static/ 2>/dev/null || true";
       } else {
         staticCopyCmd = "mkdir -p public && cp -r frontend/dist/* public/ 2>/dev/null || true";
       }
       await execInContainer(containerId, staticCopyCmd);
+      // Java: 配置 Spring Boot 从文件系统读静态资源（不依赖 classpath）
+      if (lang.includes("java")) {
+        await execInContainer(containerId, `echo '\n# 混合项目：从文件系统加载前端静态资源\nspring.web.resources.static-locations=file:./src/main/resources/static/' >> src/main/resources/application.properties`);
+      }
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** Copied frontend dist to static dir`);
     }
   } catch (e: any) {
