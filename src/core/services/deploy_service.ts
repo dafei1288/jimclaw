@@ -1,5 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as http from "http";
 import { JimClawState, SystemManifest, TechSpec } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
@@ -83,15 +84,16 @@ export class DeployService {
       let isAccessible = false;
       for (let i = 0; i < 10; i++) {
         try {
-          const curlOut = await ShellExecuteSkill.config.run({
-            command: `curl -s -D- -o /dev/null --max-time 2 ${dynamicUrl} 2>/dev/null | head -1`,
-            workDir: process.cwd(),
-            timeout: 5000
+          // 用 Node.js 原生 HTTP 替代 curl — spawn({shell:true}) 在 Windows 上用 cmd.exe 不认 /dev/null
+          const result = await new Promise<{ statusCode: number | null }>((resolve) => {
+            const req = http.get(dynamicUrl, (res) => {
+              res.resume(); // 消费响应体
+              resolve({ statusCode: res.statusCode || null });
+            });
+            req.on("error", () => resolve({ statusCode: null }));
+            req.setTimeout(3000, () => { req.destroy(); resolve({ statusCode: null }); });
           });
-          const rawCurl = String(curlOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
-          const httpMatch = rawCurl.match(/HTTP\/\S+\s+(\d+)/);
-          const code = httpMatch ? httpMatch[1] : "";
-          if (code === "200" || code === "301" || code === "302") {
+          if (result.statusCode === 200 || result.statusCode === 301 || result.statusCode === 302) {
             isAccessible = true;
             break;
           }

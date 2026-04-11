@@ -8,6 +8,30 @@ import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
 import * as fs from "fs/promises";
+import * as http from "http";
+
+/**
+ * Node.js 原生 HTTP GET — 替代 curl，跨平台兼容
+ * spawn({ shell: true }) 在 Windows 上用 cmd.exe，不认 /dev/null
+ */
+function httpGet(url: string, timeoutMs = 3000): Promise<{ statusCode: number | null; body: string; error?: string }> {
+  return new Promise((resolve) => {
+    const req = http.get(url, (res) => {
+      let body = "";
+      res.on("data", (chunk) => { body += chunk.toString(); });
+      res.on("end", () => {
+        resolve({ statusCode: res.statusCode || null, body });
+      });
+    });
+    req.on("error", (err) => {
+      resolve({ statusCode: null, body: "", error: err.message });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      resolve({ statusCode: null, body: "", error: "timeout" });
+    });
+  });
+}
 import * as path from "path";
 import { runWithHeartbeat } from "../node_heartbeat";
 
@@ -627,16 +651,10 @@ export async function deployNode(
     await saveBoulder(buildHeartbeatState(`deploy_healthcheck_attempt_${i + 1}`), "deploy_heartbeat_healthcheck");
     for (const candidate of healthCheckCandidates) {
       try {
-        // FP-0016: 避免 curl -o /dev/null 在 MSYS 下 exit 23，用 -D- + head 获取状态行
-        const curlOut = await ShellExecuteSkill.config.run({
-          command: `curl -s -D- -o /dev/null --max-time 2 ${candidate.target} 2>/dev/null | head -1`,
-          workDir: WORKSPACE,
-          timeout: 5000
-        });
-        const rawCurl = String(curlOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
-        const httpMatch = rawCurl.match(/HTTP\/\S+\s+(\d+)/);
-        const code = httpMatch ? httpMatch[1] : "";
-        const codeMatch = code && /^(200|201|204|301|302|404)$/.test(code);
+        // 用 Node.js 原生 HTTP 替代 curl — spawn({shell:true}) 在 Windows/cmd.exe 下不认 /dev/null
+        const result = await httpGet(candidate.target, 3000);
+        const code = result.statusCode;
+        const codeMatch = code && /^(200|201|204|301|302|404)$/.test(String(code));
         if (codeMatch) {
           isAccessible = true;
           if (candidate.target !== healthCheckTarget) {
@@ -649,7 +667,7 @@ export async function deployNode(
           }
           break;
         }
-        lastError = `HTTP Code: ${code || rawCurl}`;
+        lastError = `HTTP Code: ${code || result.error || "no response"}`;
       } catch (e: any) {
         lastError = e.message || String(e);
       }
@@ -672,15 +690,9 @@ export async function deployNode(
     for (const ep of apiEndpoints.slice(0, 10)) {
       const epPath = String(ep.path || "").replace(/:([^/]+)/g, "1"); // 替换路径参数
       try {
-        // FP-0016: 避免 curl -o /dev/null 在 MSYS 下 exit 23，改用 -D- 获取状态行
-        const epOut = await ShellExecuteSkill.config.run({
-          command: `curl -s -D- -o /dev/null --max-time 3 http://127.0.0.1:${hostPort}${epPath} 2>/dev/null | head -1`,
-          workDir: WORKSPACE,
-          timeout: 8000,
-        });
-        const rawOut = String(epOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "").trim();
-        const httpMatch = rawOut.match(/HTTP\/\S+\s+(\d+)/);
-        const code = httpMatch ? httpMatch[1] : rawOut.split("\n").pop()?.trim() || "";
+        // 用 Node.js 原生 HTTP 替代 curl
+        const epResult = await httpGet(`http://127.0.0.1:${hostPort}${epPath}`, 5000);
+        const code = epResult.statusCode ? String(epResult.statusCode) : "";
         const ok = /^[23]\d\d$/.test(code);
         verificationResults.push(`  ${epPath} → HTTP ${code} ${ok ? "✅" : "❌"}`);
         if (!ok) allEndpointsOk = false;
@@ -695,13 +707,9 @@ export async function deployNode(
     let frontendAccessible = false;
     if (frontendSpec) {
       try {
-        // 先检查 /index.html（SPA 入口），如果成功则前端可访问
-        const feOut = await ShellExecuteSkill.config.run({
-          command: `curl -s --max-time 3 http://127.0.0.1:${hostPort}/index.html`,
-          workDir: WORKSPACE,
-          timeout: 5000,
-        });
-        const html = String(feOut).replace(/[\s\S]*Output:\n?/, "").replace(/[\s\S]*Errors:\n?/, "");
+        // 用 Node.js 原生 HTTP 替代 curl
+        const feResult = await httpGet(`http://127.0.0.1:${hostPort}/index.html`, 5000);
+        const html = feResult.body || "";
         frontendAccessible = /<html|<div|<!doctype/i.test(html) && html.length > 100;
         verificationResults.push(`  /index.html (前端页面) → ${frontendAccessible ? "HTML ✅" : "非 HTML ❌ (" + html.slice(0, 60) + ")"}`);
         if (!frontendAccessible) allEndpointsOk = false;
