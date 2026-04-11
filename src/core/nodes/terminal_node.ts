@@ -7,6 +7,7 @@ import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "
 import { ExecutorResult } from "../../executor/types";
 import { createLocalShellAdapter } from "../../skills/shell_exec";
 import { runWithHeartbeat } from "../node_heartbeat";
+import { host } from "../../infra";
 
 function isRetryableTerminalExecFailure(output: string): boolean {
   return /OCI runtime exec failed|container .* is not running|No such container/i.test(String(output || ""));
@@ -252,15 +253,22 @@ export async function terminalNode(
   let rawOutput = result.stdout || result.stderr || "";
   await AuditLogger.log(WORKSPACE, "Terminal", `**Test Output:**\n${rawOutput}`);
 
-  // ── 混合项目：前端测试 ──
-  // 如果 spec.frontend 存在且有前端测试命令，在后端测试之后执行前端测试
+  // ── 混合项目：前端测试（宿主机执行） ──
+  // 容器内没有 Node.js（Maven/Go/Python 镜像），前端测试必须在宿主机跑
   const frontendSpec = (state.spec as any)?.frontend;
-  if (frontendSpec && frontendSpec.testCommand && executionBackend === "docker" && state.containerId) {
+  if (frontendSpec && frontendSpec.testCommand) {
+    const frontendDir = host.os === "windows"
+      ? WORKSPACE.replace(/\//g, "\\") + "\\frontend"
+      : WORKSPACE + "/frontend";
     const frontendTestCmd = frontendSpec.testCommand;
-    await AuditLogger.log(WORKSPACE, "Terminal", `**Frontend Test Command:** ${frontendTestCmd}`);
+    await AuditLogger.log(WORKSPACE, "Terminal", `**Frontend Test Command:** ${frontendTestCmd} (宿主机执行)`);
     try {
-      const frontendTestOut = await execInContainer(state.containerId, frontendTestCmd, { timeout: 120000 });
+      const feResult = await host.exec(frontendTestCmd, { cwd: frontendDir, timeout: 120000 });
+      const frontendTestOut = feResult.stdout + (feResult.stderr ? "\n" + feResult.stderr : "");
       await AuditLogger.log(WORKSPACE, "Terminal", `**Frontend Test Output:**\n${frontendTestOut}`);
+      if (!feResult.ok) {
+        throw new Error(`Frontend tests failed (exit ${feResult.exitCode}): ${frontendTestOut.slice(0, 200)}`);
+      }
       // 追加到 rawOutput
       const combinedOutput = rawOutput + "\n\n--- Frontend Tests ---\n" + frontendTestOut;
       const combinedEvidence = extractFailureEvidence(combinedOutput, state.deploymentStatus, state.blockedReason);
@@ -273,7 +281,7 @@ export async function terminalNode(
         "terminal",
         state.retryCount || 0,
         combinedSummary,
-        `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 后端命令：${testCmd}\n- 前端命令：${frontendTestCmd}\n- 容器：${state.containerId}\n- 结论：${combinedEvidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${combinedOutput}\n\`\`\`\n`
+        `# Terminal 第${state.retryCount || 0}轮\n\n## 执行信息\n- 后端命令：${testCmd}\n- 前端命令：${frontendTestCmd}（宿主机）\n- 结论：${combinedEvidence.hasBlockingFailure ? "失败" : "通过"}\n\n## 原始输出\n\`\`\`text\n${combinedOutput}\n\`\`\`\n`
       );
       return {
         testResults: combinedOutput,

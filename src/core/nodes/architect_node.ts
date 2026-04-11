@@ -54,7 +54,10 @@ function getPrimaryEntity(requirementProtocol: any): { singular: string; plural:
  */
 function isSimpleApiGoal(goal: string): boolean {
   const g = String(goal || "").toLowerCase();
-  return /简单|simple|basic|health|健康|hello|ping|status|check/i.test(g);
+  // 注意：status/check 不能单独匹配，因为它们可能出现在 CRUD 字段名中（如 {title,status}）
+  // 只匹配明确指向健康检查的语境
+  return /简单|simple|basic|^health$|健康|hello|ping|存活|探活|连通/i.test(g)
+    || /\b(health[- ]?check|status[- ]?check|readiness|liveness)\b/i.test(g);
 }
 
 /**

@@ -652,7 +652,8 @@ function hasBackendFiles(files: string[]): boolean {
 function inferEntities(lines: string[]): string[] {
   const entities = new Set<string>();
   const entityPatterns: Array<[RegExp, string]> = [
-    [/待办|todo|task|任务/gi, "todo"],
+    [/待办|todo/gi, "todo"],
+    [/任务|task/gi, "task"],
     [/商品|产品|电器|product|appliance/gi, "product"],
     [/图书|book/gi, "book"],
     [/用户|user/gi, "user"],
@@ -768,7 +769,14 @@ export function buildRequirementProtocol(contract: TaskContract | null | undefin
       auditLogRequired,
       dockerRequired,
       entities,
-      crudEntities: entities.filter((entity) => /(list|create|edit|delete)/.test(uiCapabilities.join(",")) || /book|log|permission/.test(entity)),
+      crudEntities: entities.filter((entity) => {
+        // 实体被认为是 CRUD 实体的条件：
+        // 1. 需求中提到任何 CRUD 操作（列表/创建/修改/删除 或 GET/POST/PUT/DELETE）
+        // 2. 或者该实体在已知业务实体列表中
+        const hasCrudKeywords = /(list|create|edit|delete|列表|创建|新增|修改|更新|删除|GET|POST|PUT|DELETE)/i.test(uiCapabilities.join(","));
+        const knownCrudEntities = /book|log|permission|task|todo|user|product|article|order|comment|item/i;
+        return hasCrudKeywords || knownCrudEntities.test(entity);
+      }),
       uiCapabilities,
     },
   };

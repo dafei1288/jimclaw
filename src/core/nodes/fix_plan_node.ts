@@ -210,6 +210,8 @@ ${summarizedIssues}
 [失败文件的当前内容]：
 ${summarizedFiles}
 
+⚠️ 重要约束：你**只允许读取上面列出的失败文件**。不要用 read_file 读取其他文件。你的输出必须是 JSON 格式的修复计划。
+
 请认真阅读以上内容，输出你的修复计划（JSON格式）：
 {
   "overall_diagnosis": "对所有失败问题的整体根因判断",

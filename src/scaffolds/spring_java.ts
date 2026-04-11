@@ -296,7 +296,7 @@ class ${pascalPlural}ControllerTest {
                 .andReturn().getResponse().getContentAsString();
 
         // Extract id from response
-        String id = response.replaceAll(".*\\"id\\":(\\d+).*", "$1");
+        String id = response.replaceAll(".*\\"id\\":(\\\\d+).*", "$1");
 
         mockMvc.perform(delete("/api/${plural}/" + id))
                 .andExpect(status().isNoContent());
@@ -344,8 +344,8 @@ const SpringJavaProvider: ScaffoldProvider = {
       t.endsWith("application.properties") ||
       t.endsWith("healthcontroller.java") ||
       t.endsWith("healthcontrollertest.java") ||
-      t.includes("controller/") && t.endsWith(".java") ||
-      t.includes("controller/") && t.endsWith("test.java")
+      t.includes("controller") && t.endsWith(".java") ||
+      t.includes("controller") && t.endsWith("test.java")
     );
   },
 
@@ -359,7 +359,7 @@ const SpringJavaProvider: ScaffoldProvider = {
     if (t.endsWith("application.java")) return generateApplicationJava(ctx);
     if (t.includes("healthcontrollertest.java")) return generateHealthTest(ctx);
     if (t.includes("healthcontroller.java")) return generateHealthController(ctx);
-    if (t.includes("controller/") && t.endsWith(".java")) {
+    if (t.includes("controller") && t.endsWith(".java")) {
       if (t.includes(`${plural}controllertest`)) return generateCrudTest(ctx, plural);
       if (t.includes(`${plural}controller`)) return generateCrudController(ctx, plural);
     }
