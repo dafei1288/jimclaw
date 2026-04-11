@@ -8,6 +8,7 @@ import { ExecutorResult } from "../../executor/types";
 import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
+import { host } from "../../infra";
 import { AuditLogger } from "../../utils/audit";
 import { runWithHeartbeat } from "../node_heartbeat";
 
@@ -128,11 +129,21 @@ function shouldCleanRuntimeProcess(state: JimClawState): boolean {
   return /EADDRINUSE/i.test(readRuntimeRepairEvidence(state));
 }
 
-function buildRuntimeCleanupCommand(): string {
+async function cleanRuntimeProcess(WORKSPACE: string): Promise<void> {
+  const pidPath = path.join(WORKSPACE, ".jimclaw", "server.pid");
+  const pidText = await host.readFile(pidPath).catch(() => "");
+  const pid = parseInt(pidText.trim(), 10);
+  if (pid > 0 && host.isProcessRunning(pid)) {
+    await host.killProcess(pid);
+  }
+  await fs.unlink(pidPath).catch(() => {});
+}
+
+/** 容器内清理残留进程（容器内始终是 Linux） */
+function buildContainerRuntimeCleanupCommand(): string {
   return [
     "if [ -f /tmp/jimclaw/server.pid ]; then kill $(cat /tmp/jimclaw/server.pid) 2>/dev/null || true; fi",
     "rm -f /tmp/jimclaw/server.pid",
-    "pkill -f \"node|npm|tsx|ts-node\" 2>/dev/null || true",
   ].join("; ");
 }
 
@@ -886,7 +897,7 @@ export async function infraNode(
       await runInfraContainerCommand(
         WORKSPACE,
         containerId,
-        buildRuntimeCleanupCommand(),
+        buildContainerRuntimeCleanupCommand(),
         "runtime cleanup",
         30000
       ).catch(async (error: any) => {

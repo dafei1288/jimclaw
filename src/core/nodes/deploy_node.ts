@@ -7,31 +7,8 @@ import { ExecutorResult } from "../../executor/types";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
+import { host } from "../../infra";
 import * as fs from "fs/promises";
-import * as http from "http";
-
-/**
- * Node.js 原生 HTTP GET — 替代 curl，跨平台兼容
- * spawn({ shell: true }) 在 Windows 上用 cmd.exe，不认 /dev/null
- */
-function httpGet(url: string, timeoutMs = 3000): Promise<{ statusCode: number | null; body: string; error?: string }> {
-  return new Promise((resolve) => {
-    const req = http.get(url, (res) => {
-      let body = "";
-      res.on("data", (chunk) => { body += chunk.toString(); });
-      res.on("end", () => {
-        resolve({ statusCode: res.statusCode || null, body });
-      });
-    });
-    req.on("error", (err) => {
-      resolve({ statusCode: null, body: "", error: err.message });
-    });
-    req.setTimeout(timeoutMs, () => {
-      req.destroy();
-      resolve({ statusCode: null, body: "", error: "timeout" });
-    });
-  });
-}
 import * as path from "path";
 import { runWithHeartbeat } from "../node_heartbeat";
 
@@ -652,7 +629,7 @@ export async function deployNode(
     for (const candidate of healthCheckCandidates) {
       try {
         // 用 Node.js 原生 HTTP 替代 curl — spawn({shell:true}) 在 Windows/cmd.exe 下不认 /dev/null
-        const result = await httpGet(candidate.target, 3000);
+        const result = await host.httpGet(candidate.target, 3000);
         const code = result.statusCode;
         const codeMatch = code && /^(200|201|204|301|302|404)$/.test(String(code));
         if (codeMatch) {
@@ -691,7 +668,7 @@ export async function deployNode(
       const epPath = String(ep.path || "").replace(/:([^/]+)/g, "1"); // 替换路径参数
       try {
         // 用 Node.js 原生 HTTP 替代 curl
-        const epResult = await httpGet(`http://127.0.0.1:${hostPort}${epPath}`, 5000);
+        const epResult = await host.httpGet(`http://127.0.0.1:${hostPort}${epPath}`, 5000);
         const code = epResult.statusCode ? String(epResult.statusCode) : "";
         const ok = /^[23]\d\d$/.test(code);
         verificationResults.push(`  ${epPath} → HTTP ${code} ${ok ? "✅" : "❌"}`);
@@ -708,7 +685,7 @@ export async function deployNode(
     if (frontendSpec) {
       try {
         // 用 Node.js 原生 HTTP 替代 curl
-        const feResult = await httpGet(`http://127.0.0.1:${hostPort}/index.html`, 5000);
+        const feResult = await host.httpGet(`http://127.0.0.1:${hostPort}/index.html`, 5000);
         const html = feResult.body || "";
         frontendAccessible = /<html|<div|<!doctype/i.test(html) && html.length > 100;
         verificationResults.push(`  /index.html (前端页面) → ${frontendAccessible ? "HTML ✅" : "非 HTML ❌ (" + html.slice(0, 60) + ")"}`);

@@ -3,6 +3,7 @@ import * as path from "path";
 import { builtinModules } from "module";
 import { JimClawState, RepairLedgerEntry, ConsensusProgress } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { host } from "../../infra";
 import { createCommandExecutor, ResolvedExecutionIntent } from "../../executor/command_executor";
 import { CapabilitySnapshot, ExecutorBackend, ExecutorResult } from "../../executor/types";
 import { AuditLogger } from "../../utils/audit";
@@ -687,9 +688,8 @@ export async function envGuardNode(
 
     const occupiedPort = extractOccupiedPort(environmentEvidence);
     if (occupiedPort) {
-      const releaseCommand = buildHostPortReleaseCommand(occupiedPort);
       await AuditLogger.log(WORKSPACE, "Environment", `**Action:** 释放占用端口 ${occupiedPort}`);
-      await ShellExecuteSkill.config.run({ command: releaseCommand, timeout: 15000 });
+      await host.killPortProcess(parseInt(occupiedPort, 10));
       ledger.push({ round, phase: "env_guard", action: `释放占用端口 ${occupiedPort}`, result: "success" });
     }
 

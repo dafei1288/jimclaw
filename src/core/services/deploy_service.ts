@@ -1,12 +1,12 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import * as http from "http";
 import { JimClawState, SystemManifest, TechSpec } from "../graph_types";
 import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { execInContainer } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
+import { host } from "../../infra";
 
 export interface DeployResult {
   containerId: string;
@@ -85,15 +85,8 @@ export class DeployService {
       for (let i = 0; i < 10; i++) {
         try {
           // 用 Node.js 原生 HTTP 替代 curl — spawn({shell:true}) 在 Windows 上用 cmd.exe 不认 /dev/null
-          const result = await new Promise<{ statusCode: number | null }>((resolve) => {
-            const req = http.get(dynamicUrl, (res) => {
-              res.resume(); // 消费响应体
-              resolve({ statusCode: res.statusCode || null });
-            });
-            req.on("error", () => resolve({ statusCode: null }));
-            req.setTimeout(3000, () => { req.destroy(); resolve({ statusCode: null }); });
-          });
-          if (result.statusCode === 200 || result.statusCode === 301 || result.statusCode === 302) {
+          const code = await host.httpStatusCode(dynamicUrl, 3000);
+          if (code === 200 || code === 301 || code === 302) {
             isAccessible = true;
             break;
           }

@@ -55,6 +55,7 @@ import {
 } from "./graph_types";
 import { ShellExecuteSkill } from "../skills/shell_exec";
 import { AuditLogger } from "../utils/audit";
+import { host } from "../infra";
 
 export function extractFailureEvidence(
   testOutput: string = "",
@@ -4101,10 +4102,7 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
     const portMatch = testOutput.match(/port\s+(\d+)/i) || testOutput.match(/:(\d+)\)/);
     if (portMatch) {
       const port = portMatch[1];
-      await ShellExecuteSkill.config.run({
-        command: `fuser -k ${port}/tcp 2>/dev/null || lsof -ti:${port} | xargs kill -9 2>/dev/null || true`,
-        timeout: 5000
-      });
+      await host.killPortProcess(parseInt(port, 10));
       return { fixed: true, action: `已释放端口 ${port}` };
     }
   }
