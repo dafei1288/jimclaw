@@ -92,6 +92,7 @@ function isStructuralConfigFile(fileTarget: string): boolean {
     n === "build.gradle" ||
     n === "requirements.txt" ||
     n === "package.json" ||
+    n.endsWith("/package.json") ||
     n === "dockerfile" ||
     n.endsWith("/dockerfile") ||
     n.endsWith("docker-compose.yml") ||
@@ -109,6 +110,7 @@ function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
   return (
     normalized === "package.json" ||
+    normalized.endsWith("/package.json") ||
     normalized === "requirements.txt" ||
     normalized === "tsconfig.json" ||
     /^(jest\.config\.(cjs|js|ts)|vitest\.config\.(ts|js|mjs))$/i.test(normalized) ||
