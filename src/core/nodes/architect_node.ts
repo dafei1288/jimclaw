@@ -286,7 +286,7 @@ function buildDeterministicPythonOutput(
   }
 
   // 混合项目：追加前端文件
-  const frontendFiles_py = buildFrontendFiles(targetStack);
+  const frontendFiles_py = buildFrontendFiles(targetStack, singular, plural);
   if (frontendFiles_py) filesToCreate.push(...frontendFiles_py);
 
   const spec = {
@@ -326,7 +326,7 @@ function buildDeterministicPythonOutput(
   };
 
   // 混合项目：追加前端文件
-  const frontendFiles_go = buildFrontendFiles(targetStack);
+  const frontendFiles_go = buildFrontendFiles(targetStack, singular, plural);
   if (frontendFiles_go) filesToCreate.push(...frontendFiles_go);
 
   const endpoints = inferMinimalApiEndpoints(state.contract, singular, plural);
@@ -452,11 +452,15 @@ function buildDeterministicGoOutput(
 
 // ── Java / Spring Boot 确定性输出 ──
 // ── 混合项目：前端文件注入 ──
-function buildFrontendFiles(targetStack: { language: string; framework: string; templateId: string; frontend?: string }): string[] | null {
+function buildFrontendFiles(
+  targetStack: { language: string; framework: string; templateId: string; frontend?: string },
+  singular?: string,
+  plural?: string
+): string[] | null {
   if (!targetStack.frontend) return null;
   const fw = targetStack.frontend.toLowerCase();
   if (fw === "vue") {
-    return [
+    const files = [
       "frontend/package.json",
       "frontend/vite.config.ts",
       "frontend/tsconfig.json",
@@ -469,6 +473,16 @@ function buildFrontendFiles(targetStack: { language: string; framework: string; 
       "frontend/src/components/HealthCheck.vue",
       "frontend/tests/HealthCheck.test.ts",
     ];
+    // CRUD 实体组件
+    if (singular && plural) {
+      const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+      files.push(
+        `frontend/src/components/${pascal}List.vue`,
+        `frontend/src/api/${plural}.ts`,
+        `frontend/tests/${pascal}List.test.ts`,
+      );
+    }
+    return files;
   }
   return null;
 }
@@ -534,7 +548,7 @@ function buildDeterministicJavaOutput(
   const apiContract = ensureRequirementDrivenApiContract({ endpoints }, requirementProtocol);
 
   // 混合项目：追加前端文件
-  const frontendFiles = buildFrontendFiles(targetStack);
+  const frontendFiles = buildFrontendFiles(targetStack, singular, plural);
   if (frontendFiles) filesToCreate.push(...frontendFiles);
 
   const spec = {

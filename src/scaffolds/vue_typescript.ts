@@ -13,11 +13,29 @@ import {
 // ── 辅助函数 ──
 
 function inferEntityPlural(ctx: ScaffoldContext): string {
+  const crudEntities = ctx.requirementProtocol?.capabilities?.crudEntities || [];
   const entities = ctx.requirementProtocol?.capabilities?.entities || [];
-  if (entities.length > 0) return entities[entities.length - 1];
+  // 优先 crudEntities（与 inferEntitySingular 一致），然后 entities
+  if (crudEntities.length > 0) return crudEntities[0] + "s";
+  if (entities.length > 0) return entities[0] + "s";
   const m = (ctx.description || "").match(/(\w+)\/(?:list|create|crud)/i);
   if (m) return m[1];
   return "items";
+}
+
+function inferEntitySingular(ctx: ScaffoldContext): string {
+  const crudEntities = ctx.requirementProtocol?.capabilities?.crudEntities || [];
+  const entities = ctx.requirementProtocol?.capabilities?.entities || [];
+  const name = crudEntities[0] || entities[0] || "";
+  // 简单单数化
+  if (name.endsWith("s") && name.length > 1) return name.slice(0, -1);
+  return name || "item";
+}
+
+function hasCrudEntity(ctx: ScaffoldContext): boolean {
+  const crudEntities = ctx.requirementProtocol?.capabilities?.crudEntities || [];
+  const entities = ctx.requirementProtocol?.capabilities?.entities || [];
+  return (crudEntities.length + entities.length) > 0;
 }
 
 // ── 模板生成 ──
@@ -113,19 +131,31 @@ app.mount('#app');
 }
 
 function generateAppVue(ctx: ScaffoldContext): string {
-  const entity = inferEntityPlural(ctx);
-  const entityLower = entity.toLowerCase();
+  const singular = inferEntitySingular(ctx);
+  const plural = inferEntityPlural(ctx);
+  const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+  const crud = hasCrudEntity(ctx);
+
+  const importSection = crud
+    ? `import { ref, computed } from 'vue';\nimport HealthCheck from './components/HealthCheck.vue';\nimport ${pascal}List from './components/${pascal}List.vue';`
+    : `import { ref, computed } from 'vue';\nimport HealthCheck from './components/HealthCheck.vue';`;
+
+  const crudSection = crud
+    ? `    <${pascal}List />\n    <hr/>`
+    : '';
+
   return `<template>
   <div id="app">
     <h1>{{ title }}</h1>
     <HealthCheck @status-change="onStatusChange" />
     <p v-if="backendStatus" :class="statusClass">后端状态: {{ backendStatus }}</p>
+    <hr/>
+${crudSection}
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
-import HealthCheck from './components/HealthCheck.vue';
+${importSection}
 
 const title = ref('${ctx.projectName || "App"}');
 const backendStatus = ref('');
@@ -149,6 +179,7 @@ function onStatusChange(status: string) {
 }
 .status-ok { color: green; }
 .status-error { color: red; }
+hr { border: none; border-top: 1px solid #eee; margin: 20px 0; }
 </style>
 `;
 }
@@ -203,6 +234,244 @@ button {
 button:disabled { opacity: 0.6; cursor: not-allowed; }
 .error { color: red; margin-top: 8px; }
 </style>
+`;
+}
+
+function generateCrudListVue(ctx: ScaffoldContext, singular: string, plural: string): string {
+  const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+  const titleField = singular === "task" ? "title" : "name";
+  return `<template>
+  <div class="${singular}-list">
+    <h2>${pascal}管理</h2>
+
+    <!-- 新增表单 -->
+    <div class="form-row">
+      <input v-model="newItem.${titleField}" placeholder="${titleField}" />
+      <input v-model="newItem.description" placeholder="description" />
+      <select v-model="newItem.status">
+        <option value="todo">todo</option>
+        <option value="in-progress">in-progress</option>
+        <option value="done">done</option>
+      </select>
+      <button @click="createItem" :disabled="!newItem.${titleField}">新增</button>
+    </div>
+
+    <!-- 列表 -->
+    <table v-if="items.length">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>${pascal === "Task" ? "Title" : "Name"}</th>
+          <th>Description</th>
+          <th>Status</th>
+          <th>操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in items" :key="item.id">
+          <td>{{ item.id }}</td>
+          <td>{{ item.${titleField} }}</td>
+          <td>{{ item.description }}</td>
+          <td>
+            <select v-model="item.status" @change="updateItem(item)">
+              <option value="todo">todo</option>
+              <option value="in-progress">in-progress</option>
+              <option value="done">done</option>
+            </select>
+          </td>
+          <td>
+            <button class="btn-delete" @click="deleteItem(item.id)">删除</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <p v-else>暂无${pascal}数据</p>
+
+    <p v-if="error" class="error">{{ error }}</p>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+import { fetch${pascal}List, create${pascal}, update${pascal}, delete${pascal} } from '../api/${plural}';
+
+interface ${pascal}Item {
+  id: number;
+  ${titleField}: string;
+  description?: string;
+  status?: string;
+  [key: string]: any;
+}
+
+const items = ref<${pascal}Item[]>([]);
+const error = ref('');
+const newItem = ref<{ ${titleField}: string; description: string; status: string }>({
+  ${titleField}: '',
+  description: '',
+  status: 'todo',
+});
+
+async function loadItems() {
+  try {
+    error.value = '';
+    items.value = await fetch${pascal}List();
+  } catch (e: any) {
+    error.value = e.message || '加载失败';
+  }
+}
+
+async function createItem() {
+  try {
+    error.value = '';
+    await create${pascal}(newItem.value);
+    newItem.value = { ${titleField}: '', description: '', status: 'todo' };
+    await loadItems();
+  } catch (e: any) {
+    error.value = e.message || '创建失败';
+  }
+}
+
+async function updateItem(item: ${pascal}Item) {
+  try {
+    error.value = '';
+    await update${pascal}(item.id, item);
+  } catch (e: any) {
+    error.value = e.message || '更新失败';
+    await loadItems();
+  }
+}
+
+async function deleteItem(id: number) {
+  try {
+    error.value = '';
+    await delete${pascal}(id);
+    await loadItems();
+  } catch (e: any) {
+    error.value = e.message || '删除失败';
+  }
+}
+
+onMounted(loadItems);
+</script>
+
+<style scoped>
+.${singular}-list { margin: 20px 0; }
+.form-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+.form-row input, .form-row select {
+  padding: 6px 10px;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+button {
+  padding: 6px 14px;
+  cursor: pointer;
+  background: #42b883;
+  color: white;
+  border: none;
+  border-radius: 4px;
+}
+button:disabled { opacity: 0.6; }
+button:hover { background: #35a372; }
+.btn-delete { background: #e74c3c; }
+.btn-delete:hover { background: #c0392b; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid #eee;
+}
+th { background: #f5f5f5; }
+.error { color: red; margin-top: 12px; }
+</style>
+`;
+}
+
+function generateApiModule(ctx: ScaffoldContext, singular: string, plural: string): string {
+  const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+  return `const API_BASE = '/api/${plural}';
+
+export async function fetch${pascal}List(): Promise<any[]> {
+  const res = await fetch(API_BASE);
+  if (!res.ok) throw new Error('Failed to fetch ${plural}');
+  return res.json();
+}
+
+export async function create${pascal}(data: Record<string, any>): Promise<any> {
+  const res = await fetch(API_BASE, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error('Failed to create ${singular}');
+  return res.json();
+}
+
+export async function update${pascal}(id: number, data: Record<string, any>): Promise<any> {
+  const res = await fetch(API_BASE + '/' + id, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(data),
+  });
+  if (!res.ok) throw new Error('Failed to update ${singular}');
+  return res.json();
+}
+
+export async function delete${pascal}(id: number): Promise<void> {
+  const res = await fetch(API_BASE + '/' + id, {
+    method: 'DELETE',
+  });
+  if (!res.ok && res.status !== 204) throw new Error('Failed to delete ${singular}');
+}
+`;
+}
+
+function generateCrudListTest(ctx: ScaffoldContext, singular: string, plural: string): string {
+  const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+  return `import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { mount } from '@vue/test-utils';
+import ${pascal}List from '../src/components/${pascal}List.vue';
+
+// mock fetch
+const mockFetch = vi.fn();
+global.fetch = mockFetch;
+
+describe('${pascal}List', () => {
+  beforeEach(() => {
+    mockFetch.mockReset();
+    // Default: GET /api/${plural} returns empty list
+    mockFetch.mockResolvedValue({
+      ok: true,
+      json: () => Promise.resolve([]),
+    });
+  });
+
+  it('renders the component with heading', async () => {
+    const wrapper = mount(${pascal}List);
+    // Wait for onMounted
+    await new Promise(r => setTimeout(r, 50));
+    expect(wrapper.find('h2').text()).toContain('${pascal}');
+  });
+
+  it('shows empty message when no ${plural}', async () => {
+    const wrapper = mount(${pascal}List);
+    await new Promise(r => setTimeout(r, 50));
+    expect(wrapper.text()).toContain('暂无');
+  });
+
+  it('has form inputs for creating new ${singular}', async () => {
+    const wrapper = mount(${pascal}List);
+    await new Promise(r => setTimeout(r, 50));
+    expect(wrapper.find('input[placeholder="title"]').exists() || wrapper.find('input').exists()).toBe(true);
+  });
+});
 `;
 }
 
@@ -284,6 +553,7 @@ class VueTypescriptProvider implements ScaffoldProvider {
     // 去掉 frontend/ 前缀来匹配
     const rel = normalizedTarget.replace(/^frontend\//i, "").toLowerCase();
 
+    // 静态文件匹配
     switch (rel) {
       case "package.json": return generatePackageJson(ctx);
       case "vite.config.ts": return generateViteConfig(ctx);
@@ -296,8 +566,20 @@ class VueTypescriptProvider implements ScaffoldProvider {
       case "src/env.d.ts": return generateEnvDts();
       case "src/components/healthcheck.vue": return generateHealthCheckVue(ctx);
       case "tests/healthcheck.test.ts": return generateHealthCheckTest(ctx);
-      default: return null;
     }
+
+    // CRUD 组件动态匹配
+    if (hasCrudEntity(ctx)) {
+      const singular = inferEntitySingular(ctx);
+      const plural = inferEntityPlural(ctx);
+      const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+
+      if (rel === `src/components/${pascal.toLowerCase()}list.vue`) return generateCrudListVue(ctx, singular, plural);
+      if (rel === `src/api/${plural.toLowerCase()}.ts`) return generateApiModule(ctx, singular, plural);
+      if (rel === `tests/${pascal.toLowerCase()}list.test.ts`) return generateCrudListTest(ctx, singular, plural);
+    }
+
+    return null;
   }
 
   fileExtensions(): string[] {

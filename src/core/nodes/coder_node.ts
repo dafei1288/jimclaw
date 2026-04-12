@@ -1705,7 +1705,7 @@ export async function coderNode(
     if (!scaffold) continue;
     const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
     const isProtected = isStructuralConfigFile(task.fileTarget);
-    if (fileFailed && !isProtected) continue; // QA 失败且非配置文件，留给 LLM 修复
+    if (fileFailed && !isProtected) continue;
     const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
     if (validationError) continue;
     // 写盘
