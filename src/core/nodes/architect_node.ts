@@ -905,16 +905,15 @@ ${langFileConstraints}
   }
 
   // ── 文件数限制：超过上限时裁剪到 MVP 子集，防止 Coder 超时 ──
-  const MAX_FILES = 15;
+  const MAX_FILES = 25;
   if ((spec.filesToCreate || []).length > MAX_FILES) {
     const original = spec.filesToCreate.length;
     const keepPatterns = [
+      // Node/TS
       /^package\.json$/,
       /^tsconfig\.json$/,
       /^jest\.config/,
       /^\.env/,
-      /^Dockerfile$/,
-      /^docker-compose/,
       /^src\/index\./,
       /^src\/config\//,
       /^src\/models?\//,
@@ -923,6 +922,28 @@ ${langFileConstraints}
       /^src\/routes?\//,
       /^src\/middleware\//,
       /^tests?\//,
+      // Docker
+      /^Dockerfile$/,
+      /^docker-compose/,
+      // Java
+      /^pom\.xml$/,
+      /^src\/main\/java\//,
+      /^src\/test\/java\//,
+      /^src\/main\/resources\//,
+      // Go
+      /^go\.mod$/,
+      /^main\.go$/,
+      /^handler\//,
+      // Python
+      /^requirements\.txt$/,
+      /^app\//,
+      /^pytest\.ini$/,
+      // Rust
+      /^Cargo\.toml$/,
+      /^src\/main\.rs$/,
+      /^src\/handlers\//,
+      // 前端（混合项目）
+      /^frontend\//,
     ];
     const kept = spec.filesToCreate.filter((f: string) => keepPatterns.some(p => p.test(f)));
     const remaining = MAX_FILES - kept.length;
