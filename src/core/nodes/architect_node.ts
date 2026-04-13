@@ -699,6 +699,91 @@ export async function architectNode(
   let readmeContent = "";
   let designSource: PlanningSource = "model";
 
+  // ── 增量修改模式：复用上次 spec，LLM 决定新增文件 ──
+  if (state.previousSpec && state.existingFiles) {
+    emit("thinking", "System", `增量修改模式：复用上次技术规范，保留 ${Object.keys(state.existingFiles).length} 个已有文件`, {});
+    const prevSpec = state.previousSpec as any;
+    const prevManifest = (state as any).previousManifest || null;
+    const prevApiContract = (state as any).previousApiContract || null;
+    const existingFileSet = new Set(Object.keys(state.existingFiles));
+    const newRequirementProtocol = buildRequirementProtocol(state.contract);
+    const { singular: newSingular, plural: newPlural } = getPrimaryEntity(newRequirementProtocol);
+    const targetStack = detectTargetStack(String(state.userGoal || ""), state.contract?.title || "");
+
+    // 让 LLM 决定需要新增/修改哪些文件
+    const existingFileList = Array.from(existingFileSet).sort().join(", ");
+    const prevFilesToCreate = (prevSpec.filesToCreate || []).join(", ");
+    const goal = String(state.userGoal || "");
+
+    let newFiles: string[] = [...(prevSpec.filesToCreate || [])];
+
+    try {
+      const response = await agents.architect.chat([
+        { role: "user", content: `## 增量修改 — 需要新增/修改哪些文件？
+
+### 用户修改需求
+${goal}
+
+### 现有项目
+语言: ${prevSpec.language}
+框架: ${prevSpec.framework}
+端口: ${prevSpec.entryPoint}
+
+### 已有文件
+${existingFileList}
+
+### 原始 filesToCreate
+${prevFilesToCreate}
+
+请分析用户需求，列出需要**新增或修改**的文件路径。
+已有文件保持不变，只列出需要新增或内容需要修改的文件。
+
+严格按照以下 JSON 格式输出（不要其他内容）：
+{
+  "newFiles": ["path/to/NewFile.java"],
+  "modifiedFiles": ["path/to/ExistingFile.java"],
+  "description": "简要说明修改内容"
+}` }
+      ], (ev) => emit(ev.type, ev.sender, ev.type === 'llm_call_start' ? "正在分析修改范围" : "分析完成", ev), {
+        brief: buildSystemContext(state),
+        workspaceDir: WORKSPACE,
+        timeoutMs: 45000,
+      });
+
+      const content = extractText(response.content);
+      const plan = parseJsonFromResponse(content, {});
+      if (plan.newFiles && Array.isArray(plan.newFiles)) {
+        for (const f of plan.newFiles) {
+          if (!existingFileSet.has(f)) newFiles.push(f);
+        }
+      }
+      if (plan.modifiedFiles && Array.isArray(plan.modifiedFiles)) {
+        // 修改的文件需要从 completed 重新变为 pending
+        // （这些文件已在 workspace 中但需要 LLM 重写）
+        for (const f of plan.modifiedFiles) {
+          if (existingFileSet.has(f)) {
+            // 不加入 newFiles（已经在里面了），但标记需要修改
+            // 通过在 state 上设置标记，让 Coder 知道这些文件需要重写
+          }
+        }
+      }
+      emit("thinking", "System", `[Architect] LLM 修改计划：${plan.description || ""} | 新增 ${plan.newFiles?.length || 0} 个文件`, {});
+    } catch (e: any) {
+      emit("thinking", "System", `[Architect] 修改模式 LLM 调用失败，使用保守策略: ${e.message}`, {});
+    }
+
+    // 去重
+    newFiles = [...new Set(newFiles)];
+
+    spec = { ...prevSpec, filesToCreate: newFiles };
+    manifest = prevManifest || { services: [{ name: "app", port: 4000 }] };
+    apiContract = prevApiContract || { endpoints: [] };
+    readmeContent = "";
+    designSource = "modify-incremental";
+
+    const newCount = newFiles.filter((f: string) => !existingFileSet.has(f)).length;
+    console.log(`[Architect] 增量修改：保留 ${existingFileSet.size} 个文件，新增 ${newCount} 个`);
+  } else
   // ── 非 TypeScript 快速通道：直接走确定性路径，不调 LLM ──
   // LLM 倾向于输出 TypeScript（因训练数据偏移），强制用确定性骨架更可靠
   if (isHintPython || isHintGo || isHintJava || isHintRust) {

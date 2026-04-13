@@ -288,6 +288,92 @@ async function main() {
     return;
   }
 
+  if (args[0] === "--modify") {
+    // 增量修改模式：--modify <workspace_path> "修改描述"
+    const workspacePath = args[1];
+    const modifyGoal = args[2];
+    if (!workspacePath || !modifyGoal) {
+      throw new Error("用法: npx ts-node src/index.ts --modify <workspacePath> \"修改描述\"");
+    }
+
+    // 加载上次 run 状态
+    const snapshot = await loadCurrentWorkspaceState(workspacePath);
+    const previousState = snapshot.state || snapshot;
+
+    // 读取已有文件
+    const existingFiles: Record<string, string> = {};
+    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw"]);
+    const skipFiles = new Set(["boulder.json", "trace-index.json", "token-usage.json", "fp_status.json", "fp_trend.json"]);
+    async function scanDir(dir: string, base: string) {
+      let entries;
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        if (skipDirs.has(entry.name)) continue;
+        const rel = base ? `${base}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await scanDir(path.join(dir, entry.name), rel);
+        } else if (!skipFiles.has(entry.name) && !entry.name.endsWith(".pid")) {
+          try {
+            const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
+            existingFiles[rel] = content;
+          } catch { /* binary */ }
+        }
+      }
+    }
+    await scanDir(workspacePath, "");
+    console.log(`[Modify] 已加载 ${Object.keys(existingFiles).length} 个文件，workspace: ${workspacePath}`);
+
+    // 创建新 run
+    const newWorkspacePath = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
+    for (const [relPath, content] of Object.entries(existingFiles)) {
+      const fullPath = path.join(newWorkspacePath, relPath);
+      await fs.mkdir(path.dirname(fullPath), { recursive: true });
+      await fs.writeFile(fullPath, content, "utf-8");
+    }
+    console.log(`[Modify] 已复制文件到新 workspace: ${newWorkspacePath}`);
+
+    const globalConfig = ModelManager.getGlobalConfig?.() || {};
+    const coderMaxParallel = Number(globalConfig?.coderMaxParallel || 1);
+    const coderExperimentalModelParallel = Boolean(globalConfig?.coderExperimentalModelParallel);
+
+    const app = await createJimClawGraph(Team, undefined, { workspacePath: newWorkspacePath });
+    const finalState = await app.invoke(
+      {
+        userGoal: modifyGoal,
+        messages: [],
+        teamChatLog: [],
+        retryCount: 0,
+        isDone: false,
+        contract: null,
+        spec: null,
+        code: "",
+        testResults: "",
+        qaFailures: null,
+        packageJsonHash: "",
+        customerApprovalState: buildCustomerApprovalState({ autoApprove: { requirements: true, solution: true, deploy: true } }),
+        coderMaxParallel: Number.isFinite(coderMaxParallel) ? Math.max(1, Math.min(4, Math.floor(coderMaxParallel))) : 1,
+        coderExperimentalModelParallel,
+        previousWorkspacePath: workspacePath,
+        existingFiles,
+        previousContract: previousState.contract || null,
+        previousSpec: previousState.spec || null,
+      },
+      { recursionLimit: 500 }
+    );
+
+    console.log(`\n--- Modify Session Completed ---`);
+    if (finalState.deploymentStatus?.status === 'running' && finalState.apiContract?.endpoints?.length) {
+      const base = finalState.deploymentStatus.url || '';
+      console.log(`\n========== 可用 API 端点 ==========`);
+      for (const ep of finalState.apiContract.endpoints) {
+        console.log(`  ${ep.method.padEnd(7)} ${base}${ep.path}  ${ep.description || ''}`);
+      }
+      console.log(`===================================\n`);
+    }
+    process.exitCode = computeSessionExitCode(finalState);
+    return;
+  }
+
   if (args[0] === "--watch" || args[0] === "--watch-latest") {
     const intervalIndex = args.indexOf("--interval-ms");
     const maxWaitIndex = args.indexOf("--max-wait-ms");

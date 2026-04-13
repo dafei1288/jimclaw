@@ -1281,6 +1281,26 @@ export async function coderNode(
 
   const subTasks = state.subTasks || [];
   const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
+
+  // ── 增量修改模式：从磁盘加载已有文件到 filesContent ──
+  if (state.existingFiles && Object.keys(state.existingFiles).length > 0) {
+    for (const [relPath, content] of Object.entries(state.existingFiles)) {
+      if (!(relPath in filesContent)) {
+        filesContent[relPath] = content;
+      }
+    }
+    // 已有文件对应的 subTask 标记为 completed（如果 status 仍是 pending）
+    const existingSet = new Set(Object.keys(state.existingFiles));
+    for (const task of subTasks as any[]) {
+      if (task.status === "pending" && existingSet.has(task.fileTarget)) {
+        task.status = "completed";
+      }
+    }
+    const preCompleted = subTasks.filter((t: any) => t.status === "completed").length;
+    if (preCompleted > 0) {
+      emit("thinking", "System", `[Coder] 增量修改：${preCompleted}/${subTasks.length} 文件已从上次运行保留`, {});
+    }
+  }
   const codeLogEntries: FileChangeEntry[] = [];
   const nodeModulesReady = isNodeLikeLanguage(state.spec?.language)
     ? await hasWorkspaceNodeModules(WORKSPACE)

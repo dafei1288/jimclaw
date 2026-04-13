@@ -21,6 +21,27 @@ const io = new Server(httpServer, {
 
 const PORT = process.env.PORT || 3111;
 
+async function resolveLatestRunPath(): Promise<string> {
+  const workspaceDir = path.join(process.cwd(), "workspace");
+  const entries = await fs.readdir(workspaceDir, { withFileTypes: true });
+  const runDirs = entries
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("run_"))
+    .map((entry) => path.join(workspaceDir, entry.name));
+  if (!runDirs.length) {
+    throw new Error("workspace 下没有可观察的 run_* 目录。");
+  }
+  const sorted = await Promise.all(
+    runDirs.map(async (dir) => ({
+      dir,
+      stat: await fs.stat(dir),
+      hasSnapshot: await fs.access(path.join(dir, "boulder.json")).then(() => true).catch(() => false),
+    }))
+  );
+  sorted.sort((a, b) => b.stat.mtimeMs - a.stat.mtimeMs);
+  const withSnapshot = sorted.find((item) => item.hasSnapshot);
+  return (withSnapshot || sorted[0]).dir;
+}
+
 function createEmptyTokenUsage() {
   return {
     calls: 0,
@@ -545,6 +566,111 @@ io.on("connection", (socket) => {
         coderExperimentalModelParallel: globalCoderExperimentalModelParallel,
       })
     );
+  });
+
+  // ── 增量修改模式：在上一次成功 run 基础上修改功能 ──
+  socket.on("modify-task", async (data: { userGoal: string; autoApprove?: ApprovalAutoApprove }) => {
+    const { userGoal, autoApprove } = data;
+    const globalMaxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+    const globalCoderMaxParallel = Number(ModelManager.getGlobalConfig()?.coderMaxParallel || 1);
+    const globalCoderExperimentalModelParallel = Boolean(ModelManager.getGlobalConfig()?.coderExperimentalModelParallel);
+    console.log(
+      `[Modify] Starting modification for client ${socket.id}: ${userGoal}`
+    );
+
+    // 1. 找到上一次 run 的 workspace
+    let previousWorkspacePath: string | null = currentSession.workspacePath;
+    if (!previousWorkspacePath) {
+      try {
+        previousWorkspacePath = await resolveLatestRunPath();
+      } catch {
+        io.emit("task-error", { message: "没有找到上一次的运行记录，请先运行一次任务。" });
+        return;
+      }
+    }
+
+    // 2. 加载上一次 run 的 boulder.json
+    let previousState: any = null;
+    try {
+      const raw = await fs.readFile(path.join(previousWorkspacePath, "boulder.json"), "utf-8");
+      const snapshot = JSON.parse(raw);
+      previousState = snapshot.state || snapshot;
+    } catch {
+      io.emit("task-error", { message: `无法加载上次运行状态: ${previousWorkspacePath}` });
+      return;
+    }
+
+    // 3. 检查上次部署是否成功
+    if (previousState.deploymentStatus?.status !== "running" && previousState.isDone !== true) {
+      console.log(`[Modify] 上次运行未成功部署，但仍允许修改`);
+    }
+
+    // 4. 读取已有文件内容（排除 node_modules、dist、.git、audit 等）
+    const existingFiles: Record<string, string> = {};
+    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw"]);
+    const skipFiles = new Set(["boulder.json", "trace-index.json", "token-usage.json", "fp_status.json", "fp_trend.json"]);
+    async function scanDir(dir: string, base: string) {
+      let entries;
+      try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
+      for (const entry of entries) {
+        if (skipDirs.has(entry.name)) continue;
+        const rel = base ? `${base}/${entry.name}` : entry.name;
+        if (entry.isDirectory()) {
+          await scanDir(path.join(dir, entry.name), rel);
+        } else if (!skipFiles.has(entry.name) && !entry.name.endsWith(".pid")) {
+          try {
+            const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
+            existingFiles[rel] = content;
+          } catch { /* binary files etc */ }
+        }
+      }
+    }
+    await scanDir(previousWorkspacePath, "");
+
+    const fileCount = Object.keys(existingFiles).length;
+    console.log(`[Modify] 已加载 ${fileCount} 个文件，workspace: ${previousWorkspacePath}`);
+
+    // 5. 创建新的 run
+    const newWorkspacePath = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
+    // 复制已有文件到新 workspace
+    for (const [relPath, content] of Object.entries(existingFiles)) {
+      const fullPath = path.join(newWorkspacePath, relPath);
+      await fs.mkdir(path.dirname(fullPath), { recursive: true });
+      await fs.writeFile(fullPath, content, "utf-8");
+    }
+    console.log(`[Modify] 已复制 ${fileCount} 个文件到新 workspace: ${newWorkspacePath}`);
+
+    const previousContract = previousState.contract || null;
+    const previousSpec = previousState.spec || null;
+
+    const latestTeam = getTeamInfo();
+    const initialSession = {
+      ...createServerInitialSession(userGoal, globalMaxRetries, autoApprove, {
+        coderMaxParallel: globalCoderMaxParallel,
+        coderExperimentalModelParallel: globalCoderExperimentalModelParallel,
+      }),
+      metrics: {
+        tokenUsage: createEmptyTokenUsage(),
+        progress: buildProgressMetrics([]),
+        protocol: createEmptyProtocolMetrics(),
+      },
+      team: latestTeam,
+    };
+
+    const graphState = {
+      ...createBaseGraphState(userGoal, globalMaxRetries, autoApprove, {
+        coderMaxParallel: globalCoderMaxParallel,
+        coderExperimentalModelParallel: globalCoderExperimentalModelParallel,
+      }),
+      previousWorkspacePath,
+      existingFiles,
+      previousContract,
+      previousSpec,
+    };
+
+    await runGraphSession(latestTeam, initialSession, graphState, {
+      workspacePath: newWorkspacePath,
+    });
   });
 
   socket.on("approve-task", async () => {

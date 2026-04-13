@@ -138,7 +138,7 @@ export interface MediationDirective {
   detail: string;
 }
 
-export type PlanningSource = "model" | "deterministic-fallback";
+export type PlanningSource = "model" | "deterministic-fallback" | "modify-incremental";
 export type GenerationSource = "model" | "deterministic_scaffold" | "recovered_disk";
 
 export const MediationDirectiveSchema = z.array(z.object({
@@ -672,6 +672,26 @@ export const JimClawState = Annotation.Root({
   }),
   userGoal: Annotation<string>({
     reducer: (x, y) => y ?? x,
+  }),
+  /** 增量修改模式：上一次 run 的 workspace 路径 */
+  previousWorkspacePath: Annotation<string | null>({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
+  }),
+  /** 增量修改模式：已有代码文件快照 { relativePath: content } */
+  existingFiles: Annotation<Record<string, string> | null>({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
+  }),
+  /** 增量修改模式：原始任务契约 */
+  previousContract: Annotation<TaskContract | null>({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
+  }),
+  /** 增量修改模式：原始技术规范 */
+  previousSpec: Annotation<TechSpec | null>({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
   }),
   orchestrationSource: Annotation<PlanningSource>({
     reducer: (x, y) => y ?? x,

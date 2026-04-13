@@ -5265,6 +5265,12 @@ export function buildCoderExecutionContext(
     `• 执行阶段:${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
   );
 
+  // ── 增量修改模式标记 ──
+  if (state.existingFiles && Object.keys(state.existingFiles).length > 0) {
+    const existingCount = Object.keys(state.existingFiles).length;
+    lines.push(`• 修改模式:增量（保留 ${existingCount} 个已有文件，只新增/修改用户要求的功能）`);
+  }
+
   if (requirementProtocol) {
     const flags = [
       requirementProtocol.capabilities.frontendRequired ? "frontend" : "",

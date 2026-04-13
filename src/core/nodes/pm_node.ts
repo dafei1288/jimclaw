@@ -149,16 +149,47 @@ export async function pmNode(
   emit("thinking", agents.pm.getPersona().name, "正在根据用户目标起草任务契约...");
 
   const goal = state.userGoal || "一个简单的计数器应用";
+
+  // ── 增量修改模式：构建已有项目上下文 ──
+  const isModifyMode = Boolean(state.existingFiles && Object.keys(state.existingFiles).length > 0);
+  let modifyContext = "";
+  if (isModifyMode && state.previousContract) {
+    const existingSummary = Object.entries(state.existingFiles!)
+      .map(([f, c]) => `- ${f} (${String(c).length} chars)`)
+      .join("\n");
+    modifyContext = `
+
+## 现有项目上下文（增量修改模式）
+项目已部署运行，现在用户要求修改/增加功能。
+请保留现有功能，只做增量修改。
+
+### 现有契约
+标题: ${state.previousContract.title}
+需求: ${(state.previousContract.requirements || []).join("; ")}
+验收: ${(state.previousContract.acceptanceCriteria || []).join("; ")}
+
+### 已有文件
+${existingSummary}
+
+### 技术规范（如有）
+${state.previousSpec ? `语言: ${state.previousSpec.language}, 框架: ${state.previousSpec.framework}, 端口: ${state.previousSpec.entryPoint}` : "（无）"}
+
+---
+
+`;
+  }
+
   let contractSource: PlanningSource = "model";
   let responseContent = "";
   try {
     const response = await agents.pm.chat([
-      { role: "user", content: `请为以下目标定义任务契约：${goal}。
+      { role: "user", content: `${modifyContext}请为以下目标定义任务契约：${goal}。
+${isModifyMode ? "注意：这是增量修改，保留现有功能，只添加/修改用户要求的新功能。" : ""}
 要求：
 1. 分析用户目标，将功能拆解为具体的、可实现的 requirements。
 2. 确保每个 requirement 都有对应的 acceptanceCriteria，且 criteria 必须是可验证的（例如：GET /health 返回 200）。
 3. 必须包含可测试的验证脚本。
-4. 只包含用户明确要求的功能，不要自行添加认证、权限、审计、前端等功能。
+4. ${isModifyMode ? "保留现有需求，只添加用户要求的新功能需求。" : "只包含用户明确要求的功能，不要自行添加认证、权限、审计、前端等功能。"}
 5. requirements 数量控制在 3-5 条，聚焦 MVP 核心功能。
 
 请严格按照以下 JSON 格式输出：
