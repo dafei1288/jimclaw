@@ -570,6 +570,12 @@ export interface TokenUsageStats {
   inputTokens: number;
   outputTokens: number;
   totalTokens: number;
+  /** 本次/本分类的 input 费用（USD） */
+  inputCost?: number;
+  /** 本次/本分类的 output 费用（USD） */
+  outputCost?: number;
+  /** 本次/本分类的总费用（USD） */
+  totalCost?: number;
 }
 
 export interface TokenUsageEntry extends TokenUsageStats {

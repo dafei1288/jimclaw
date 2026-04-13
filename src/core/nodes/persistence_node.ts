@@ -4,6 +4,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { execFile } from "child_process";
 import { promisify } from "util";
+import { AuditLogger, formatCost } from "../../utils/audit";
 
 /**
  * Persistence 节点：负责资源清理和最终状态持久化
@@ -47,6 +48,25 @@ export async function persistenceNode(
   }
   const result = { isDone };
   await saveBoulder({ ...state, ...result }, "persistence");
+
+  // ── 本次 Run Token 用量 & 费用汇总 ──
+  try {
+    const usage = await AuditLogger.loadTokenUsageSummary(WORKSPACE);
+    if (usage.calls > 0) {
+      console.log(`\n${"=".repeat(60)}`);
+      console.log(`  💰 Token 用量 & 费用汇总`);
+      console.log(`${"=".repeat(60)}`);
+      console.log(`  总调用: ${usage.calls} 次  |  Input: ${usage.inputTokens.toLocaleString()}  Output: ${usage.outputTokens.toLocaleString()}  Total: ${usage.totalTokens.toLocaleString()}`);
+      console.log(`  总费用: ${formatCost(usage.totalCost)}`);
+      console.log(`${"-".repeat(60)}`);
+      for (const [agent, stats] of Object.entries(usage.byAgent)) {
+        console.log(`  ${agent}: ${stats.calls}次, ${stats.inputTokens.toLocaleString()}/${stats.outputTokens.toLocaleString()} tokens, ${formatCost(stats.totalCost)}`);
+      }
+      console.log(`${"=".repeat(60)}\n`);
+    }
+  } catch {
+    // token 汇总失败不应阻塞 persistence
+  }
 
   // ── FP 回归检测：每次运行结束自动检查所有已知 failure patterns ──
   try {
