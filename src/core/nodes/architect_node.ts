@@ -698,6 +698,7 @@ export async function architectNode(
   let apiContract: any;
   let readmeContent = "";
   let designSource: PlanningSource = "model";
+  let savedModifyFiles: string[] = [];  // 增量修改模式：需要重写的文件列表
 
   // ── 增量修改模式：复用上次 spec，LLM 决定新增文件 ──
   if (state.previousSpec && state.existingFiles) {
@@ -757,17 +758,20 @@ ${prevFilesToCreate}
           if (!existingFileSet.has(f)) newFiles.push(f);
         }
       }
+      const modifyFilesToOverwrite: string[] = [];
       if (plan.modifiedFiles && Array.isArray(plan.modifiedFiles)) {
-        // 修改的文件需要从 completed 重新变为 pending
-        // （这些文件已在 workspace 中但需要 LLM 重写）
         for (const f of plan.modifiedFiles) {
           if (existingFileSet.has(f)) {
-            // 不加入 newFiles（已经在里面了），但标记需要修改
-            // 通过在 state 上设置标记，让 Coder 知道这些文件需要重写
+            modifyFilesToOverwrite.push(f);
           }
         }
       }
-      emit("thinking", "System", `[Architect] LLM 修改计划：${plan.description || ""} | 新增 ${plan.newFiles?.length || 0} 个文件`, {});
+      // 存入返回值，让 Orchestrator 和 Coder 识别
+      if (modifyFilesToOverwrite.length > 0) {
+        savedModifyFiles = modifyFilesToOverwrite;
+      }
+      const modCount = modifyFilesToOverwrite.length;
+      emit("thinking", "System", `[Architect] LLM 修改计划：${plan.description || ""} | 新增 ${plan.newFiles?.length || 0} 个文件，重写 ${modCount} 个文件`, {});
     } catch (e: any) {
       emit("thinking", "System", `[Architect] 修改模式 LLM 调用失败，使用保守策略: ${e.message}`, {});
     }
@@ -1303,6 +1307,7 @@ ${JSON.stringify(validationReport, null, 2)}
     consensusProgress,
     meetingNotes: [meetingNote],
     teamChatLog: [{ sender: architectName, content: "我已经完成系统设计。" }],
+    ...(savedModifyFiles.length > 0 ? { modifyFilesToOverwrite: savedModifyFiles } : {}),
   };
   await saveBoulder({ ...state, ...result }, "architect");
 

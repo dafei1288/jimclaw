@@ -296,14 +296,33 @@ async function main() {
       throw new Error("用法: npx ts-node src/index.ts --modify <workspacePath> \"修改描述\"");
     }
 
+    // 校验 workspace 路径有效性
+    const resolvedWorkspace = path.resolve(workspacePath);
+    try {
+      const stat = await fs.stat(resolvedWorkspace);
+      if (!stat.isDirectory()) {
+        throw new Error(`路径不是目录: ${resolvedWorkspace}`);
+      }
+    } catch (e: any) {
+      throw new Error(`workspace 路径不存在或不可访问: ${resolvedWorkspace} (${e.message})`);
+    }
+    // 检查是否是有效的 JimClaw run 目录
+    const boulderPath = path.join(resolvedWorkspace, "boulder.json");
+    try {
+      await fs.access(boulderPath);
+    } catch {
+      throw new Error(`不是有效的 JimClaw run 目录（缺少 boulder.json）: ${resolvedWorkspace}`);
+    }
+
     // 加载上次 run 状态
     const snapshot = await loadCurrentWorkspaceState(workspacePath);
     const previousState = snapshot.state || snapshot;
 
     // 读取已有文件
     const existingFiles: Record<string, string> = {};
-    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw"]);
+    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw", "target", "checkpoints", "__pycache__", ".mvn"]);
     const skipFiles = new Set(["boulder.json", "trace-index.json", "token-usage.json", "fp_status.json", "fp_trend.json"]);
+    const skipExtensions = new Set([".class", ".jar", ".pyc", ".pyo", ".o", ".a", ".so", ".exe", ".bin", ".pid"]);
     async function scanDir(dir: string, base: string) {
       let entries;
       try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -312,16 +331,19 @@ async function main() {
         const rel = base ? `${base}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           await scanDir(path.join(dir, entry.name), rel);
-        } else if (!skipFiles.has(entry.name) && !entry.name.endsWith(".pid")) {
+        } else if (!skipFiles.has(entry.name)) {
+          // 跳过编译产物和二进制文件
+          const ext = path.extname(entry.name).toLowerCase();
+          if (skipExtensions.has(ext)) continue;
           try {
             const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
             existingFiles[rel] = content;
-          } catch { /* binary */ }
+          } catch { /* binary or unreadable */ }
         }
       }
     }
-    await scanDir(workspacePath, "");
-    console.log(`[Modify] 已加载 ${Object.keys(existingFiles).length} 个文件，workspace: ${workspacePath}`);
+    await scanDir(resolvedWorkspace, "");
+    console.log(`[Modify] 已加载 ${Object.keys(existingFiles).length} 个文件，workspace: ${resolvedWorkspace}`);
 
     // 创建新 run
     const newWorkspacePath = path.join(process.cwd(), "workspace", `run_${Date.now()}`);
@@ -353,7 +375,7 @@ async function main() {
         customerApprovalState: buildCustomerApprovalState({ autoApprove: { requirements: true, solution: true, deploy: true } }),
         coderMaxParallel: Number.isFinite(coderMaxParallel) ? Math.max(1, Math.min(4, Math.floor(coderMaxParallel))) : 1,
         coderExperimentalModelParallel,
-        previousWorkspacePath: workspacePath,
+        previousWorkspacePath: resolvedWorkspace,
         existingFiles,
         previousContract: previousState.contract || null,
         previousSpec: previousState.spec || null,

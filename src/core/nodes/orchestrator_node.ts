@@ -120,13 +120,15 @@ ${JSON.stringify(executionProtocol, null, 2)}
     );
     const previousStatus = previousTask?.status;
     const wasCompleted = previousStatus === "completed";
-    // 增量修改模式：已有文件标记为 completed
+    // 增量修改模式：已有文件标记为 completed，但 modifyFilesToOverwrite 中的文件除外
     const isExistingFile = state.existingFiles && normalizedTarget in state.existingFiles;
+    const isOverwrite = state.modifyFilesToOverwrite && state.modifyFilesToOverwrite.includes(normalizedTarget);
+    const shouldBeCompleted = (wasCompleted || isExistingFile) && !isOverwrite;
     return {
       ...task,
       fileTarget: normalizedTarget,
       dependencies: (task.dependencies || []).map((dep: string) => normalizeNodeJestTestFilePath(dep)),
-      status: (wasCompleted || isExistingFile) ? "completed" : "pending" as const,
+      status: shouldBeCompleted ? "completed" : "pending" as const,
       // 自动推断 role：测试文件标记为 test 角色
       role: task.role || (/^tests?\//i.test(normalizedTarget) ? "test" : task.role || "implement"),
     };

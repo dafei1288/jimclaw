@@ -683,6 +683,11 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y ?? x,
     default: () => null,
   }),
+  /** 增量修改模式：Architect 标记需要重写的已有文件路径列表 */
+  modifyFilesToOverwrite: Annotation<string[] | null>({
+    reducer: (x, y) => y ?? x,
+    default: () => null,
+  }),
   /** 增量修改模式：原始任务契约 */
   previousContract: Annotation<TaskContract | null>({
     reducer: (x, y) => y ?? x,

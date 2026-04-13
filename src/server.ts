@@ -607,8 +607,9 @@ io.on("connection", (socket) => {
 
     // 4. 读取已有文件内容（排除 node_modules、dist、.git、audit 等）
     const existingFiles: Record<string, string> = {};
-    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw"]);
+    const skipDirs = new Set(["node_modules", ".git", "dist", "audit", ".jimclaw", "target", "checkpoints", "__pycache__", ".mvn"]);
     const skipFiles = new Set(["boulder.json", "trace-index.json", "token-usage.json", "fp_status.json", "fp_trend.json"]);
+    const skipExtensions = new Set([".class", ".jar", ".pyc", ".pyo", ".o", ".a", ".so", ".exe", ".bin", ".pid"]);
     async function scanDir(dir: string, base: string) {
       let entries;
       try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return; }
@@ -617,7 +618,9 @@ io.on("connection", (socket) => {
         const rel = base ? `${base}/${entry.name}` : entry.name;
         if (entry.isDirectory()) {
           await scanDir(path.join(dir, entry.name), rel);
-        } else if (!skipFiles.has(entry.name) && !entry.name.endsWith(".pid")) {
+        } else if (!skipFiles.has(entry.name)) {
+          const ext = path.extname(entry.name).toLowerCase();
+          if (skipExtensions.has(ext)) continue;
           try {
             const content = await fs.readFile(path.join(dir, entry.name), "utf-8");
             existingFiles[rel] = content;

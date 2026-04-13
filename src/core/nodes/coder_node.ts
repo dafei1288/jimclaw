@@ -1234,13 +1234,17 @@ async function reconcileCompletedFilesFromDisk(
   codeLogEntries: FileChangeEntry[],
   currentRetry: number,
   protocol: JimClawState["executionProtocol"],
-  qaFailedFiles?: string[]
+  qaFailedFiles?: string[],
+  modifyFilesToOverwrite?: string[] | null
 ): Promise<void> {
   const qaFailedSet = new Set((qaFailedFiles || []).map(f => f.replace(/\\/g, "/")));
+  const overwriteSet = new Set(modifyFilesToOverwrite || []);
   for (const task of subTasks) {
     if (task.status === "completed") continue;
     // 不要从磁盘恢复本轮 QA 标记为失败的文件——它们需要重新生成
     if (qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"))) continue;
+    // 不要从磁盘恢复增量修改模式中标记为需要重写的文件
+    if (overwriteSet.has(task.fileTarget)) continue;
 
     const recovered = await tryLoadValidatedDiskOutput(workspace, task.fileTarget, filesContent, protocol);
     if (!recovered.ok) continue;
@@ -1284,15 +1288,16 @@ export async function coderNode(
 
   // ── 增量修改模式：从磁盘加载已有文件到 filesContent ──
   if (state.existingFiles && Object.keys(state.existingFiles).length > 0) {
+    const overwriteSet = new Set(state.modifyFilesToOverwrite || []);
     for (const [relPath, content] of Object.entries(state.existingFiles)) {
-      if (!(relPath in filesContent)) {
+      if (!(relPath in filesContent) && !overwriteSet.has(relPath)) {
         filesContent[relPath] = content;
       }
     }
-    // 已有文件对应的 subTask 标记为 completed（如果 status 仍是 pending）
+    // 已有文件对应的 subTask 标记为 completed（排除 modifyFilesToOverwrite 中需要重写的文件）
     const existingSet = new Set(Object.keys(state.existingFiles));
     for (const task of subTasks as any[]) {
-      if (task.status === "pending" && existingSet.has(task.fileTarget)) {
+      if (task.status === "pending" && existingSet.has(task.fileTarget) && !overwriteSet.has(task.fileTarget)) {
         task.status = "completed";
       }
     }
@@ -1706,7 +1711,8 @@ export async function coderNode(
     codeLogEntries,
     currentRetry,
     state.executionProtocol,
-    state.qaFailures?.failedFiles
+    state.qaFailures?.failedFiles,
+    state.modifyFilesToOverwrite
   );
 
   // ── 全局超时保护：防止 Coder process 被外部杀死而丢失已完成的工作 ──
@@ -1718,9 +1724,12 @@ export async function coderNode(
   // ── 预写入阶段：所有有 scaffold 内容的文件直接写盘，跳过 LLM ──
   // 减少 LLM 调用次数，降低 Debug Failure 风险，加速执行
   const qaFailedSet_preWrite = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
+  const overwriteSet_preWrite = new Set(state.modifyFilesToOverwrite || []);
   let preWrittenCount = 0;
   for (const task of subTasks as any[]) {
     if (task.status === "completed") continue;
+    // 增量修改：需要重写的已有文件不走 scaffold 预写入
+    if (overwriteSet_preWrite.has(task.fileTarget)) continue;
     const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
     if (!scaffold) continue;
     const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
@@ -1744,7 +1753,7 @@ export async function coderNode(
     emit("thinking", "System", `[Coder] 预写入阶段：直接写盘 ${preWrittenCount} 个确定性文件，跳过 LLM`, {});
     await reconcileCompletedFilesFromDisk(
       WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry,
-      state.executionProtocol, state.qaFailures?.failedFiles
+      state.executionProtocol, state.qaFailures?.failedFiles, state.modifyFilesToOverwrite
     );
   }
 
@@ -1835,6 +1844,12 @@ export async function coderNode(
       }
       if (completedFiles.length > 0) {
         prompt += `\n\n[已完成的文件列表 - 可安全 import]：\n${completedFiles.map(f => `- ${f}`).join("\n")}`;
+      }
+
+      // ── 增量修改模式：注入已有文件内容 + 修改指令 ──
+      const isOverwriteFile = state.modifyFilesToOverwrite?.includes(task.fileTarget);
+      if (isOverwriteFile && state.existingFiles?.[task.fileTarget]) {
+        prompt += `\n\n[增量修改 - 这是已有文件，需要基于现有代码进行修改]\n以下是当前文件内容，请在保留现有功能的基础上，添加用户要求的新功能：\n\`\`\`\n${state.existingFiles[task.fileTarget]}\n\`\`\``;
       }
 
       // P0-B：重试时注入当前文件内容，避免盲目重写丢失已有正确实现
@@ -2297,7 +2312,7 @@ CMD ["node", "dist/index.js"]`;
     }
   }
 
-  await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol, state.qaFailures?.failedFiles);
+  await reconcileCompletedFilesFromDisk(WORKSPACE, subTasks as any, filesContent, codeLogEntries, currentRetry, state.executionProtocol, state.qaFailures?.failedFiles, state.modifyFilesToOverwrite);
 
   // 清理重复的 jest/vitest 配置文件——优先保留 .cjs（确定性 scaffold 生成的），删除 .js/.ts（LLM 额外生成的）
   const configFiles = Object.keys(filesContent).map(f => f.replace(/\\/g, "/"));
