@@ -1791,6 +1791,15 @@ export async function coderNode(
     for (const task of getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
+      // 3. 增量修改保护：overwrite 文件在 round 0 已成功写入，后续重试不再碰
+      if (currentRetry > 0 && state.modifyFilesToOverwrite?.includes(task.fileTarget)) {
+        // 磁盘上已有内容说明 round 0 已成功，跳过
+        const diskContent = filesContent[task.fileTarget];
+        if (diskContent && diskContent.trim().length > 0) {
+          task.status = "completed";
+          continue;
+        }
+      }
       if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) {
         emit("thinking", "System", `[Coder] 首轮核心阶段暂缓 ${task.fileTarget}，等待阶段验证后再补齐外围文件`, { task });
         continue;
@@ -1849,7 +1858,7 @@ export async function coderNode(
       // ── 增量修改模式：注入已有文件内容 + 修改指令 ──
       const isOverwriteFile = state.modifyFilesToOverwrite?.includes(task.fileTarget);
       if (isOverwriteFile && state.existingFiles?.[task.fileTarget]) {
-        prompt += `\n\n[增量修改 - 这是已有文件，需要基于现有代码进行修改]\n以下是当前文件内容，请在保留现有功能的基础上，添加用户要求的新功能：\n\`\`\`\n${state.existingFiles[task.fileTarget]}\n\`\`\``;
+        prompt += `\n\n[增量修改 - 这是已有文件，需要基于现有代码进行修改]\n以下是当前文件完整内容，请在保留现有所有功能的基础上，添加用户要求的新功能。\n⚠️ 你必须输出完整的文件内容（包含原有代码 + 新增代码），不要只输出新增的函数或片段！\n\n当前文件内容：\n\`\`\`\n${state.existingFiles[task.fileTarget]}\n\`\`\``;
       }
 
       // P0-B：重试时注入当前文件内容，避免盲目重写丢失已有正确实现
@@ -1989,7 +1998,9 @@ CMD ["node", "dist/index.js"]`;
       const fileFailedByQa = qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"));
       // 配置文件（Cargo.toml, go.mod, pom.xml 等）即使被 QA 标记也始终使用 scaffold
       const isProtectedConfig = isStructuralConfigFile(task.fileTarget) && Boolean(deterministicScaffold);
-      const scaffoldAllowed = Boolean(deterministicScaffold) && (!fileFailedByQa || isProtectedConfig);
+      // 增量修改：overwrite 文件必须走 LLM，不用 scaffold
+      const isOverwriteTarget = state.modifyFilesToOverwrite?.includes(task.fileTarget);
+      const scaffoldAllowed = !isOverwriteTarget && Boolean(deterministicScaffold) && (!fileFailedByQa || isProtectedConfig);
       let generationSource: FileChangeEntry["generationSource"] | undefined;
       let extractResult: { isValid: boolean; code: string; error?: string } | undefined = undefined;
       if (scaffoldAllowed) {
@@ -2030,6 +2041,18 @@ CMD ["node", "dist/index.js"]`;
                   const writtenTarget = normalizeWriteTarget(targetMatch?.[1] || "");
                   if (writtenTarget === task.fileTarget.replace(/\\/g, "/")) {
                     fileWrittenByTool = true;
+                    // 增量修改完整性检查：overwrite 文件写入后，校验是否比原文件短太多
+                    if (isOverwriteTarget && state.existingFiles?.[task.fileTarget]) {
+                      const originalLen = state.existingFiles[task.fileTarget].length;
+                      try {
+                        const freshContent = require('fs').readFileSync(path.join(WORKSPACE, task.fileTarget), "utf-8");
+                        if (freshContent.length < originalLen * 0.5 && freshContent.length < 100) {
+                          emit("thinking", "System", `[Coder] ⚠️ overwrite 完整性告警：${task.fileTarget} 写入 ${freshContent.length} 字符 < 原文件 ${originalLen} 字符，可能不完整`, {});
+                          fileWrittenByTool = false;
+                          toolError = `增量修改写入不完整：文件只有 ${freshContent.length} 字符，但原文件有 ${originalLen} 字符。必须输出完整文件内容（包含原有代码+新增代码），不能只写新增部分！`;
+                        }
+                      } catch { /* 忽略读取失败 */ }
+                    }
                   } else if (writtenTarget) {
                     unauthorizedWriteTargets.add(writtenTarget);
                     toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
