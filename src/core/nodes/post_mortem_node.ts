@@ -136,8 +136,27 @@ export async function postMortemNode(
     // 保留最多 20 条经验（防止无限增长）
     const sections = existing.split("\n---\n");
     const header = sections[0];
-    const entries = sections.slice(1);
-    const trimmedEntries = entries.slice(-19); // 保留最近 19 条 + 本次 1 条 = 20 条
+    let entries = sections.slice(1);
+
+    // 去重：与本次同语言+同结果+同重试次数的旧条目只保留最新一条
+    const thisFingerprint = `${lang}|${isSuccessful ? "ok" : "fail"}|round=${round}`;
+    entries = entries.filter(e => {
+      const fp = [
+        (e.match(/语言\/框架\*?: (.+)/)?.[1] || ""),
+        e.includes("✅ 成功") ? "ok" : "fail",
+        e.match(/重试次数\*?: (\d+)/)?.[0] || "",
+      ].join("|");
+      return fp !== thisFingerprint;
+    });
+
+    // 失败优先：失败条目排前面，成功条目排后面
+    const failEntries = entries.filter(e => e.includes("❌ 失败"));
+    const okEntries = entries.filter(e => e.includes("✅ 成功"));
+
+    // 保留：失败全部保留（最多10条），成功保留最近10条
+    const keptFails = failEntries.slice(-10);
+    const keptOks = okEntries.slice(-9); // +本次1条=10
+    const trimmedEntries = [...keptFails, ...keptOks];
 
     const newContent = header + "\n---\n" + trimmedEntries.join("\n---\n") + entry;
     await fs.writeFile(knowledgePath, newContent, "utf-8");

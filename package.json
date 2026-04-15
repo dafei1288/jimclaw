@@ -4,7 +4,7 @@
   "description": "JimClaw 是一个借鉴了 Claude Code, OpenClaw 和 OpenCode 设计理念的智能体系统。它旨在通过拟人化的角色设定、执着的循环迭代（Sisyphus 协议）以及基于复盘的自我进化，实现高度自主的代码开发与维护。",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test tests/core/pure-functions.test.js",
     "test:core": "node --experimental-test-isolation=none --test tests/core/*.test.js",
     "executor:sidecar": "powershell.exe -ExecutionPolicy Bypass -File scripts/executor-sidecar.ps1",
     "executor:sidecar:node": "npx ts-node src/executor/sidecar.ts",
