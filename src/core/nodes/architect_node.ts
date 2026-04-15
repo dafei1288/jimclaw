@@ -500,6 +500,16 @@ function buildFrontendSpec(targetStack: { language: string; framework: string; t
       sourceDir: "frontend",
     };
   }
+  if (fw === "React") {
+    return {
+      language: "TypeScript",
+      framework: "React",
+      buildCommand: "cd frontend && npm run build",
+      testCommand: "cd frontend && npx vitest run",
+      outputDir: "frontend/dist",
+      sourceDir: "frontend",
+    };
+  }
   return undefined;
 }
 

@@ -2951,9 +2951,18 @@ function tryExternalScaffoldProvider(
     const { findScaffoldProvider, getScaffoldProviderById } = require("../scaffolds") as typeof import("../scaffolds");
     // 前端文件：使用前端 scaffold provider
     if (normalizedTarget.startsWith("frontend/")) {
-      const feProvider = getScaffoldProviderById("vue-typescript");
+      // 根据架构师决定的前端框架选择 scaffold
+      const feFramework = state.spec?.framework?.toLowerCase() || "";
+      const feProviderId = feFramework.includes("react") ? "react-typescript" : "vue-typescript";
+      const feProvider = getScaffoldProviderById(feProviderId);
       if (feProvider && feProvider.canHandle(ctx, normalizedTarget)) {
         return feProvider.generate(ctx, normalizedTarget);
+      }
+      // fallback: try the other frontend provider
+      const fallbackId = feProviderId === "react-typescript" ? "vue-typescript" : "react-typescript";
+      const fallbackProvider = getScaffoldProviderById(fallbackId);
+      if (fallbackProvider && fallbackProvider.canHandle(ctx, normalizedTarget)) {
+        return fallbackProvider.generate(ctx, normalizedTarget);
       }
       return null;
     }

@@ -167,7 +167,55 @@ export async function postMortemNode(
     await AuditLogger.log(WORKSPACE, "Post Mortem", `**Warning:** 写入 KNOWLEDGE.md 失败: ${e.message}`);
   }
 
-  // ── 5. 更新会议纪要 ──
+  // ── 5. 失败时自动检测并追加 FP 条目 ──
+  if (!isSuccessful) {
+    try {
+      const fpPath = path.resolve(process.cwd(), "FAILURE_PATTERNS.md");
+      let fpContent = "";
+      try { fpContent = await fs.readFile(fpPath, "utf-8"); } catch {}
+      if (fpContent) {
+        // 检测是否是已知模式
+        const knownPatterns = [...fpContent.matchAll(/## FP-(\d+)/g)].map(m => m[1]);
+        const nextNum = Math.max(...knownPatterns.map(Number), 0) + 1;
+        const fpId = `FP-${String(nextNum).padStart(3, "0")}`;
+
+        // 简单模式匹配：看根因是否已经在 FP 库中
+        const rootCause = guessRootCause(state);
+        const isKnownFailure = rootCause && fpContent.includes(rootCause.slice(0, 30));
+
+        if (!isKnownFailure && rootCause) {
+          // 新的未知失败模式 → 追加 FP 条目
+          const tags = [];
+          if (lang.includes("python")) tags.push("python");
+          else if (lang.includes("java")) tags.push("java");
+          else if (lang.includes("go")) tags.push("go");
+          else if (lang.includes("rust")) tags.push("rust");
+          else tags.push("typescript");
+          tags.push(state.lastFailedNode || "unknown");
+
+          const newEntry = `
+---
+
+## ${fpId}: ${rootCause.slice(0, 60)}
+
+- **症状**: ${failureAnalysis || "见 KNOWLEDGE.md 最近条目"}
+- **根因**: ${rootCause}
+- **修复**: 待人工分析确认
+- **预防**: 待确认
+- **首次发现**: ${new Date().toISOString().slice(0, 10)}, ${path.basename(WORKSPACE)}
+- **标签**: ${[...new Set(tags)].join(", ")}
+`;
+          await fs.appendFile(fpPath, newEntry, "utf-8");
+          await AuditLogger.log(WORKSPACE, "Post Mortem", `**新失败模式检测:** ${fpId} — ${rootCause.slice(0, 50)}`);
+        }
+      }
+    } catch (e: any) {
+      // FP 检测失败不应阻塞
+      await AuditLogger.log(WORKSPACE, "Post Mortem", `**Warning:** FP 自动检测失败: ${e.message}`);
+    }
+  }
+
+  // ── 6. 更新会议纪要 ──
   const meetingSummary = isSuccessful
     ? `复盘：成功，retryCount=${round}，${filesCreated}文件`
     : `复盘：失败，retryCount=${round}，${failureAnalysis.slice(0, 50)}`;

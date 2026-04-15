@@ -20,6 +20,7 @@ import "./gin_go"; // side-effect: auto-registers
 import "./spring_java"; // side-effect: auto-registers
 import "./axum_rust"; // side-effect: auto-registers
 import "./vue_typescript"; // side-effect: auto-registers
+import "./react_typescript"; // side-effect: auto-registers
 
 let initialized = false;
 

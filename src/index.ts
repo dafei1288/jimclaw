@@ -396,6 +396,69 @@ async function main() {
     return;
   }
 
+  // ── 跨 run Token 费用汇总 ──
+  if (args[0] === "--cost") {
+    const workspaceRoot = path.resolve("workspace");
+    const fs = await import("fs/promises");
+    const dirs = (await fs.readdir(workspaceRoot)).filter(d => d.startsWith("run_"));
+    const runs: Array<{ dir: string; totalCost: number; calls: number; totalTokens: number; byAgent: Record<string, any> }> = [];
+    let grandCost = 0, grandCalls = 0, grandTokens = 0;
+    const today = new Date().toISOString().slice(0, 10);
+    let todayCost = 0, todayCalls = 0;
+
+    for (const d of dirs) {
+      try {
+        const raw = await fs.readFile(path.join(workspaceRoot, d, "token-usage.json"), "utf-8");
+        const tu = JSON.parse(raw);
+        const s = tu.summary || {};
+        if (!s.calls) continue;
+        const entry = { dir: d, totalCost: s.totalCost || 0, calls: s.calls, totalTokens: s.totalTokens || 0, byAgent: s.byAgent || {} };
+        runs.push(entry);
+        grandCost += entry.totalCost;
+        grandCalls += entry.calls;
+        grandTokens += entry.totalTokens;
+        // Check if today
+        const ts = parseInt(d.replace("run_", ""));
+        const runDate = new Date(ts).toISOString().slice(0, 10);
+        if (runDate === today) { todayCost += entry.totalCost; todayCalls += entry.calls; }
+      } catch { /* skip */ }
+    }
+
+    runs.sort((a, b) => b.totalCost - a.totalCost);
+
+    console.log("\n============================================================");
+    console.log("  📊 跨 Run Token 费用汇总");
+    console.log("============================================================");
+    console.log(`  总 Run 数: ${runs.length}  |  总调用: ${grandCalls}  |  总 Tokens: ${grandTokens.toLocaleString()}`);
+    console.log(`  总费用: $${grandCost.toFixed(3)}  |  今日: ${todayCalls} 调用, $${todayCost.toFixed(3)}`);
+    console.log("------------------------------------------------------------");
+
+    // By agent summary
+    const agentTotals: Record<string, { calls: number; tokens: number; cost: number }> = {};
+    for (const r of runs) {
+      for (const [agent, stats] of Object.entries(r.byAgent)) {
+        if (!agentTotals[agent]) agentTotals[agent] = { calls: 0, tokens: 0, cost: 0 };
+        agentTotals[agent].calls += (stats as any).calls || 0;
+        agentTotals[agent].tokens += (stats as any).totalTokens || 0;
+        agentTotals[agent].cost += (stats as any).totalCost || 0;
+      }
+    }
+    console.log("  各 Agent 汇总:");
+    for (const [agent, t] of Object.entries(agentTotals).sort((a, b) => b[1].cost - a[1].cost)) {
+      console.log(`    ${agent}: ${t.calls} 调用, ${t.tokens.toLocaleString()} tokens, $${t.cost.toFixed(3)}`);
+    }
+    console.log("------------------------------------------------------------");
+
+    // Top 5 most expensive runs
+    console.log("  费用最高的 5 次 Run:");
+    for (const r of runs.slice(0, 5)) {
+      const agents = Object.entries(r.byAgent).map(([a, s]) => `${a}:${(s as any).calls}`).join(", ");
+      console.log(`    ${r.dir}: $${r.totalCost.toFixed(3)} (${r.calls} 调用) [${agents}]`);
+    }
+    console.log("============================================================\n");
+    return;
+  }
+
   if (args[0] === "--watch" || args[0] === "--watch-latest") {
     const intervalIndex = args.indexOf("--interval-ms");
     const maxWaitIndex = args.indexOf("--max-wait-ms");
