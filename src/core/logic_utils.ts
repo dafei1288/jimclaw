@@ -40,6 +40,7 @@ import {
   ExecutionPlanFile,
   ExecutionPlanTask,
   ExecutionProtocolFileContract,
+  ApiContract,
   ProtocolFileRole,
   ProtocolPatch,
   ProductSpec,
@@ -47,7 +48,9 @@ import {
   RuntimeStateSnapshot,
   RepairPlan,
   SolutionProtocol,
+  SprintPlan,
   TaskContract,
+  TechSpec,
   TechnologyDecision,
   ValidationFailureType,
   ValidationReport,
@@ -754,6 +757,74 @@ export function buildProductSpec(userGoal: string, contract: TaskContract | null
     })),
     nonGoals: [],
   };
+}
+
+export function buildSprintPlans(args: {
+  productSpec: ProductSpec | null | undefined;
+  apiContract: ApiContract | null | undefined;
+  spec: Partial<TechSpec> | null | undefined;
+}): SprintPlan[] {
+  const product = args.productSpec;
+  if (!product) return [];
+
+  const criteria = product.acceptanceCriteria || [];
+  const hasUi = criteria.some((item) => item.verificationKind === "ui");
+  const hasApi = criteria.some((item) => item.verificationKind === "api");
+  const allAcceptanceIds = criteria.map((item) => item.id);
+  const foundationAcceptanceIds = criteria
+    .filter((item) => ["build", "deploy", "unit"].includes(item.verificationKind))
+    .map((item) => item.id);
+
+  const plans: SprintPlan[] = [{
+    id: "SP-1",
+    title: "可运行骨架与健康检查",
+    goal: "应用可以安装、启动，并通过基础健康检查",
+    userStoryIds: product.userStories.slice(0, 1).map((item) => item.id),
+    acceptanceCriteriaIds: foundationAcceptanceIds,
+    deliverables: ["可运行应用", "基础测试", "健康检查"],
+    allowedScope: ["package.json", "tsconfig.json", "src/", "tests/", "Dockerfile", "docker-compose.yml"],
+    dependencies: [],
+    estimatedComplexity: "small",
+    doneWhen: ["测试命令通过", "健康检查可访问"],
+  }];
+
+  if (hasApi || hasUi) {
+    plans.push({
+      id: "SP-2",
+      title: "核心用户路径闭环",
+      goal: "完成用户最重要的 API/UI 纵向路径",
+      userStoryIds: product.userStories.map((item) => item.id),
+      acceptanceCriteriaIds: allAcceptanceIds,
+      deliverables: [
+        hasApi ? "核心 API 行为" : "",
+        hasUi ? "核心页面交互" : "",
+      ].filter(Boolean),
+      allowedScope: ["src/", "tests/", "frontend/", "public/"],
+      dependencies: ["SP-1"],
+      estimatedComplexity: "medium",
+      doneWhen: criteria.map((item) => item.description),
+    });
+  }
+
+  const hasWriteEndpoint = (args.apiContract?.endpoints || []).some((endpoint) =>
+    ["POST", "PUT", "PATCH", "DELETE"].includes(String(endpoint.method || "").toUpperCase())
+  );
+  if (hasWriteEndpoint && criteria.length > 2) {
+    plans.push({
+      id: "SP-3",
+      title: "写操作与回归验收",
+      goal: "完成核心写操作并回归用户验收",
+      userStoryIds: product.userStories.map((item) => item.id),
+      acceptanceCriteriaIds: allAcceptanceIds,
+      deliverables: ["写操作 API", "错误处理", "回归测试"],
+      allowedScope: ["src/", "tests/", "frontend/", "public/"],
+      dependencies: ["SP-2"],
+      estimatedComplexity: "medium",
+      doneWhen: criteria.map((item) => item.description),
+    });
+  }
+
+  return plans.filter((plan) => plan.id === "SP-1" || plan.acceptanceCriteriaIds.length > 0);
 }
 
 export function buildRequirementProtocol(contract: TaskContract | null | undefined): RequirementProtocol {
