@@ -25,6 +25,7 @@ import { verifierNode } from "./nodes/verifier_node";
 import { evaluatorNode } from "./nodes/evaluator_node";
 import { qaNode } from "./nodes/qa_node";
 import { deployNode } from "./nodes/deploy_node";
+import { releaseGateNode } from "./nodes/release_gate_node";
 import { postMortemNode } from "./nodes/post_mortem_node";
 import { persistenceNode } from "./nodes/persistence_node";
 import { architectMediationNode } from "./nodes/architect_mediation_node";
@@ -154,8 +155,15 @@ export function getQaNextNode(
   return "fix_plan";
 }
 
-export function getDeployNextNode(state: JimClawState): "qa" | "post_mortem" {
+export function getDeployNextNode(state: JimClawState): "qa" | "release_gate" {
   if (state.deploymentStatus?.status === "failed" && state.validationReport?.failureType === "runtime_gap") {
+    return "qa";
+  }
+  return "release_gate";
+}
+
+export function getReleaseGateNextNode(state: JimClawState): "qa" | "post_mortem" {
+  if (state.validationReport?.blocking || state.lastFailedNode === "release_gate") {
     return "qa";
   }
   return "post_mortem";
@@ -366,6 +374,7 @@ export async function createJimClawGraph(agents: {
     .addNode("evaluator", withNodeGuard("evaluator", (s) => evaluatorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("qa", withNodeGuard("qa", (s) => qaNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("deploy", withNodeGuard("deploy", (s) => deployNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
+    .addNode("release_gate", withNodeGuard("release_gate", (s) => releaseGateNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("post_mortem", withNodeGuard("post_mortem", (s) => postMortemNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("persistence", withNodeGuard("persistence", (s) => persistenceNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("architect_mediation", withNodeGuard("architect_mediation", (s) => architectMediationNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -391,6 +400,7 @@ export async function createJimClawGraph(agents: {
     qa: "qa",
     qa_resume_router: "qa",
     deploy: "deploy",
+    release_gate: "release_gate",
     post_mortem: "post_mortem",
     persistence: "persistence",
     architect_mediation: "architect_mediation",
@@ -453,6 +463,7 @@ export async function createJimClawGraph(agents: {
     fix_plan: "fix_plan",
     architect_mediation: "architect_mediation",
     deploy: "deploy",
+    release_gate: "release_gate",
     post_mortem: "post_mortem",
     persistence: "persistence",
     __end__: END,
@@ -540,6 +551,11 @@ export async function createJimClawGraph(agents: {
     agent_pending: "agent_pending",
   });
   workflow.addConditionalEdges("deploy", routeWithAgentPending((s) => getDeployNextNode(s)), {
+    qa: "qa",
+    release_gate: "release_gate",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("release_gate", routeWithAgentPending((s) => getReleaseGateNextNode(s)), {
     qa: "qa",
     post_mortem: "post_mortem",
     agent_pending: "agent_pending",
