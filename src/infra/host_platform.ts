@@ -219,29 +219,22 @@ class HostPlatformImpl {
   private async _startBackgroundWindows(opts: {
     command: string; cwd: string; stdoutLog: string; stderrLog: string; env?: Record<string, string>;
   }): Promise<number> {
-    const escapedCmd = opts.command.replace(/'/g, "''");
-    const escapedWorkspace = opts.cwd.replace(/'/g, "''");
+    const quote = (value: string) => `'${String(value || "").replace(/'/g, "''")}'`;
     const envVars = opts.env
-      ? Object.entries(opts.env).map(([k, v]) => `$env:${k}='${v}'`).join("; ")
+      ? Object.entries(opts.env).map(([k, v]) => `$env:${k}=${quote(v)}`).join("; ")
       : "";
-
-    const ps = [
-      "powershell",
-      "-NoProfile",
-      "-Command",
-      [
-        `"`,
-        `$pidPath='${opts.stdoutLog.replace(/\.log$/, ".pid").replace(/\\/g, "\\\\")}'`,
-        `$stdoutLogPath='${opts.stdoutLog.replace(/\\/g, "\\\\")}'`,
-        `$stderrLogPath='${opts.stderrLog.replace(/\\/g, "\\\\")}'`,
-        `New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($pidPath)) | Out-Null`,
-        envVars ? `${envVars}; ` : "",
-        `$p = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c','${escapedCmd}' -WorkingDirectory '${escapedWorkspace}' -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath -PassThru`,
-        `Set-Content -Path $pidPath -Value $p.Id`,
-        `Write-Output $p.Id`,
-        `"`,
-      ].join(" "),
-    ].join(" ");
+    const script = [
+      `$pidPath=${quote(opts.stdoutLog.replace(/\.log$/, ".pid"))}`,
+      `$stdoutLogPath=${quote(opts.stdoutLog)}`,
+      `$stderrLogPath=${quote(opts.stderrLog)}`,
+      `New-Item -ItemType Directory -Force -Path ([System.IO.Path]::GetDirectoryName($pidPath)) | Out-Null`,
+      envVars || "",
+      `$p = Start-Process -FilePath 'cmd.exe' -ArgumentList @('/d','/s','/c',${quote(opts.command)}) -WorkingDirectory ${quote(opts.cwd)} -RedirectStandardOutput $stdoutLogPath -RedirectStandardError $stderrLogPath -WindowStyle Hidden -PassThru`,
+      `Set-Content -Path $pidPath -Value $p.Id`,
+      `Write-Output $p.Id`,
+    ].filter(Boolean).join("; ");
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    const ps = `powershell -NoProfile -ExecutionPolicy Bypass -EncodedCommand ${encoded}`;
 
     const result = await this.exec(ps, { timeout: 10000 });
     const pid = parseInt(result.stdout.trim(), 10);
@@ -278,17 +271,18 @@ class HostPlatformImpl {
    * 用 PID 杀进程
    */
   async killProcess(pid: number): Promise<boolean> {
+    if (this.os === "windows") {
+      const result = await this.exec(`taskkill /PID ${pid} /T /F`, { timeout: 5000 });
+      return result.ok || /SUCCESS|成功/i.test(`${result.stdout}\n${result.stderr}`);
+    }
+
     try {
       process.kill(pid);
       return true;
     } catch {
       // 进程可能已退出
       try {
-        if (this.os === "windows") {
-          await this.exec(`taskkill /PID ${pid} /F`, { timeout: 5000 });
-        } else {
-          await this.exec(`kill -9 ${pid}`, { timeout: 5000 });
-        }
+        await this.exec(`kill -9 ${pid}`, { timeout: 5000 });
         return true;
       } catch {
         return false;

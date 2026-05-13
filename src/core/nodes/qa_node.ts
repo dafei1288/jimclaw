@@ -8,6 +8,8 @@ import {
   buildValidationReport,
   buildSystemContext,
   extractFailureEvidence,
+  hasPendingTasksInActiveSprintScope,
+  isTaskInActiveSprintScope,
   writeMeetingNote
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
@@ -329,10 +331,14 @@ export async function qaNode(
 
   // 1. 如果完全没有错误，且之前的 Issue 都已解决，则直接通过
   const openIssues = (state.issueTracker || []).filter(i => i.status === 'open');
-  const hasPendingTasks = (state.subTasks || []).some((task) => task.status !== "completed");
+  const pendingTasksInActiveSprint = (state.subTasks || []).filter((task) =>
+    task.status !== "completed" &&
+    isTaskInActiveSprintScope(state, task.fileTarget)
+  );
+  const hasPendingTasks = hasPendingTasksInActiveSprintScope(state);
   if (!failureEvidence.hasBlockingFailure && hasPendingTasks && !hostEnvironmentBlocked) {
     const noteId = `note-qa-r${round}`;
-    const pendingCount = state.subTasks.filter((task) => task.status !== "completed").length;
+    const pendingCount = pendingTasksInActiveSprint.length;
     const resumedFromCheckpoint = Boolean(state.validationCheckpointRequested);
     const summary = resumedFromCheckpoint
       ? `QA 第${round}轮：阶段验证通过，恢复 coder 完成剩余 ${pendingCount} 个文件`
@@ -344,7 +350,7 @@ export async function qaNode(
 - 说明：当前核心骨架已可通过验证，但仍存在待补齐文件，因此恢复 coder 继续实现，不进入 deploy。
 
 ## 待完成文件
-${state.subTasks.filter((task) => task.status !== "completed").map((task) => `- ${task.fileTarget}`).join("\n") || "无"}
+${pendingTasksInActiveSprint.map((task) => `- ${task.fileTarget}`).join("\n") || "无"}
 `;
     const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "qa", round, summary, fullContent);
     const validationReport = buildValidationReport([], { status: "pass", blocking: false });

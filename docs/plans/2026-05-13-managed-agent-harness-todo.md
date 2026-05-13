@@ -18,6 +18,7 @@
 - [x] 新增 `evaluator_node`。
 - [x] 支持 `command` check，第一版可复用 `terminal` 输出。
 - [x] 支持 `http` check，使用 `host.httpGet()`，不依赖 curl。
+- [x] HTTP check 前启动临时 runtime，并在检查后清理，避免未启动服务导致 `ECONNREFUSED` 假失败。
 - [ ] 支持 `file` check，用于确认构建产物、关键文件和静态页面。
 - [x] `EvaluationResult` 必须包含 evidence；没有 evidence 的 pass 无效。
 - [x] `verifier -> qa` 调整为 `verifier -> evaluator -> qa`。
@@ -40,6 +41,7 @@
 - [x] 失败修复必须绑定 `EvaluationResult.failedChecks`。
 - [x] 修复 scope 只覆盖当前 sprint。
 - [x] 修复后必须回到 evaluator 复测，不得直接进入下一个 sprint。
+- [x] `fixPlan`/`mediationDirectives` 明确授权的修复目标可绕过陈旧依赖死锁。
 - [ ] 连续相同 failed check 达到阈值时，转 `architect_mediation`。
 
 ## P1: Session Event 事实源
@@ -75,6 +77,8 @@
 ## P2: Builder 从文件任务转向 sprint 执行
 
 - [ ] `SubTask[]` 保留但不再作为主协作对象。
+- [x] Coder 只处理当前 Sprint 范围内任务，未来 Sprint 文件保持 pending，不再误判为阻塞失败。
+- [x] SprintContract 生成时纳入当前 Sprint 文件的传递依赖，并支持当前 Sprint 通过后推进下一 Sprint。
 - [ ] Builder 根据 `SprintContract.builderPlan` 生成内部任务。
 - [ ] `filesToCreate` 改为 `suggestedFiles`，不再是唯一真相源。
 - [ ] 如果 Builder 需要新增文件，生成 `scopeChangeRequest`。

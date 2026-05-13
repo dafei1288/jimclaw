@@ -313,6 +313,240 @@ test("coder prompt includes active sprint contract context", async () => {
   }
 });
 
+test("coder skips future sprint files instead of treating them as blocking failures", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "完成当前 Sprint 文件",
+        filesLikelyTouched: ["src/current.ts"],
+        implementationSteps: ["实现当前文件"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/current.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 1,
+      },
+      status: "agreed",
+    }],
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/current.ts", "public/future.html"],
+    },
+    subTasks: [
+      {
+        id: "task-current",
+        description: "current",
+        fileTarget: "src/current.ts",
+        dependencies: [],
+        contextRequirement: "",
+        status: "pending",
+      },
+      {
+        id: "task-future",
+        description: "future",
+        fileTarget: "public/future.html",
+        dependencies: [],
+        contextRequirement: "",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请实现\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            return { content: "```typescript\nexport const current = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason, "");
+    assert.deepEqual(attemptedTargets, ["src/current.ts"]);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/current.ts").status, "completed");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "public/future.html").status, "pending");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder does not deadlock when only future sprint files remain pending", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "完成当前 Sprint 文件",
+        filesLikelyTouched: ["src/current.ts"],
+        implementationSteps: ["实现当前文件"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/current.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 1,
+      },
+      status: "agreed",
+    }],
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/current.ts", "public/future.html"],
+    },
+    code: JSON.stringify({ "src/current.ts": "export const current = true;\n" }),
+    subTasks: [
+      {
+        id: "task-current",
+        description: "current",
+        fileTarget: "src/current.ts",
+        dependencies: [],
+        contextRequirement: "",
+        status: "completed",
+      },
+      {
+        id: "task-future",
+        description: "future",
+        fileTarget: "public/future.html",
+        dependencies: [],
+        contextRequirement: "",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            throw new Error("future sprint files must not be sent to coder");
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason, "");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "public/future.html").status, "pending");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("coder executes fixPlan target even when stale dependencies are not completed", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const state = createBaseState({
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/app.ts", "public/index.html"],
+    },
+    fixPlan: [{
+      fileTarget: "src/app.ts",
+      diagnosis: "src/app.ts 被陈旧 public/index.html 依赖阻塞",
+      proposedChange: "直接实现 app，不再等待静态页面文件",
+      qaApproval: "approved",
+    }],
+    subTasks: [
+      {
+        id: "task-ui",
+        description: "future ui",
+        fileTarget: "public/index.html",
+        dependencies: [],
+        contextRequirement: "",
+        status: "pending",
+      },
+      {
+        id: "task-app",
+        description: "app",
+        fileTarget: "src/app.ts",
+        dependencies: ["public/index.html"],
+        contextRequirement: "",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请修复\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            return { content: "```typescript\nimport express from \"express\";\nconst app = express();\nexport default app;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason, "");
+    assert.equal(attemptedTargets.includes("src/app.ts"), true);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/app.ts").status, "completed");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder regression harness is ready for snapshot consistency checks", () => {
   assert.equal(true, true);
 });

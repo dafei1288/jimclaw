@@ -422,10 +422,18 @@ test("qa checkpoint replay preserves failure evidence for decision replay", () =
   assert.equal(replayState.lastFailedNode, "coder");
 });
 
-test("failure evidence detection catches verifier, deploy and coder-block markers", () => {
+test("failure evidence detection catches verifier, evaluator, release gate, deploy and coder-block markers", () => {
   const verifier = extractFailureEvidence("[Verifier 预检失败]\n测试文件 tests/setup.test.ts 未找到断言", null, "");
   assert.equal(verifier.hasBlockingFailure, true);
   assert.equal(verifier.verifierFailed, true);
+
+  const evaluator = extractFailureEvidence("[Evaluator 验收失败]\nSP-1 验收失败：CHK-HTTP-1", null, "");
+  assert.equal(evaluator.hasBlockingFailure, true);
+  assert.equal(evaluator.evaluatorFailed, true);
+
+  const releaseGate = extractFailureEvidence("[ReleaseGate 阻塞]\n前端验收缺少 UI 证据", null, "");
+  assert.equal(releaseGate.hasBlockingFailure, true);
+  assert.equal(releaseGate.releaseGateFailed, true);
 
   const deploy = extractFailureEvidence("some output\n[部署验证失败] 无法访问", { status: "failed" }, "");
   assert.equal(deploy.hasBlockingFailure, true);

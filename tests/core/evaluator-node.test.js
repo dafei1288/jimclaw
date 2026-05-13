@@ -76,6 +76,63 @@ test("evaluator passes an http check with concrete evidence", async () => {
   }
 });
 
+test("evaluator starts a temporary runtime before http checks when deploy has not run", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  const originalStartBackground = host.startBackground;
+  const originalKillProcess = host.killProcess;
+  let started = false;
+  let killedPid = 0;
+  host.startBackground = async (opts) => {
+    started = true;
+    assert.equal(opts.command, "npm start");
+    assert.equal(opts.env.PORT, "4101");
+    return 12345;
+  };
+  host.killProcess = async (pid) => {
+    killedPid = pid;
+    return true;
+  };
+  host.httpGet = async (url) => ({ statusCode: 200, body: `ok:${url}` });
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4101,
+        manifest: { services: [{ name: "app", port: 4101 }], environment: {}, sharedConfig: {} },
+        spec: { runCommand: "npm start" },
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-HTTP-1",
+          kind: "http",
+          description: "验证 GET /api/books",
+          method: "GET",
+          url: "/api/books",
+          expectedStatus: [200],
+        }])],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(started, true);
+    assert.equal(killedPid, 12345);
+    assert.equal(result.deploymentStatus, undefined);
+    assert.equal(result.hostRuntimePid, undefined);
+    assert.equal(result.evaluationResults[0].status, "pass");
+  } finally {
+    host.httpGet = originalHttpGet;
+    host.startBackground = originalStartBackground;
+    host.killProcess = originalKillProcess;
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("evaluator http failure records suspected files and validation report", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

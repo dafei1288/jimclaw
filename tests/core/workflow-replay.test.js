@@ -212,6 +212,51 @@ test("managed harness routing can be disabled for verifier and deploy compatibil
   }), true), "release_gate");
 });
 
+test("qa routing advances to next sprint before deploy when managed sprint remains unevaluated", () => {
+  const next = getQaNextNode(createBaseState({
+    isDone: true,
+    activeSprintId: "SP-1",
+    sprintPlans: [
+      {
+        id: "SP-1",
+        title: "基础骨架",
+        goal: "基础验证通过",
+        userStoryIds: ["US-1"],
+        acceptanceCriteriaIds: ["AC-1"],
+        deliverables: ["骨架"],
+        allowedScope: ["src/"],
+        dependencies: [],
+        estimatedComplexity: "small",
+        doneWhen: ["测试通过"],
+      },
+      {
+        id: "SP-2",
+        title: "核心路径",
+        goal: "完成用户路径",
+        userStoryIds: ["US-1"],
+        acceptanceCriteriaIds: ["AC-2"],
+        deliverables: ["页面"],
+        allowedScope: ["src/", "public/"],
+        dependencies: ["SP-1"],
+        estimatedComplexity: "medium",
+        doneWhen: ["页面可访问"],
+      },
+    ],
+    evaluationResults: [{
+      sprintId: "SP-1",
+      status: "pass",
+      summary: "SP-1 通过",
+      checks: [],
+      missingEvidence: [],
+    }],
+    issueTracker: [],
+    protocolFailures: [],
+    testResults: "PASS",
+  }), 5);
+
+  assert.equal(next, "sprint_contract");
+});
+
 test("deploy routing sends early executor startup environment failures to post_mortem instead of qa runtime loop", () => {
   const { getDeployNextNode } = require("../../src/core/graph");
 

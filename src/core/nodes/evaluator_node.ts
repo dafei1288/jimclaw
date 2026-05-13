@@ -1,7 +1,9 @@
 import { EvaluationCheck, EvaluationResult, Issue, JimClawState, SprintContract } from "../graph_types";
+import * as path from "path";
 import {
   buildRepairPlan,
   buildValidationReport,
+  execInContainer,
   extractFailureEvidence,
   getActiveSprintContract,
   writeMeetingNote,
@@ -42,6 +44,111 @@ function resolveEvaluationUrl(state: JimClawState, rawUrl?: string): { url: stri
   }
 
   return { url: value, error: "缺少部署地址或已分配端口，无法执行 HTTP 验收" };
+}
+
+function hasHttpChecks(checks: EvaluationCheck[]): boolean {
+  return checks.some((check) => check.kind === "http");
+}
+
+function resolveEvaluationPort(state: JimClawState): number {
+  const rawPort = state.allocatedHostPort || state.manifest?.services?.[0]?.port;
+  const port = typeof rawPort === "number" ? rawPort : parseInt(String(rawPort || ""), 10);
+  return Number.isFinite(port) && port > 0 && port < 65535 ? port : 0;
+}
+
+function getEvaluatorRuntimePaths(workspace: string) {
+  const runtimeDir = path.join(workspace, ".jimclaw");
+  return {
+    runtimeDir,
+    pidPath: path.join(runtimeDir, "evaluator.pid"),
+    stdoutLogPath: path.join(runtimeDir, "evaluator.stdout.log"),
+    stderrLogPath: path.join(runtimeDir, "evaluator.stderr.log"),
+  };
+}
+
+async function stopPreviousEvaluatorRuntime(workspace: string): Promise<void> {
+  const paths = getEvaluatorRuntimePaths(workspace);
+  const pidText = await host.readFile(paths.pidPath).catch(() => "");
+  const pid = parseInt(pidText.trim(), 10);
+  if (pid > 0 && host.isProcessRunning(pid)) {
+    await host.killProcess(pid);
+  }
+}
+
+function buildContainerEvaluatorLaunchCommand(runCmd: string, port: number): string {
+  const effectiveRunCmd = `PORT=${port} HOST=0.0.0.0 ${runCmd}`;
+  const escapedRunCmd = effectiveRunCmd.replace(/"/g, '\\"');
+  return [
+    "mkdir -p /tmp/jimclaw",
+    "if [ -f /tmp/jimclaw/evaluator.pid ]; then kill $(cat /tmp/jimclaw/evaluator.pid) 2>/dev/null || true; fi",
+    ": > /tmp/jimclaw/evaluator.log",
+    `nohup sh -c "${escapedRunCmd}" >/tmp/jimclaw/evaluator.log 2>&1 & echo $! >/tmp/jimclaw/evaluator.pid`,
+  ].join("; ");
+}
+
+async function waitForRuntime(origin: string): Promise<void> {
+  for (let attempt = 0; attempt < 10; attempt++) {
+    const result = await host.httpGet(origin, 1000);
+    if (result.statusCode || (result.error && !/ECONNREFUSED|connect/i.test(result.error))) return;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+}
+
+async function ensureRuntimeForHttpChecks(
+  state: JimClawState,
+  WORKSPACE: string,
+  checks: EvaluationCheck[]
+): Promise<{ statePatch: Partial<JimClawState>; cleanup?: () => Promise<void> }> {
+  if (!hasHttpChecks(checks)) return { statePatch: {} };
+  if (state.deploymentStatus?.status === "running" && /^https?:\/\//i.test(state.deploymentStatus.url || "")) {
+    return { statePatch: {} };
+  }
+
+  const port = resolveEvaluationPort(state);
+  if (!port) return { statePatch: {} };
+
+  const runCmd = state.spec?.runCommand || state.executionProtocol?.runtime?.startCommand || "npm start";
+  const origin = `http://127.0.0.1:${port}`;
+
+  if (state.executionBackend === "host") {
+    await stopPreviousEvaluatorRuntime(WORKSPACE);
+    const paths = getEvaluatorRuntimePaths(WORKSPACE);
+    const pid = await host.startBackground({
+      command: runCmd,
+      cwd: WORKSPACE,
+      stdoutLog: paths.stdoutLogPath,
+      stderrLog: paths.stderrLogPath,
+      env: { PORT: String(port), HOST: "0.0.0.0" },
+    });
+    await host.writeFile(paths.pidPath, String(pid));
+    await waitForRuntime(origin);
+    return {
+      statePatch: {
+        deploymentStatus: { status: "running", url: origin },
+        hostRuntimePid: pid,
+        hostRuntimeLogPath: paths.stdoutLogPath,
+      },
+      cleanup: async () => {
+        await host.killProcess(pid);
+      },
+    };
+  }
+
+  if (state.containerId) {
+    const containerPort = state.manifest?.services?.[0]?.port || port;
+    await execInContainer(state.containerId, buildContainerEvaluatorLaunchCommand(runCmd, containerPort));
+    await waitForRuntime(origin);
+    return {
+      statePatch: {
+        deploymentStatus: { status: "running", url: origin },
+      },
+      cleanup: async () => {
+        await execInContainer(state.containerId || "", "if [ -f /tmp/jimclaw/evaluator.pid ]; then kill $(cat /tmp/jimclaw/evaluator.pid) 2>/dev/null || true; fi");
+      },
+    };
+  }
+
+  return { statePatch: {} };
 }
 
 function inferEndpointStem(check: EvaluationCheck): string {
@@ -225,9 +332,16 @@ export async function evaluatorNode(
     return result;
   }
 
+  const plannedChecks = contract.evaluatorPlan.checks || [];
   const checks = [];
-  for (const check of contract.evaluatorPlan.checks || []) {
-    checks.push(await runEvaluationCheck(state, check, contract));
+  const runtime = await ensureRuntimeForHttpChecks(state, WORKSPACE, plannedChecks);
+  try {
+    const evaluationState = { ...state, ...runtime.statePatch };
+    for (const check of plannedChecks) {
+      checks.push(await runEvaluationCheck(evaluationState, check, contract));
+    }
+  } finally {
+    await runtime.cleanup?.();
   }
 
   const status = checks.length > 0 && checks.every((check) => check.status === "pass" && hasConcreteEvidence(check))

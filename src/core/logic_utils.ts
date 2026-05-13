@@ -71,6 +71,8 @@ export function extractFailureEvidence(
 ) {
   const normalized = String(testOutput || "");
   const verifierFailed = normalized.includes("[Verifier 预检失败]");
+  const evaluatorFailed = normalized.includes("[Evaluator 验收失败]");
+  const releaseGateFailed = normalized.includes("[ReleaseGate 阻塞]");
   const deploymentFailed = normalized.includes("[部署验证失败]") || deploymentStatus?.status === "failed";
   const coderBlocked = normalized.startsWith("[Coder 阻塞失败]") || (Boolean(blockedReason) && /Coder 阻塞/i.test(String(blockedReason || "")));
   const commandFailed = /command failed with exit code\s+[1-9]/i.test(normalized);
@@ -83,6 +85,8 @@ export function extractFailureEvidence(
 
   const hasBlockingFailure =
     verifierFailed ||
+    evaluatorFailed ||
+    releaseGateFailed ||
     deploymentFailed ||
     coderBlocked ||
     commandFailed ||
@@ -95,6 +99,8 @@ export function extractFailureEvidence(
 
   return {
     verifierFailed,
+    evaluatorFailed,
+    releaseGateFailed,
     deploymentFailed,
     coderBlocked,
     commandFailed,
@@ -5360,6 +5366,41 @@ export function getActiveSprintContract(
   return contracts.find((item) => item.sprintId === id && item.status === "agreed") || null;
 }
 
+export function getPassedSprintIds(
+  state: Pick<JimClawState, "evaluationResults">
+): Set<string> {
+  return new Set(
+    (state.evaluationResults || [])
+      .filter((result) => result.status === "pass")
+      .map((result) => result.sprintId)
+  );
+}
+
+export function getNextRunnableSprintPlan(
+  state: Pick<JimClawState, "activeSprintId" | "sprintPlans" | "evaluationResults">
+): SprintPlan | null {
+  const sprintPlans = state.sprintPlans || [];
+  if (!sprintPlans.length) return null;
+
+  const passedSprintIds = getPassedSprintIds(state);
+  const activeSprint = sprintPlans.find((plan) => plan.id === state.activeSprintId);
+  if (activeSprint && !passedSprintIds.has(activeSprint.id)) return activeSprint;
+
+  return sprintPlans.find((plan) =>
+    !passedSprintIds.has(plan.id) &&
+    (plan.dependencies || []).every((dependency) => passedSprintIds.has(dependency))
+  ) || sprintPlans.find((plan) => !passedSprintIds.has(plan.id)) || activeSprint || sprintPlans[0];
+}
+
+export function hasUnpassedSprintPlans(
+  state: Pick<JimClawState, "sprintPlans" | "evaluationResults">
+): boolean {
+  const sprintPlans = state.sprintPlans || [];
+  if (!sprintPlans.length) return false;
+  const passedSprintIds = getPassedSprintIds(state);
+  return sprintPlans.some((plan) => !passedSprintIds.has(plan.id));
+}
+
 export function buildSprintContractContext(state: JimClawState): string {
   const contract = getActiveSprintContract(state);
   if (!contract) return "";
@@ -5395,6 +5436,24 @@ export function isFileAllowedBySprintContract(fileTarget: string, contract: Spri
     if (!scope) return false;
     return scope.endsWith("/") ? target.startsWith(scope) : target === scope;
   });
+}
+
+export function isTaskInActiveSprintScope(
+  state: Pick<JimClawState, "activeSprintId" | "sprintContracts">,
+  fileTarget: string
+): boolean {
+  const contract = getActiveSprintContract(state);
+  if (!contract) return true;
+  return isFileAllowedBySprintContract(fileTarget, contract);
+}
+
+export function hasPendingTasksInActiveSprintScope(
+  state: Pick<JimClawState, "activeSprintId" | "sprintContracts" | "subTasks">
+): boolean {
+  return (state.subTasks || []).some((task) =>
+    task.status !== "completed" &&
+    isTaskInActiveSprintScope(state, task.fileTarget)
+  );
 }
 
 export function buildCoderExecutionContext(

@@ -1,17 +1,56 @@
 import { EvaluationCheck, JimClawState, SprintContract, SprintPlan } from "../graph_types";
-import { writeMeetingNote } from "../logic_utils";
+import { getNextRunnableSprintPlan, writeMeetingNote } from "../logic_utils";
 import { appendSessionEvent } from "../../utils/session_events";
 
 function findActiveSprint(state: JimClawState): SprintPlan | null {
-  const sprintPlans = state.sprintPlans || [];
-  const activeSprintId = state.activeSprintId || sprintPlans[0]?.id || "";
-  return sprintPlans.find((sprint) => sprint.id === activeSprintId) || sprintPlans[0] || null;
+  return getNextRunnableSprintPlan(state);
+}
+
+function normalizeScopePath(value: string): string {
+  return String(value || "").replace(/\\/g, "/").replace(/^\.\/+/, "");
+}
+
+function scopeAllowsFile(fileTarget: string, scopeEntry: string): boolean {
+  const file = normalizeScopePath(fileTarget);
+  const scope = normalizeScopePath(scopeEntry);
+  if (!scope) return false;
+  return scope.endsWith("/") ? file.startsWith(scope) : file === scope;
+}
+
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean).map(normalizeScopePath)));
 }
 
 function normalizeAllowedFiles(state: JimClawState, sprint: SprintPlan): string[] {
+  const subTasks = state.subTasks || [];
   const filesToCreate = state.spec?.filesToCreate || [];
-  if (filesToCreate.length > 0) return Array.from(new Set(filesToCreate));
-  return Array.from(new Set(sprint.allowedScope || []));
+  const candidateFiles = unique([
+    ...filesToCreate,
+    ...subTasks.map((task) => task.fileTarget),
+  ]);
+  const sprintScope = sprint.allowedScope || [];
+  const taskByFile = new Map(subTasks.map((task) => [normalizeScopePath(task.fileTarget), task]));
+  const allowed = new Set(
+    candidateFiles.filter((file) => sprintScope.some((scope) => scopeAllowsFile(file, scope)))
+  );
+
+  const queue = Array.from(allowed);
+  while (queue.length > 0) {
+    const file = queue.shift() as string;
+    const task = taskByFile.get(file);
+    for (const dependency of task?.dependencies || []) {
+      const normalized = normalizeScopePath(dependency);
+      if (!normalized || allowed.has(normalized)) continue;
+      if (candidateFiles.includes(normalized) || taskByFile.has(normalized)) {
+        allowed.add(normalized);
+        queue.push(normalized);
+      }
+    }
+  }
+
+  if (allowed.size > 0) return Array.from(allowed);
+  if (filesToCreate.length > 0) return unique(filesToCreate);
+  return unique(sprint.allowedScope || []);
 }
 
 function buildDefaultEvaluationChecks(state: JimClawState, sprint: SprintPlan): EvaluationCheck[] {

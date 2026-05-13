@@ -14,6 +14,7 @@ import {
   getExecutionDependencyStem,
   isAggregateExecutionServiceFile,
   isFileAllowedBySprintContract,
+  isTaskInActiveSprintScope,
   logPrefix,
   writeMeetingNote,
   persistWriteRecoveryIntent,
@@ -1329,26 +1330,25 @@ export async function coderNode(
   const localRetryAttempts: Record<string, number> = {};
   const localRetryArtifacts: Record<string, string> = {};
 
-  const blockOutOfSprintScope = (task: { fileTarget: string; status?: string; lastError?: string }) => {
+  const skipOutOfSprintScope = (task: { fileTarget: string; status?: string; lastError?: string }) => {
     if (!activeSprintContract || isFileAllowedBySprintContract(task.fileTarget, activeSprintContract)) return false;
-    const message = `SprintContract 范围外文件：${task.fileTarget} 不在 ${activeSprintContract.sprintId} 的允许文件范围内`;
-    task.status = "failed";
-    task.lastError = message;
-    blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${message}`;
-    blockedFailedFiles = [task.fileTarget];
-    coderValidationReport = buildValidationReport([{
-      blocking: true,
-      summary: message,
-      file: task.fileTarget,
-      evidence: [`allowedFiles=${activeSprintContract.agreedScope.allowedFiles.join(", ")}`],
-    }], {
-      failureType: "planning_gap",
-      status: "fail",
-      blocking: true,
-    });
-    coderRepairPlan = buildRepairPlan(coderValidationReport);
-    emit("thinking", "System", `[Coder] ${message}`, { task });
+    emit(
+      "thinking",
+      "System",
+      `[Coder] 暂缓 ${task.fileTarget}，等待后续 Sprint；当前 ${activeSprintContract.sprintId} 允许范围: ${activeSprintContract.agreedScope.allowedFiles.join(", ")}`,
+      { task }
+    );
     return true;
+  };
+  const hasRepairOverrideForTask = (task: { fileTarget: string }) => {
+    const normalized = normalizeTaskFileTarget(task.fileTarget);
+    return (
+      (state.fixPlan || []).some((plan) => normalizeTaskFileTarget(plan.fileTarget) === normalized) ||
+      (state.mediationDirectives || []).some((directive: any) =>
+        normalizeTaskFileTarget(directive.file || "") === normalized ||
+        (directive.file === "*" && /resume|repair|fix|create|implement|authorize/i.test(String(directive.action || "")))
+      )
+    );
   };
 
   const runDeterministicParallelBatch = async (): Promise<{ progressed: boolean; stop: boolean }> => {
@@ -1764,7 +1764,7 @@ export async function coderNode(
   let preWrittenCount = 0;
   for (const task of subTasks as any[]) {
     if (task.status === "completed") continue;
-    if (blockOutOfSprintScope(task)) break;
+    if (skipOutOfSprintScope(task)) continue;
     // 增量修改：需要重写的已有文件不走 scaffold 预写入
     if (overwriteSet_preWrite.has(task.fileTarget)) continue;
     const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
@@ -1828,7 +1828,7 @@ export async function coderNode(
     for (const task of getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
-      if (blockOutOfSprintScope(task)) break;
+      if (skipOutOfSprintScope(task)) continue;
       // 3. 增量修改保护：overwrite 文件在 round 0 已成功写入，后续重试不再碰
       if (currentRetry > 0 && state.modifyFilesToOverwrite?.includes(task.fileTarget)) {
         // 磁盘上已有内容说明 round 0 已成功，跳过
@@ -1842,9 +1842,13 @@ export async function coderNode(
         emit("thinking", "System", `[Coder] 首轮核心阶段暂缓 ${task.fileTarget}，等待阶段验证后再补齐外围文件`, { task });
         continue;
       }
-      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) {
+      const hasRepairOverride = hasRepairOverrideForTask(task);
+      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent) && !hasRepairOverride) {
         emit("thinking", "System", `[Coder] 暂缓 ${task.fileTarget}，其依赖尚未完成: ${(task.dependencies || []).join(", ")}`, { task });
         continue;
+      }
+      if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent) && hasRepairOverride) {
+        emit("thinking", "System", `[Coder] ${task.fileTarget} 已被修复计划/仲裁授权，忽略陈旧依赖并直接执行`, { task });
       }
 
       const taskLocalAttempt = localRetryAttempts[task.fileTarget] || 0;
@@ -2403,7 +2407,10 @@ CMD ["node", "dist/index.js"]`;
   }
 
   if (!blockedReason) {
-    const pendingTasks = subTasks.filter((task) => task.status !== "completed");
+    const pendingTasks = subTasks.filter((task) =>
+      task.status !== "completed" &&
+      isTaskInActiveSprintScope(state, task.fileTarget)
+    );
     const hasLocalSelfHealInFlight = Object.keys(localRetryAttempts).length > 0;
     if (
       pendingTasks.length > 0 &&
@@ -2422,8 +2429,11 @@ CMD ["node", "dist/index.js"]`;
         });
         return `${task.fileTarget} <- ${unmet.join(", ") || "无可满足依赖"}`;
       });
-      blockedReason = `Coder 依赖死锁: ${deadlocked.join(" | ")}`;
-      blockedFailedFiles = pendingTasks.map((task) => task.fileTarget);
+      const blockingPendingTasks = pendingTasks.filter((task) => !hasRepairOverrideForTask(task));
+      if (blockingPendingTasks.length > 0) {
+        blockedReason = `Coder 依赖死锁: ${deadlocked.join(" | ")}`;
+        blockedFailedFiles = blockingPendingTasks.map((task) => task.fileTarget);
+      }
     }
   }
 

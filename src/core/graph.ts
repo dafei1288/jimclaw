@@ -6,7 +6,7 @@ import { ModelManager } from "../utils/models";
 import { JimClawState } from "./graph_types";
 import { getBeijingTime } from "../utils/common";
 import { getTemplateEngine } from "./template_engine";
-import { buildCheckpointMeta, buildRepairPlan, buildTraceIndex, buildValidationReport, extractFailureEvidence, recordNodeFailure, recoverWorkspaceFromWriteIntents, shouldPersistCheckpoint } from "./logic_utils";
+import { buildCheckpointMeta, buildRepairPlan, buildTraceIndex, buildValidationReport, extractFailureEvidence, hasPendingTasksInActiveSprintScope, hasUnpassedSprintPlans, recordNodeFailure, recoverWorkspaceFromWriteIntents, shouldPersistCheckpoint } from "./logic_utils";
 import { AuditLogger } from "../utils/audit";
 
 // 导入重构后的节点函数
@@ -124,7 +124,7 @@ function isHostEnvironmentBlocked(state: JimClawState): boolean {
 export function getQaNextNode(
   state: JimClawState,
   maxRetries: number
-): "approval" | "deploy" | "architect" | "env_guard" | "infra_setup" | "post_mortem" | "architect_mediation" | "fix_plan" | "coder" {
+): "approval" | "deploy" | "architect" | "env_guard" | "infra_setup" | "post_mortem" | "architect_mediation" | "fix_plan" | "coder" | "sprint_contract" {
   if (shouldPauseForAgentPending(state)) return "coder";
   const openIssues = (state.issueTracker || []).filter((issue: any) => issue.status === "open");
   const blockingProtocolFailures = (state.protocolFailures || []).filter((failure: any) => failure?.blocking);
@@ -133,6 +133,7 @@ export function getQaNextNode(
 
   if (state.resumeAfterValidation) return "coder";
   if (state.isDone && openIssues.length === 0 && blockingProtocolFailures.length === 0 && !failureEvidence.hasBlockingFailure) {
+    if (hasUnpassedSprintPlans(state)) return "sprint_contract";
     if (shouldRequireApproval(state, "deploy")) return "approval";
     return "deploy";
   }
@@ -496,7 +497,7 @@ export async function createJimClawGraph(agents: {
   workflow.addConditionalEdges("coder", routeWithAgentPending((s) => {
     if (s.blockedReason) return "qa";
     if (s.validationCheckpointRequested) return "env_guard";
-    const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
+    const hasPending = hasPendingTasksInActiveSprintScope(s);
     if (hasPending) return "coder";
     return "env_guard";
   }), { coder: "coder", env_guard: "env_guard", infra_setup: "infra_setup", qa: "qa", agent_pending: "agent_pending" });
@@ -504,7 +505,7 @@ export async function createJimClawGraph(agents: {
   workflow.addConditionalEdges("env_guard", routeWithAgentPending((s) => {
     if (s.envReady === false) return "qa";
     if (s.validationCheckpointRequested) return "infra_setup";
-    const hasPending = (s.subTasks || []).some((t: any) => t.status === "pending");
+    const hasPending = hasPendingTasksInActiveSprintScope(s);
     return hasPending ? "coder" : "infra_setup";
   }), { qa: "qa", coder: "coder", infra_setup: "infra_setup", agent_pending: "agent_pending" });
   workflow.addConditionalEdges("infra_setup", routeWithAgentPending((s) => getInfraNextNode(s)), {
@@ -540,6 +541,7 @@ export async function createJimClawGraph(agents: {
     architect_mediation: "architect_mediation",
     fix_plan: "fix_plan",
     coder: "coder",
+    sprint_contract: "sprint_contract",
     agent_pending: "agent_pending",
   });
 
