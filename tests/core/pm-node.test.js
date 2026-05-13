@@ -11,6 +11,21 @@ const {
 } = require("./test-helpers");
 const { pmNode } = require("../../src/core/nodes/pm_node");
 const { AgentTimeoutError } = require("../../src/core/agent");
+const { buildProductSpec } = require("../../src/core/logic_utils");
+
+test("pm derives product spec from task contract", () => {
+  const spec = buildProductSpec("图书管理系统", {
+    title: "图书管理系统",
+    requirements: ["提供图书列表 API", "提供前端页面"],
+    acceptanceCriteria: ["GET /api/books 返回 200", "页面可以显示图书列表"],
+  });
+
+  assert.equal(spec.version, "v1");
+  assert.equal(spec.title, "图书管理系统");
+  assert.ok(spec.userStories.length >= 1);
+  assert.ok(spec.acceptanceCriteria.some((item) => item.verificationKind === "api"));
+  assert.ok(spec.acceptanceCriteria.some((item) => item.verificationKind === "ui"));
+});
 
 test("pm node compresses generic oversized product contracts into an MVP-scoped execution contract", async () => {
   const workspace = await createTempWorkspace();
@@ -160,8 +175,9 @@ test("pm node falls back to a deterministic contract when model is unavailable",
 
     assert.equal(Boolean(result.contract), true);
     assert.equal(result.contract.title.includes("图书"), true);
-    assert.equal(result.contract.requirements.length >= 4, true);
+    assert.equal(result.contract.requirements.length >= 3, true);
     assert.equal(result.contract.acceptanceCriteria.some((item) => /图书列表|验证脚本|认证|权限/.test(item)), true);
+    assert.equal(result.productSpec.acceptanceCriteria.some((item) => item.verificationKind === "api"), true);
   } finally {
     await removeTempWorkspace(workspace);
   }

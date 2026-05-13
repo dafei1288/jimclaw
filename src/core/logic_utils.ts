@@ -42,6 +42,7 @@ import {
   ExecutionProtocolFileContract,
   ProtocolFileRole,
   ProtocolPatch,
+  ProductSpec,
   RequirementProtocol,
   RuntimeStateSnapshot,
   RepairPlan,
@@ -50,6 +51,7 @@ import {
   TechnologyDecision,
   ValidationFailureType,
   ValidationReport,
+  VerificationKind,
   ProjectRuntime,
   BackendFramework,
 } from "./graph_types";
@@ -721,6 +723,37 @@ function getPrimaryEntityStems(requirementProtocol: RequirementProtocol | null |
 function toCamelCase(value: string): string {
   const pascal = toPascalCase(value);
   return pascal ? pascal.charAt(0).toLowerCase() + pascal.slice(1) : "";
+}
+
+export function inferVerificationKind(text: string): VerificationKind {
+  const normalized = String(text || "").toLowerCase();
+  if (/页面|前端|界面|浏览器|点击|显示|表单|button|page|ui/i.test(text)) return "ui";
+  if (/api|http|get\s+\/|post\s+\/|put\s+\/|delete\s+\/|patch\s+\/|接口|端点|返回\s*\d{3}/i.test(text)) return "api";
+  if (/部署|启动|访问地址|health|健康检查|docker|容器/i.test(normalized)) return "deploy";
+  if (/测试|单元|npm test|pytest|go test|cargo test|验证脚本/i.test(text)) return "unit";
+  if (/构建|build|compile|tsc/i.test(text)) return "build";
+  return "manual";
+}
+
+export function buildProductSpec(userGoal: string, contract: TaskContract | null | undefined): ProductSpec {
+  const requirements = contract?.requirements || [];
+  const acceptanceCriteria = contract?.acceptanceCriteria || [];
+  return {
+    version: "v1",
+    title: contract?.title || userGoal || "未命名任务",
+    userGoal: userGoal || contract?.title || "",
+    userStories: requirements.map((requirement, index) => ({
+      id: `US-${index + 1}`,
+      story: requirement,
+      priority: "must" as const,
+    })),
+    acceptanceCriteria: acceptanceCriteria.map((criterion, index) => ({
+      id: `AC-${index + 1}`,
+      description: criterion,
+      verificationKind: inferVerificationKind(criterion),
+    })),
+    nonGoals: [],
+  };
 }
 
 export function buildRequirementProtocol(contract: TaskContract | null | undefined): RequirementProtocol {
