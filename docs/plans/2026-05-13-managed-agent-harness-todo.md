@@ -4,52 +4,52 @@
 
 ## P0: 先让协作契约进入主流程
 
-- [ ] 新增 `ProductSpec`、`SprintPlan`、`SprintContract`、`EvaluationResult` 类型和 Zod schema。
-- [ ] 在 `pm_node` 中从 `TaskContract` 派生 `ProductSpec`。
-- [ ] 新增 deterministic `buildSprintPlans()`，先覆盖 API/UI/部署三类验收。
-- [ ] 新增 `sprint_planner_node`，输出 `sprintPlans` 和 `activeSprintId`。
-- [ ] 新增 `sprint_contract_node`，在 Coder 动手前生成 `SprintContract`。
-- [ ] 将 `SprintContract` 注入 `coder_node` prompt。
-- [ ] 在 `coder_node` 中做轻量 scope guard，防止明显越界写文件。
-- [ ] 新增 `managedHarness.enabled` 配置开关。
+- [x] 新增 `ProductSpec`、`SprintPlan`、`SprintContract`、`EvaluationResult` 类型和 Zod schema。
+- [x] 在 `pm_node` 中从 `TaskContract` 派生 `ProductSpec`。
+- [x] 新增 deterministic `buildSprintPlans()`，先覆盖 API/UI/部署三类验收。
+- [x] 新增 `sprint_planner_node`，输出 `sprintPlans` 和 `activeSprintId`。
+- [x] 新增 `sprint_contract_node`，在 Coder 动手前生成 `SprintContract`。
+- [x] 将 `SprintContract` 注入 `coder_node` prompt。
+- [x] 在 `coder_node` 中做轻量 scope guard，防止明显越界写文件。
+- [x] 新增 `managedHarness.enabled` 配置开关。
 
 ## P0: Evaluator 取代“只读日志”的 QA 放行
 
-- [ ] 新增 `evaluator_node`。
-- [ ] 支持 `command` check，第一版可复用 `terminal` 输出。
-- [ ] 支持 `http` check，使用 `host.httpGet()`，不依赖 curl。
+- [x] 新增 `evaluator_node`。
+- [x] 支持 `command` check，第一版可复用 `terminal` 输出。
+- [x] 支持 `http` check，使用 `host.httpGet()`，不依赖 curl。
 - [ ] 支持 `file` check，用于确认构建产物、关键文件和静态页面。
-- [ ] `EvaluationResult` 必须包含 evidence；没有 evidence 的 pass 无效。
-- [ ] `verifier -> qa` 调整为 `verifier -> evaluator -> qa`。
-- [ ] QA 继续负责 issue 分类，但不再单独决定最终 release。
+- [x] `EvaluationResult` 必须包含 evidence；没有 evidence 的 pass 无效。
+- [x] `verifier -> qa` 调整为 `verifier -> evaluator -> qa`。
+- [x] QA 继续负责 issue 分类，但不再单独决定最终 release。
 
 ## P0: Release Gate 防伪成功
 
-- [ ] 新增 `release_gate_node`。
+- [x] 新增 `release_gate_node`。
 - [ ] 每个 must user story 必须有 passing sprint 覆盖。
-- [ ] 每个 acceptance criterion 必须有 evidence。
+- [x] 每个 acceptance criterion 必须有 evidence。
 - [ ] 前端需求存在时，根路径或 `/index.html` 必须返回 HTML。
 - [ ] API contract 中公开 GET 端点必须被实际访问。
 - [ ] `audit/Infrastructure.md` 和 `audit/Terminal.md` 中不得存在未解释 critical failure。
-- [ ] `deploy -> post_mortem` 改为 `deploy -> release_gate -> post_mortem`。
+- [x] `deploy -> post_mortem` 改为 `deploy -> release_gate -> post_mortem`。
 
 ## P1: Repair Contract 替换失败后盲修
 
-- [ ] 新增 `RepairContract` 类型。
-- [ ] `fix_plan_node` 兼容输出 `repairContracts`。
-- [ ] 失败修复必须绑定 `EvaluationResult.failedChecks`。
-- [ ] 修复 scope 只覆盖当前 sprint。
-- [ ] 修复后必须回到 evaluator 复测，不得直接进入下一个 sprint。
+- [x] 新增 `RepairContract` 类型。
+- [x] `fix_plan_node` 兼容输出 `repairContracts`。
+- [x] 失败修复必须绑定 `EvaluationResult.failedChecks`。
+- [x] 修复 scope 只覆盖当前 sprint。
+- [x] 修复后必须回到 evaluator 复测，不得直接进入下一个 sprint。
 - [ ] 连续相同 failed check 达到阈值时，转 `architect_mediation`。
 
 ## P1: Session Event 事实源
 
-- [ ] 新增 `src/utils/session_events.ts`。
-- [ ] 写入 `workspace/run_xxx/session/events.jsonl`。
-- [ ] `sprint_planner_node` 写 `sprint_plan` event。
-- [ ] `sprint_contract_node` 写 `sprint_contract` event。
-- [ ] `evaluator_node` 写 `evaluation_result` event。
-- [ ] `release_gate_node` 写 `release_decision` event。
+- [x] 新增 `src/utils/session_events.ts`。
+- [x] 写入 `workspace/run_xxx/session/events.jsonl`。
+- [x] `sprint_planner_node` 写 `sprint_plan` event。
+- [x] `sprint_contract_node` 写 `sprint_contract` event。
+- [x] `evaluator_node` 写 `evaluation_result` event。
+- [x] `release_gate_node` 写 `release_decision` event。
 - [ ] `trace-index.json` 聚合 session event summary。
 - [ ] Dashboard/TUI 展示 active sprint、current contract、latest evaluation。
 
@@ -90,14 +90,14 @@
 
 ## 测试 TODO
 
-- [ ] `tests/core/managed-harness-types.test.js`
-- [ ] `tests/core/sprint-planner.test.js`
-- [ ] `tests/core/sprint-planner-node.test.js`
-- [ ] `tests/core/sprint-contract-node.test.js`
-- [ ] `tests/core/evaluator-node.test.js`
-- [ ] `tests/core/release-gate-node.test.js`
-- [ ] `tests/core/session-events.test.js`
-- [ ] `tests/core/workflow-replay.test.js` 覆盖 legacy 和 managed harness 两条路由。
+- [x] `tests/core/managed-harness-types.test.js`
+- [x] `tests/core/sprint-planner.test.js`
+- [x] `tests/core/sprint-planner-node.test.js`
+- [x] `tests/core/sprint-contract-node.test.js`
+- [x] `tests/core/evaluator-node.test.js`
+- [x] `tests/core/release-gate-node.test.js`
+- [x] `tests/core/session-events.test.js`
+- [x] `tests/core/workflow-replay.test.js` 覆盖 legacy 和 managed harness 两条路由。
 - [ ] 增加真实 run fixture：前端 404 时 release gate 必须 fail。
 - [ ] 增加真实 run fixture：API health pass 但业务 endpoint fail 时 release gate 必须 fail。
 
