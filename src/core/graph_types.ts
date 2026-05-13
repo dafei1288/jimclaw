@@ -19,6 +19,186 @@ export const TaskContractSchema = z.object({
   acceptanceCriteria: z.array(z.string()),
 });
 
+export type VerificationKind = "api" | "ui" | "unit" | "build" | "deploy" | "manual";
+
+export const VerificationKindSchema = z.enum(["api", "ui", "unit", "build", "deploy", "manual"]);
+
+export interface ProductSpec {
+  version: "v1";
+  title: string;
+  userGoal: string;
+  userStories: Array<{
+    id: string;
+    story: string;
+    priority: "must" | "should" | "could";
+  }>;
+  acceptanceCriteria: Array<{
+    id: string;
+    description: string;
+    verificationKind: VerificationKind;
+  }>;
+  nonGoals: string[];
+}
+
+export const ProductSpecSchema = z.object({
+  version: z.literal("v1"),
+  title: z.string(),
+  userGoal: z.string(),
+  userStories: z.array(z.object({
+    id: z.string(),
+    story: z.string(),
+    priority: z.enum(["must", "should", "could"]),
+  })),
+  acceptanceCriteria: z.array(z.object({
+    id: z.string(),
+    description: z.string(),
+    verificationKind: VerificationKindSchema,
+  })),
+  nonGoals: z.array(z.string()),
+});
+
+export interface SprintPlan {
+  id: string;
+  title: string;
+  goal: string;
+  userStoryIds: string[];
+  acceptanceCriteriaIds: string[];
+  deliverables: string[];
+  allowedScope: string[];
+  dependencies: string[];
+  estimatedComplexity: "small" | "medium" | "large";
+  doneWhen: string[];
+}
+
+export const SprintPlanSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  goal: z.string(),
+  userStoryIds: z.array(z.string()),
+  acceptanceCriteriaIds: z.array(z.string()),
+  deliverables: z.array(z.string()),
+  allowedScope: z.array(z.string()),
+  dependencies: z.array(z.string()),
+  estimatedComplexity: z.enum(["small", "medium", "large"]),
+  doneWhen: z.array(z.string()),
+});
+
+export interface EvaluationCheck {
+  id: string;
+  kind: "command" | "http" | "playwright" | "file" | "unit" | "deploy";
+  description: string;
+  command?: string;
+  url?: string;
+  method?: string;
+  expectedStatus?: number[];
+  expectedText?: string;
+  targetFile?: string;
+}
+
+export const EvaluationCheckSchema = z.object({
+  id: z.string(),
+  kind: z.enum(["command", "http", "playwright", "file", "unit", "deploy"]),
+  description: z.string(),
+  command: z.string().optional(),
+  url: z.string().optional(),
+  method: z.string().optional(),
+  expectedStatus: z.array(z.number()).optional(),
+  expectedText: z.string().optional(),
+  targetFile: z.string().optional(),
+});
+
+export interface SprintContract {
+  version: "v1";
+  sprintId: string;
+  builderPlan: {
+    intent: string;
+    filesLikelyTouched: string[];
+    implementationSteps: string[];
+    selfChecks: string[];
+    assumptions: string[];
+  };
+  evaluatorPlan: {
+    checks: EvaluationCheck[];
+    requiredEvidence: string[];
+    passThreshold: "all" | "critical-only";
+    concerns: string[];
+  };
+  agreedScope: {
+    allowedFiles: string[];
+    forbiddenFiles: string[];
+    maxNewFiles?: number;
+  };
+  status: "draft" | "agreed" | "rejected";
+}
+
+export const SprintContractSchema = z.object({
+  version: z.literal("v1"),
+  sprintId: z.string(),
+  builderPlan: z.object({
+    intent: z.string(),
+    filesLikelyTouched: z.array(z.string()),
+    implementationSteps: z.array(z.string()),
+    selfChecks: z.array(z.string()),
+    assumptions: z.array(z.string()),
+  }),
+  evaluatorPlan: z.object({
+    checks: z.array(EvaluationCheckSchema),
+    requiredEvidence: z.array(z.string()),
+    passThreshold: z.enum(["all", "critical-only"]),
+    concerns: z.array(z.string()),
+  }),
+  agreedScope: z.object({
+    allowedFiles: z.array(z.string()),
+    forbiddenFiles: z.array(z.string()),
+    maxNewFiles: z.number().optional(),
+  }),
+  status: z.enum(["draft", "agreed", "rejected"]),
+});
+
+export interface EvaluationResult {
+  version: "v1";
+  sprintId: string;
+  status: "pass" | "fail";
+  checks: Array<{
+    checkId: string;
+    status: "pass" | "fail" | "skipped";
+    evidence: {
+      commandOutput?: string;
+      httpStatus?: number | null;
+      httpBodySnippet?: string;
+      screenshotPath?: string;
+      tracePath?: string;
+      fileSnippet?: string;
+      error?: string;
+    };
+    reproSteps: string[];
+    suspectedFiles: string[];
+  }>;
+  summary: string;
+}
+
+export const EvaluationResultSchema = z.object({
+  version: z.literal("v1"),
+  sprintId: z.string(),
+  status: z.enum(["pass", "fail"]),
+  checks: z.array(z.object({
+    checkId: z.string(),
+    status: z.enum(["pass", "fail", "skipped"]),
+    evidence: z.object({
+      commandOutput: z.string().optional(),
+      httpStatus: z.number().nullable().optional(),
+      httpBodySnippet: z.string().optional(),
+      screenshotPath: z.string().optional(),
+      tracePath: z.string().optional(),
+      fileSnippet: z.string().optional(),
+      error: z.string().optional(),
+    }),
+    reproSteps: z.array(z.string()),
+    suspectedFiles: z.array(z.string()),
+  })),
+  summary: z.string(),
+});
+
 /**
  * 技术方案：架构师下发给开发的实现指南
  */
@@ -652,6 +832,9 @@ export const JimClawState = Annotation.Root({
   contractSource: Annotation<PlanningSource>({
     reducer: (x, y) => y ?? x,
   }),
+  productSpec: Annotation<ProductSpec | null>({
+    reducer: (x, y) => y ?? x,
+  }),
   spec: Annotation<TechSpec | null>({
     reducer: (x, y) => y ?? x,
   }),
@@ -700,6 +883,18 @@ export const JimClawState = Annotation.Root({
   }),
   orchestrationSource: Annotation<PlanningSource>({
     reducer: (x, y) => y ?? x,
+  }),
+  sprintPlans: Annotation<SprintPlan[]>({
+    reducer: (x, y) => y !== undefined ? y : (x || []),
+  }),
+  activeSprintId: Annotation<string>({
+    reducer: (x, y) => y ?? x,
+  }),
+  sprintContracts: Annotation<SprintContract[]>({
+    reducer: (x, y) => y !== undefined ? y : (x || []),
+  }),
+  evaluationResults: Annotation<EvaluationResult[]>({
+    reducer: (x, y) => [...(x || []), ...(y || [])],
   }),
   retryCount: Annotation<number>({
     reducer: (x, y) => y ?? x,
