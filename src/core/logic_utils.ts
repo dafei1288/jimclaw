@@ -48,6 +48,7 @@ import {
   RuntimeStateSnapshot,
   RepairPlan,
   SolutionProtocol,
+  SprintContract,
   SprintPlan,
   TaskContract,
   TechSpec,
@@ -5351,6 +5352,51 @@ export function buildSystemContext(state: JimClawState): string[] {
   return lines;
 }
 
+export function getActiveSprintContract(
+  state: Pick<JimClawState, "activeSprintId" | "sprintContracts">
+): SprintContract | null {
+  const id = state.activeSprintId || "";
+  const contracts = state.sprintContracts || [];
+  return contracts.find((item) => item.sprintId === id && item.status === "agreed") || null;
+}
+
+export function buildSprintContractContext(state: JimClawState): string {
+  const contract = getActiveSprintContract(state);
+  if (!contract) return "";
+  return [
+    "## 当前 SprintContract（必须遵守）",
+    `Sprint: ${contract.sprintId}`,
+    `目标: ${contract.builderPlan.intent}`,
+    `允许文件: ${contract.agreedScope.allowedFiles.join(", ")}`,
+    `禁止文件: ${contract.agreedScope.forbiddenFiles.join(", ")}`,
+    "Evaluator 检查:",
+    ...contract.evaluatorPlan.checks.map((check) => `- ${check.id}: ${check.description}`),
+  ].join("\n");
+}
+
+function normalizeSprintScopePath(value: string): string {
+  return String(value || "").replace(/\\/g, "/").replace(/^\.\/+/, "");
+}
+
+export function isFileAllowedBySprintContract(fileTarget: string, contract: SprintContract): boolean {
+  const target = normalizeSprintScopePath(fileTarget);
+  const forbidden = contract.agreedScope.forbiddenFiles || [];
+  if (forbidden.some((entry) => {
+    const scope = normalizeSprintScopePath(entry);
+    return scope.endsWith("/") ? target.startsWith(scope) : target === scope;
+  })) {
+    return false;
+  }
+
+  const allowed = contract.agreedScope.allowedFiles || [];
+  if (allowed.length === 0) return true;
+  return allowed.some((entry) => {
+    const scope = normalizeSprintScopePath(entry);
+    if (!scope) return false;
+    return scope.endsWith("/") ? target.startsWith(scope) : target === scope;
+  });
+}
+
 export function buildCoderExecutionContext(
   state: JimClawState,
   currentTask?: { fileTarget?: string; dependencies?: string[]; contextRequirement?: string } | null
@@ -5378,6 +5424,12 @@ export function buildCoderExecutionContext(
   lines.push(
     `• 执行阶段:${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
   );
+
+  const sprintContractContext = buildSprintContractContext(state);
+  if (sprintContractContext) {
+    lines.push("");
+    lines.push(...sprintContractContext.split("\n"));
+  }
 
   // ── 增量修改模式标记 ──
   if (state.existingFiles && Object.keys(state.existingFiles).length > 0) {

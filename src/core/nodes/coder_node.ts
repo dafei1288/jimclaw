@@ -4,11 +4,16 @@ import * as ts from "typescript";
 import { JimClawState, FileChangeEntry, ConsensusProgress } from "../graph_types";
 import { AgentTimeoutError, BaseAgent } from "../agent";
 import {
+  buildRepairPlan,
   buildCoderExecutionContext,
+  buildSprintContractContext,
+  buildValidationReport,
   getProtocolFileContract,
+  getActiveSprintContract,
   getDeterministicTemplateScaffold,
   getExecutionDependencyStem,
   isAggregateExecutionServiceFile,
+  isFileAllowedBySprintContract,
   logPrefix,
   writeMeetingNote,
   persistWriteRecoveryIntent,
@@ -1285,6 +1290,8 @@ export async function coderNode(
 
   const subTasks = state.subTasks || [];
   const filesContent: Record<string, string> = JSON.parse(state.code || "{}");
+  const activeSprintContract = getActiveSprintContract(state);
+  const sprintContractContext = buildSprintContractContext(state);
 
   // ── 增量修改模式：从磁盘加载已有文件到 filesContent ──
   if (state.existingFiles && Object.keys(state.existingFiles).length > 0) {
@@ -1315,10 +1322,34 @@ export async function coderNode(
   const experimentalModelParallel = isExperimentalModelParallelEnabled(state);
   let blockedReason = "";
   let blockedFailedFiles: string[] = [];
+  let coderValidationReport = state.validationReport || null;
+  let coderRepairPlan = state.repairPlan || null;
   let validationCheckpointRequested = false;
   let validationCheckpointReason = "";
   const localRetryAttempts: Record<string, number> = {};
   const localRetryArtifacts: Record<string, string> = {};
+
+  const blockOutOfSprintScope = (task: { fileTarget: string; status?: string; lastError?: string }) => {
+    if (!activeSprintContract || isFileAllowedBySprintContract(task.fileTarget, activeSprintContract)) return false;
+    const message = `SprintContract 范围外文件：${task.fileTarget} 不在 ${activeSprintContract.sprintId} 的允许文件范围内`;
+    task.status = "failed";
+    task.lastError = message;
+    blockedReason = `Coder 阻塞失败: ${task.fileTarget} -> ${message}`;
+    blockedFailedFiles = [task.fileTarget];
+    coderValidationReport = buildValidationReport([{
+      blocking: true,
+      summary: message,
+      file: task.fileTarget,
+      evidence: [`allowedFiles=${activeSprintContract.agreedScope.allowedFiles.join(", ")}`],
+    }], {
+      failureType: "planning_gap",
+      status: "fail",
+      blocking: true,
+    });
+    coderRepairPlan = buildRepairPlan(coderValidationReport);
+    emit("thinking", "System", `[Coder] ${message}`, { task });
+    return true;
+  };
 
   const runDeterministicParallelBatch = async (): Promise<{ progressed: boolean; stop: boolean }> => {
     if (maxParallel <= 1 || blockedReason || validationCheckpointRequested) {
@@ -1328,6 +1359,7 @@ export async function coderNode(
     const prioritized = getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks;
     const readyTasks = prioritized.filter((task) => {
       if (task.status === "completed") return false;
+      if (activeSprintContract && !isFileAllowedBySprintContract(task.fileTarget, activeSprintContract)) return false;
       if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) return false;
       if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) return false;
       if ((localRetryAttempts[task.fileTarget] || 0) > 0) return false;
@@ -1515,6 +1547,7 @@ export async function coderNode(
     const prioritized = getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks;
     const readyTasks = prioritized.filter((task) => {
       if (task.status === "completed") return false;
+      if (activeSprintContract && !isFileAllowedBySprintContract(task.fileTarget, activeSprintContract)) return false;
       if (isCorePhaseActive(state, subTasks as any) && isCorePhaseDeferredFile(task.fileTarget)) return false;
       if (!areTaskDependenciesSatisfied(task, subTasks as any, filesContent)) return false;
       if ((localRetryAttempts[task.fileTarget] || 0) > 0) return false;
@@ -1537,7 +1570,10 @@ export async function coderNode(
     const taskTimeoutMs = getCoderTaskTimeoutMs(state, subTasks as any);
     const generationResults = await Promise.all(
       batch.map(async (task) => {
-        const prompt = `请实现 ${task.fileTarget}。\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}\n\n仅输出 markdown 代码块中的完整文件内容，不要调用 write_file 工具。`;
+        let prompt = `请实现 ${task.fileTarget}。\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}\n\n仅输出 markdown 代码块中的完整文件内容，不要调用 write_file 工具。`;
+        if (sprintContractContext) {
+          prompt += `\n\n${sprintContractContext}`;
+        }
         try {
           const coderResponse = await invokeCoderWithTaskTimeout({
             agent: agents.coder,
@@ -1728,6 +1764,7 @@ export async function coderNode(
   let preWrittenCount = 0;
   for (const task of subTasks as any[]) {
     if (task.status === "completed") continue;
+    if (blockOutOfSprintScope(task)) break;
     // 增量修改：需要重写的已有文件不走 scaffold 预写入
     if (overwriteSet_preWrite.has(task.fileTarget)) continue;
     const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
@@ -1791,6 +1828,7 @@ export async function coderNode(
     for (const task of getPrioritizedSubTasks(state, subTasks as any) as typeof subTasks) {
       // 2. 严格增量：跳过所有已完成且不在修复名单中的任务
       if (task.status === "completed") continue;
+      if (blockOutOfSprintScope(task)) break;
       // 3. 增量修改保护：overwrite 文件在 round 0 已成功写入，后续重试不再碰
       if (currentRetry > 0 && state.modifyFilesToOverwrite?.includes(task.fileTarget)) {
         // 磁盘上已有内容说明 round 0 已成功，跳过
@@ -1820,6 +1858,9 @@ export async function coderNode(
         ? `请修复 ${task.fileTarget}。\n\n[与QA协商后的修复方案（必须严格按此执行）]：\n- 根因：${fixPlanItem.diagnosis}\n- 具体修改：${fixPlanItem.proposedChange}${fixPlanItem.qaFeedback ? `\n- QA的纠正意见：${fixPlanItem.qaFeedback}` : ""}\n\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}`
         // 无协商计划：首轮正常实现
         : `请实现 ${task.fileTarget}。\n[任务规范摘要]\n${buildCompactTaskSpecSummary(state, task)}\n上下文：${task.contextRequirement}`;
+      if (sprintContractContext) {
+        prompt += `\n\n${sprintContractContext}`;
+      }
 
       // P0-A：注入 API 接口契约
       if (state.apiContract?.endpoints?.length) {
@@ -2424,6 +2465,10 @@ CMD ["node", "dist/index.js"]`;
         }
       : null,
     protocolFailures: blockedReason ? (state.protocolFailures || []) : [],
+    ...(blockedReason && coderValidationReport ? {
+      validationReport: coderValidationReport,
+      repairPlan: coderRepairPlan,
+    } : {}),
     lastFailedNode: blockedReason ? "coder" : "",
     lastFailureSummary: blockedReason ? blockedReason : "",
     failureFingerprint: blockedReason ? state.failureFingerprint : "",

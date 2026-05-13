@@ -223,6 +223,96 @@ test("coder prioritizes reopened files ahead of ordinary pending work", async ()
   }
 });
 
+test("coder prompt includes active sprint contract context", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let capturedPrompt = "";
+  let capturedBrief = [];
+  const state = createBaseState({
+    activeSprintId: "SP-2",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-2",
+      builderPlan: {
+        intent: "完成图书列表 API",
+        filesLikelyTouched: ["src/features/books.ts"],
+        implementationSteps: ["实现列表逻辑"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{
+          id: "CHK-HTTP-1",
+          kind: "http",
+          description: "验证 GET /api/books",
+          method: "GET",
+          url: "/api/books",
+          expectedStatus: [200],
+        }],
+        requiredEvidence: ["验证 GET /api/books"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/features/books.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 2,
+      },
+      status: "agreed",
+    }],
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/features/books.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-sprint-context",
+        description: "write sprint scoped feature",
+        fileTarget: "src/features/books.ts",
+        dependencies: [],
+        contextRequirement: "实现当前 Sprint 范围内的图书列表逻辑",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages, onEvent, options) {
+            capturedPrompt = messages[0]?.content || "";
+            capturedBrief = options?.brief || [];
+            return {
+              content: "```typescript\nexport const listBooks = () => [];\n```",
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const combinedContext = `${capturedPrompt}\n${capturedBrief.join("\n")}`;
+    assert.equal(result.subTasks[0].status, "completed");
+    assert.match(combinedContext, /当前 SprintContract/);
+    assert.match(combinedContext, /SP-2/);
+    assert.match(combinedContext, /完成图书列表 API/);
+    assert.match(combinedContext, /src\/features\/books\.ts/);
+    assert.match(combinedContext, /CHK-HTTP-1: 验证 GET \/api\/books/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder regression harness is ready for snapshot consistency checks", () => {
   assert.equal(true, true);
 });
