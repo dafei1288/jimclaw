@@ -15,6 +15,7 @@ import { architectNode } from "./nodes/architect_node";
 import { contractSyncNode } from "./nodes/contract_sync_node";
 import { approvalNode } from "./nodes/approval_node";
 import { orchestratorNode } from "./nodes/orchestrator_node";
+import { sprintPlannerNode } from "./nodes/sprint_planner_node";
 import { coderNode } from "./nodes/coder_node";
 import { envGuardNode } from "./nodes/env_guard_node";
 import { infraNode } from "./nodes/infra_node";
@@ -354,6 +355,7 @@ export async function createJimClawGraph(agents: {
       }
     })
     .addNode("orchestrator", withNodeGuard("orchestrator", (s) => orchestratorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
+    .addNode("sprint_planner", withNodeGuard("sprint_planner", (s) => sprintPlannerNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("coder", withNodeGuard("coder", (s) => coderNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("env_guard", withNodeGuard("env_guard", (s) => envGuardNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("infra_setup", withNodeGuard("infra_setup", (s) => infraNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -375,6 +377,7 @@ export async function createJimClawGraph(agents: {
     contract_sync: "contract_sync",
     approval: "approval",
     orchestrator: "orchestrator",
+    sprint_planner: "sprint_planner",
     coder: "coder",
     env_guard: "env_guard",
     infra_setup: "infra_setup",
@@ -433,6 +436,7 @@ export async function createJimClawGraph(agents: {
     architect: "architect",
     contract_sync: "contract_sync",
     orchestrator: "orchestrator",
+    sprint_planner: "sprint_planner",
     coder: "coder",
     env_guard: "env_guard",
     infra_setup: "infra_setup",
@@ -446,7 +450,11 @@ export async function createJimClawGraph(agents: {
     persistence: "persistence",
     __end__: END,
   });
-  workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => "env_guard"), {
+  workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => "sprint_planner"), {
+    sprint_planner: "sprint_planner",
+    agent_pending: "agent_pending",
+  });
+  workflow.addConditionalEdges("sprint_planner", routeWithAgentPending(() => "env_guard"), {
     env_guard: "env_guard",
     agent_pending: "agent_pending",
   });
