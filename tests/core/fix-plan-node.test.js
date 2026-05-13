@@ -19,6 +19,111 @@ function createRateLimitError(message = "429 余额不足或无可用资源包,�
   return error;
 }
 
+test("fix plan creates repair contract from failed evaluation result", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const failingFile = "src/routes/books.ts";
+  await fs.mkdir(path.join(workspace, "src", "routes"), { recursive: true });
+  await fs.writeFile(path.join(workspace, failingFile), "export default {};\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 1,
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "完成图书列表 API",
+        filesLikelyTouched: [failingFile],
+        implementationSteps: ["修复路由"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{
+          id: "CHK-HTTP-1",
+          kind: "http",
+          description: "验证 GET /api/books",
+          method: "GET",
+          url: "/api/books",
+          expectedStatus: [200],
+        }],
+        requiredEvidence: ["验证 GET /api/books"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: [failingFile],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 2,
+      },
+      status: "agreed",
+    }],
+    evaluationResults: [{
+      version: "v1",
+      sprintId: "SP-1",
+      status: "fail",
+      checks: [{
+        checkId: "CHK-HTTP-1",
+        status: "fail",
+        evidence: { httpStatus: 500, httpBodySnippet: "server error" },
+        reproSteps: ["GET /api/books"],
+        suspectedFiles: [failingFile],
+      }],
+      summary: "SP-1 验收失败：CHK-HTTP-1",
+    }],
+    subTasks: [
+      {
+        id: "task-route",
+        fileTarget: failingFile,
+        description: "实现图书路由",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() { return { name: "星河" }; },
+      async chat() {
+        return {
+          content: '{"overall_diagnosis":"HTTP 验收失败","items":[{"file":"src/routes/books.ts","issue_id":"BUG-EVAL-SP-1-CHK-HTTP-1","my_understanding":"路由没有正确返回 200","proposed_change":"修复 GET /api/books 的路由响应","confidence":"high"}]}',
+        };
+      },
+    },
+    qa: {
+      getPersona() { return { name: "清扬" }; },
+      async chat() {
+        return {
+          content: '{"overall_assessment":"方案可执行","items":[{"file":"src/routes/books.ts","approved":true,"feedback":""}],"additional_fixes":[]}',
+        };
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.repairContracts.length, 1);
+    assert.equal(result.repairContracts[0].sprintId, "SP-1");
+    assert.deepEqual(result.repairContracts[0].failedChecks, ["CHK-HTTP-1"]);
+    assert.deepEqual(result.repairContracts[0].repairScope, [failingFile]);
+    assert.match(result.repairContracts[0].instructions[0], /GET \/api\/books/);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === failingFile).status, "pending");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("fix plan falls back to deterministic repair plan when model calls are exhausted", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

@@ -450,6 +450,16 @@ export interface FixPlanItem {
   qaFeedback?: string;      // QA 的纠正意见（当 qaApproval = "corrected" 时有值）
 }
 
+export interface RepairContract {
+  version: "v1";
+  sprintId: string;
+  sourceEvaluationResultId?: string;
+  failedChecks: string[];
+  repairScope: string[];
+  instructions: string[];
+  expectedEvidence: string[];
+}
+
 /**
  * 环境修复账本：记录每次自动修复动作，避免重复无效尝试
  */
@@ -895,6 +905,14 @@ export const JimClawState = Annotation.Root({
   }),
   evaluationResults: Annotation<EvaluationResult[]>({
     reducer: (x, y) => [...(x || []), ...(y || [])],
+  }),
+  repairContracts: Annotation<RepairContract[]>({
+    reducer: (x, y) => {
+      if (y === undefined) return x || [];
+      const map = new Map((x || []).map((item) => [item.sprintId, item]));
+      (y || []).forEach((item) => map.set(item.sprintId, item));
+      return Array.from(map.values());
+    },
   }),
   retryCount: Annotation<number>({
     reducer: (x, y) => y ?? x,

@@ -1,8 +1,8 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, FixPlanItem, ProtocolPatch } from "../graph_types";
+import { JimClawState, FixPlanItem, ProtocolPatch, RepairContract } from "../graph_types";
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
-import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, writeMeetingNote } from "../logic_utils";
+import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, getActiveSprintContract, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
 const FIX_PLAN_CODER_TIMEOUT_MS = 120000;
@@ -72,6 +72,76 @@ function buildSyntheticOpenIssuesFromProtocolFailures(state: JimClawState) {
       rawErrorSnippet: failure.evidence?.join(" | ") || failure.summary,
       detectedRound: state.retryCount || 0,
     }));
+}
+
+function buildSyntheticOpenIssuesFromEvaluationResults(state: JimClawState) {
+  return (state.evaluationResults || [])
+    .filter((result) => result.status === "fail")
+    .flatMap((result) =>
+      result.checks
+        .filter((check) => check.status !== "pass")
+        .map((check) => ({
+          id: `BUG-EVAL-${result.sprintId}-${check.checkId}`,
+          title: `${result.sprintId} ${check.checkId} 验收失败`,
+          description: [
+            result.summary,
+            `复现步骤：${(check.reproSteps || []).join("；") || "无"}`,
+            `证据：${JSON.stringify(check.evidence || {})}`,
+          ].join("\n"),
+          severity: "major" as const,
+          status: "open" as const,
+          relatedFiles: check.suspectedFiles || [],
+          rawErrorSnippet: JSON.stringify(check.evidence || {}).slice(0, 500),
+          detectedRound: state.retryCount || 0,
+        }))
+    );
+}
+
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function buildRepairContractsFromEvaluation(
+  state: JimClawState,
+  fixPlan: FixPlanItem[],
+  failingFiles: string[]
+): RepairContract[] {
+  const failedResults = (state.evaluationResults || []).filter((result) =>
+    result.status === "fail" &&
+    (!state.activeSprintId || result.sprintId === state.activeSprintId)
+  );
+  if (!failedResults.length) return state.repairContracts || [];
+
+  const activeContract = getActiveSprintContract(state);
+  const nextContracts = failedResults.map((result) => {
+    const failedChecks = result.checks.filter((check) => check.status !== "pass");
+    const repairScope = unique([
+      ...failedChecks.flatMap((check) => check.suspectedFiles || []),
+      ...failingFiles,
+      ...fixPlan.map((item) => item.fileTarget),
+    ]);
+    const instructions = fixPlan
+      .filter((item) => repairScope.includes(item.fileTarget))
+      .map((item) => `${item.fileTarget}: ${item.proposedChange}`);
+    const expectedEvidence = unique([
+      ...(activeContract?.evaluatorPlan.requiredEvidence || []),
+      ...failedChecks.flatMap((check) => check.reproSteps || []),
+    ]);
+
+    return {
+      version: "v1" as const,
+      sprintId: result.sprintId,
+      sourceEvaluationResultId: `${result.sprintId}:${failedChecks.map((check) => check.checkId).join(",")}`,
+      failedChecks: failedChecks.map((check) => check.checkId),
+      repairScope,
+      instructions,
+      expectedEvidence,
+    };
+  });
+
+  const map = new Map((state.repairContracts || []).map((item) => [item.sprintId, item]));
+  for (const contract of nextContracts) map.set(contract.sprintId, contract);
+  return Array.from(map.values());
 }
 
 function summarizeBlock(text: string | undefined, limit = 1200): string {
@@ -158,7 +228,10 @@ export async function fixPlanNode(
   const round = state.retryCount || 0;
   const issueOpenIssues = (state.issueTracker || []).filter(i => i.status === "open");
   const protocolOpenIssues = buildSyntheticOpenIssuesFromProtocolFailures(state);
-  const openIssues = protocolOpenIssues.length > 0 ? protocolOpenIssues : issueOpenIssues;
+  const evaluationOpenIssues = buildSyntheticOpenIssuesFromEvaluationResults(state);
+  const openIssues = protocolOpenIssues.length > 0
+    ? protocolOpenIssues
+    : (evaluationOpenIssues.length > 0 ? evaluationOpenIssues : issueOpenIssues);
   const failingFiles = Array.from(new Set([
     ...(state.qaFailures?.failedFiles || []),
     ...openIssues.flatMap(i => i.relatedFiles),
@@ -445,11 +518,13 @@ ${summarizeCoderPlan(coderPlan)}
     return t;
   });
   const nextExecutionProtocol = applyProtocolPatches(state.executionProtocol, protocolPatches);
+  const repairContracts = buildRepairContractsFromEvaluation(state, fixPlan, failingFiles);
 
-  await saveBoulder({ ...state, fixPlan, protocolPatches, executionProtocol: nextExecutionProtocol, subTasks: updatedSubTasks }, "fix_plan");
+  await saveBoulder({ ...state, fixPlan, repairContracts, protocolPatches, executionProtocol: nextExecutionProtocol, subTasks: updatedSubTasks }, "fix_plan");
 
   return {
     fixPlan,
+    repairContracts,
     protocolPatches,
     executionProtocol: nextExecutionProtocol,
     subTasks: updatedSubTasks,
