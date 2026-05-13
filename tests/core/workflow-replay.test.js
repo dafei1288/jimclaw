@@ -7,7 +7,7 @@ const {
   createBaseState,
   createSnapshotRecorder,
 } = require("./test-helpers");
-const { createJimClawGraph, getVerifierNextNode, getQaNextNode, getInfraNextNode, hasPendingExecutorApproval } = require("../../src/core/graph");
+const { createJimClawGraph, getVerifierNextNode, getQaNextNode, getInfraNextNode, getDeployNextNode, hasPendingExecutorApproval } = require("../../src/core/graph");
 const { deployNode } = require("../../src/core/nodes/deploy_node");
 const { qaNode } = require("../../src/core/nodes/qa_node");
 const { fixPlanNode } = require("../../src/core/nodes/fix_plan_node");
@@ -180,8 +180,6 @@ test("qa routing sends host environment blocked failures directly to post_mortem
 });
 
 test("deploy routing sends failed deployments back to qa runtime repair loop", () => {
-  const { getDeployNextNode } = require("../../src/core/graph");
-
   assert.equal(getDeployNextNode(createBaseState({
     deploymentStatus: { status: "failed", url: "http://127.0.0.1:4000" },
     validationReport: {
@@ -196,6 +194,22 @@ test("deploy routing sends failed deployments back to qa runtime repair loop", (
   assert.equal(getDeployNextNode(createBaseState({
     deploymentStatus: { status: "running", url: "http://127.0.0.1:4000" },
   })), "post_mortem");
+});
+
+test("managed harness routing can be disabled for verifier and deploy compatibility", () => {
+  assert.equal(getVerifierNextNode(createBaseState({
+    testResults: "PASS tests/books.test.ts",
+  }), false), "qa");
+  assert.equal(getVerifierNextNode(createBaseState({
+    testResults: "PASS tests/books.test.ts",
+  }), true), "evaluator");
+
+  assert.equal(getDeployNextNode(createBaseState({
+    deploymentStatus: { status: "running", url: "http://127.0.0.1:4000" },
+  }), false), "post_mortem");
+  assert.equal(getDeployNextNode(createBaseState({
+    deploymentStatus: { status: "running", url: "http://127.0.0.1:4000" },
+  }), true), "release_gate");
 });
 
 test("deploy routing sends early executor startup environment failures to post_mortem instead of qa runtime loop", () => {

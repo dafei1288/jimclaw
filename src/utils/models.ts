@@ -16,6 +16,12 @@ export interface ModelConfig {
   temperature?: number;
 }
 
+export interface ManagedHarnessConfig {
+  enabled?: boolean;
+  evaluatorRequired?: boolean;
+  releaseGateRequired?: boolean;
+}
+
 /**
  * JimClaw 全局配置结构
  */
@@ -23,6 +29,7 @@ export interface JimClawConfig {
   llm_configs: Record<string, ModelConfig>;
   // 向下兼容：string 格式等价于 { "default": configId }
   agents: Record<string, string | Record<string, string>>;
+  managedHarness?: ManagedHarnessConfig;
   global?: {
     maxRetries?: number;
     workspaceDir?: string;
@@ -77,6 +84,15 @@ export class ModelManager {
   static getGlobalConfig() {
     if (!this.config) this.loadConfig();
     return this.config.global;
+  }
+
+  static getManagedHarnessConfig(): ManagedHarnessConfig {
+    if (!this.config) this.loadConfig();
+    return this.config.managedHarness || (this.config.global as any)?.managedHarness || {
+      enabled: false,
+      evaluatorRequired: true,
+      releaseGateRequired: true,
+    };
   }
 
   /**

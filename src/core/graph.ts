@@ -83,17 +83,20 @@ type ApprovalRequest = {
   nextNode: string;
 };
 
-export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "evaluator" | "qa" {
+export function getVerifierNextNode(
+  state: JimClawState,
+  evaluatorEnabled: boolean = true
+): "coder" | "architect" | "env_guard" | "evaluator" | "qa" {
   if (shouldPauseForAgentPending(state)) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
-    return "evaluator";
+    return evaluatorEnabled ? "evaluator" : "qa";
   }
   if (state.testResults.includes("文件缺失")) {
     return "coder";
   }
 
   // verifier 是静态预检；非缺文件失败先进入 evaluator 生成可复现证据，再交给 QA 分类。
-  return "evaluator";
+  return evaluatorEnabled ? "evaluator" : "qa";
 }
 
 export function getInfraNextNode(state: JimClawState): "terminal" | "qa" {
@@ -155,11 +158,14 @@ export function getQaNextNode(
   return "fix_plan";
 }
 
-export function getDeployNextNode(state: JimClawState): "qa" | "release_gate" {
+export function getDeployNextNode(
+  state: JimClawState,
+  releaseGateEnabled: boolean = true
+): "qa" | "release_gate" | "post_mortem" {
   if (state.deploymentStatus?.status === "failed" && state.validationReport?.failureType === "runtime_gap") {
     return "qa";
   }
-  return "release_gate";
+  return releaseGateEnabled ? "release_gate" : "post_mortem";
 }
 
 export function getReleaseGateNextNode(state: JimClawState): "qa" | "post_mortem" {
@@ -188,6 +194,10 @@ export async function createJimClawGraph(agents: {
   requestApproval?: (request: ApprovalRequest) => Promise<ApprovalDecision>;
 }) {
   const maxRetries = ModelManager.getGlobalConfig()?.maxRetries ?? 5;
+  const managedHarnessConfig = ModelManager.getManagedHarnessConfig();
+  const managedHarnessEnabled = Boolean(managedHarnessConfig.enabled);
+  const evaluatorEnabled = managedHarnessEnabled && managedHarnessConfig.evaluatorRequired !== false;
+  const releaseGateEnabled = managedHarnessEnabled && managedHarnessConfig.releaseGateRequired !== false;
   const WORKSPACE = path.resolve(options?.workspacePath || path.join(process.cwd(), "workspace", `run_${Date.now()}`));
   process.env.JIMCLAW_WORKSPACE = WORKSPACE;
 
@@ -468,8 +478,9 @@ export async function createJimClawGraph(agents: {
     persistence: "persistence",
     __end__: END,
   });
-  workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => "sprint_planner"), {
+  workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => managedHarnessEnabled ? "sprint_planner" : "env_guard"), {
     sprint_planner: "sprint_planner",
+    env_guard: "env_guard",
     agent_pending: "agent_pending",
   });
   workflow.addConditionalEdges("sprint_planner", routeWithAgentPending(() => "sprint_contract"), {
@@ -507,7 +518,7 @@ export async function createJimClawGraph(agents: {
   });
 
   // verifier：文件缺失直回 coder；其他结果先走 evaluator 生成可复现验收证据。
-  workflow.addConditionalEdges("verifier", routeWithAgentPending((s) => getVerifierNextNode(s)), {
+  workflow.addConditionalEdges("verifier", routeWithAgentPending((s) => getVerifierNextNode(s, evaluatorEnabled)), {
     coder: "coder",
     evaluator: "evaluator",
     qa: "qa",
@@ -550,9 +561,10 @@ export async function createJimClawGraph(agents: {
     coder: "coder",
     agent_pending: "agent_pending",
   });
-  workflow.addConditionalEdges("deploy", routeWithAgentPending((s) => getDeployNextNode(s)), {
+  workflow.addConditionalEdges("deploy", routeWithAgentPending((s) => getDeployNextNode(s, releaseGateEnabled)), {
     qa: "qa",
     release_gate: "release_gate",
+    post_mortem: "post_mortem",
     agent_pending: "agent_pending",
   });
   workflow.addConditionalEdges("release_gate", routeWithAgentPending((s) => getReleaseGateNextNode(s)), {

@@ -24,6 +24,11 @@
       "coding":   "openai"
     }
   },
+  "managedHarness": {
+    "enabled": false,
+    "evaluatorRequired": true,
+    "releaseGateRequired": true
+  },
   "global": {
     "maxRetries": 20,
     "workspaceDir": "./workspace",
