@@ -53,7 +53,8 @@ import {
   ProjectRuntime,
   BackendFramework,
 } from "./graph_types";
-import { ShellExecuteSkill } from "../skills/shell_exec";
+// ShellExecuteSkill no longer imported — host-level commands use host.exec() from infra
+// Only execInContainer remains in this file, which also uses host.exec()
 import { AuditLogger } from "../utils/audit";
 import { host } from "../infra";
 
@@ -4100,7 +4101,7 @@ export async function tryFixEnvironmentProblem(testOutput: string, state: JimCla
     if (state.containerId) {
       await execInContainer(state.containerId, cmd, { timeout });
     } else {
-      await ShellExecuteSkill.config.run({ command: `cd ${workspacePath} && ${cmd}`, timeout });
+      await host.exec(`cd ${workspacePath} && ${cmd}`, { timeout });
     }
   };
 
@@ -5881,16 +5882,26 @@ export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state
  */
 export async function execInContainer(containerId: string, command: string, opts: { timeout?: number; background?: boolean } = {}): Promise<string> {
   if (opts.background) {
-    return ShellExecuteSkill.config.run({
-      command: `docker exec -d -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
-      timeout: 10000,
-    });
+    const bgResult = await host.exec(
+      `docker exec -d -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
+      { timeout: 10000 }
+    );
+    return bgResult.stdout + bgResult.stderr;
   }
 // ═══════════════════════════════════════════════════════════════════════
 // §11 容器执行 (execInContainer)
 // ═══════════════════════════════════════════════════════════════════════
-  return ShellExecuteSkill.config.run({
-    command: `docker exec -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
-    timeout: opts.timeout ?? 90000,
-  });
+  const result = await host.exec(
+    `docker exec -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
+    { timeout: opts.timeout ?? 90000 }
+  );
+  if (result.timedOut) {
+    // 保持与旧 ShellExecuteSkill 格式兼容，让调用方的 isTimeoutOutput() 能正确匹配
+    return `Command timed out after ${opts.timeout ?? 90000}ms\nOutput:\n${result.stdout}\nErrors:\n${result.stderr}`;
+  }
+  if (!result.ok) {
+    // 保持与旧 ShellExecuteSkill 格式兼容，让调用方的 isCommandFailureOutput() 能正确匹配
+    return `Command failed with exit code ${result.exitCode}\nOutput:\n${result.stdout}\nErrors:\n${result.stderr}`;
+  }
+  return result.stdout;
 }

@@ -5,7 +5,7 @@ import { resolvePreferredBackend } from "../../executor/backend_resolver";
 import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
 import { ExecutorResult } from "../../executor/types";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
-import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
+import { createLocalShellAdapter } from "../../skills/shell_exec";
 import { AuditLogger } from "../../utils/audit";
 import { host } from "../../infra";
 import * as fs from "fs/promises";
@@ -418,10 +418,11 @@ export async function deployNode(
   let hostPort = state.allocatedHostPort ? String(state.allocatedHostPort) : "";
 
   if (!hostPort && state.containerId) {
-    const portOut = await ShellExecuteSkill.config.run({ 
-      command: `docker port ${state.containerId} ${targetInternalPort}/tcp || docker port ${state.containerId} ${targetInternalPort} || echo ""` 
-    });
-    
+    const portResult = await host.exec(
+      `docker port ${state.containerId} ${targetInternalPort}/tcp || docker port ${state.containerId} ${targetInternalPort} || echo ""`,
+      { timeout: 10000 }
+    );
+    const portOut = portResult.stdout + portResult.stderr;
     const portMatch = portOut.match(/:(\d+)\s*$/m);
     if (portMatch) {
       hostPort = portMatch[1];
@@ -656,7 +657,7 @@ export async function deployNode(
   }
 
   if (isAccessible) {
-    // ── FP-008: Post-deploy 验证 — 不只检查 health check，验证所有公开端点 ──
+    // ── FP-008: Post-deploy 验证 — 前端不可达视为部署失败，必须阻断 ──
     const verificationResults: string[] = [];
     let allEndpointsOk = true;
 
@@ -703,14 +704,15 @@ export async function deployNode(
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Post-deploy Verification:**\n${report}`);
     }
 
-    // 前端不可达 → 报告失败（但不回退，只是记录，让 QA/下一轮能处理）
-    const frontendWarning = (frontendSpec && !frontendAccessible)
-      ? `⚠️ 前端页面 http://127.0.0.1:${hostPort}/index.html 不可访问（非 HTML 响应）。后端 API 已部署成功。`
+    // 前端不可达 → 视为部署失败，触发重试修复
+    const frontendFailed = Boolean(frontendSpec && !frontendAccessible);
+    const deployWarning = frontendFailed
+      ? `[部署后验证失败] 前端页面 http://127.0.0.1:${hostPort}/index.html 不可访问（非 HTML 响应）。后端 API 已部署成功，但前端不可用。`
       : "";
 
     const msg = allEndpointsOk
       ? `🚀 服务部署成功并已通过连通性校验！访问地址: ${publicUrl}`
-      : `⚠️ 服务已部署，但部分端点验证失败。访问地址: ${publicUrl}\n${frontendWarning}`;
+      : `⚠️ 服务已部署，但部分端点验证失败。访问地址: ${publicUrl}\n${deployWarning}`;
     console.log(`[System] ${msg}`);
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Result:** ${allEndpointsOk ? "Deployment Verified Success" : "Deployment Partial Success — " + verificationResults.filter(r => r.includes("❌")).join("; ")}`);
     const note = await writeMeetingNote(
@@ -729,8 +731,9 @@ export async function deployNode(
       // FP-008: 前端不可达时标记为未完成
       ...(frontendSpec ? { postDeployVerification: { frontendAccessible, frontendUrl: `http://127.0.0.1:${hostPort}/index.html` } } : {}),
       meetingNotes: [note],
-      lastFailedNode: allEndpointsOk ? "" : (frontendAccessible ? "" : "deploy"),
-      lastFailureSummary: allEndpointsOk ? "" : frontendWarning,
+      // FP-008 修复：前端不可达时设置 lastFailedNode，触发重试
+      lastFailedNode: allEndpointsOk ? "" : (frontendFailed ? "deploy" : ""),
+      lastFailureSummary: allEndpointsOk ? "" : deployWarning,
     };
     await saveBoulder({ ...state, ...result }, "deploy");
     return result;
@@ -743,13 +746,11 @@ export async function deployNode(
 
     if (executionBackend === "host") {
       const hostArtifacts = getHostRuntimeArtifactPaths(WORKSPACE);
-      internalAudit = await ShellExecuteSkill.config.run({
-        command: process.platform === "win32"
-          ? `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize"`
-          : `sh -c "ss -tlnp || netstat -tlnp || lsof -i -P -n"`,
-        workDir: WORKSPACE,
-        timeout: 10000,
-      }).catch((error: any) => String(error?.message || error || ""));
+      const auditCmd = host.os === "windows"
+        ? `powershell -NoProfile -Command "Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Select-Object LocalAddress,LocalPort,OwningProcess | Format-Table -AutoSize"`
+        : `sh -c "ss -tlnp || netstat -tlnp || lsof -i -P -n"`;
+      const auditResult = await host.exec(auditCmd, { cwd: WORKSPACE, timeout: 10000 }).catch((error: any) => ({ ok: false as const, stdout: "", stderr: String(error?.message || error || ""), exitCode: null, timedOut: false }));
+      internalAudit = auditResult.stdout + auditResult.stderr;
       const stdoutLog = await fs.readFile(hostArtifacts.stdoutLogPath, "utf-8").catch(() => "");
       const stderrLog = await fs.readFile(hostArtifacts.stderrLogPath, "utf-8").catch(() => "");
       processLog = [stdoutLog, stderrLog].filter(Boolean).join("\n");
@@ -759,17 +760,24 @@ export async function deployNode(
       pidInfo = await fs.readFile(hostArtifacts.pidPath, "utf-8").catch(() => "");
       logs = processLog;
     } else {
-      internalAudit = await ShellExecuteSkill.config.run({ 
-        command: `docker exec ${state.containerId} sh -c "netstat -tlnp || ss -tlnp || lsof -i -P -n" 2>/dev/null || echo "无法获取容器内监听状态"` 
-      });
+      const dockerAuditResult = await host.exec(
+        `docker exec ${state.containerId} sh -c "netstat -tlnp || ss -tlnp || lsof -i -P -n"`,
+        { timeout: 10000 }
+      );
+      internalAudit = dockerAuditResult.stdout + dockerAuditResult.stderr;
       
-      processLog = await ShellExecuteSkill.config.run({
-        command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.log 2>/dev/null || true"`,
-      });
-      pidInfo = await ShellExecuteSkill.config.run({
-        command: `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.pid 2>/dev/null || true"`,
-      });
-      logs = await ShellExecuteSkill.config.run({ command: `docker logs ${state.containerId} --tail 200` });
+      const processLogResult = await host.exec(
+        `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.log 2>/dev/null || true"`,
+        { timeout: 10000 }
+      );
+      processLog = processLogResult.stdout;
+      const pidInfoResult = await host.exec(
+        `docker exec ${state.containerId} sh -c "cat /tmp/jimclaw/server.pid 2>/dev/null || true"`,
+        { timeout: 10000 }
+      );
+      pidInfo = pidInfoResult.stdout;
+      const logsResult = await host.exec(`docker logs ${state.containerId} --tail 200`, { timeout: 10000 });
+      logs = logsResult.stdout + logsResult.stderr;
     }
     
     const classifiedFailure = classifyDeploymentVerificationFailure({

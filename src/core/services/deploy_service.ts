@@ -1,7 +1,6 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState, SystemManifest, TechSpec } from "../graph_types";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { execInContainer } from "../logic_utils";
@@ -54,16 +53,16 @@ export class DeployService {
     let containerId = "";
     try {
       if (hasCompose) {
-        await ShellExecuteSkill.config.run({ command: `cd ${workspaceDir} && docker-compose down 2>/dev/null || true` });
-        await ShellExecuteSkill.config.run({ command: `cd ${workspaceDir} && docker-compose up -d` });
+        await host.exec(`docker-compose down`, { cwd: workspaceDir, timeout: 30000 }).catch(() => {});
+        await host.exec(`docker-compose up -d`, { cwd: workspaceDir, timeout: 60000 });
         containerId = containerName;
       } else {
-        await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` });
-        const startOut = await ShellExecuteSkill.config.run({
-          command: `docker run -d --name ${containerName} -p ${hostPort}:${targetInternalPort} -v "${workspaceDir}:/app" -w /app ${image} tail -f /dev/null`,
-          timeout: 60000,
-        });
-        containerId = startOut.replace(/Output:/g, "").trim().split('\n').pop() || "";
+        await host.exec(`docker rm -f ${containerName}`, { timeout: 10000 }).catch(() => {});
+        const startResult = await host.exec(
+          `docker run -d --name ${containerName} -p ${hostPort}:${targetInternalPort} -v "${workspaceDir}:/app" -w /app ${image} tail -f /dev/null`,
+          { timeout: 60000 }
+        );
+        containerId = startResult.stdout.trim().split('\n').pop() || "";
       }
 
       // 4. 安装依赖
@@ -97,10 +96,10 @@ export class DeployService {
       if (isAccessible) {
         return { containerId, hostPort, url: dynamicUrl, status: "running" };
       } else {
-        const logs = await ShellExecuteSkill.config.run({ command: `docker logs ${containerName} --tail 100` });
-        return { 
-          containerId, hostPort, url: dynamicUrl, status: "failed", 
-          error: "Health check failed", logs: logs.replace(/Output:/g, "").trim() 
+        const logsResult = await host.exec(`docker logs ${containerName} --tail 100`, { timeout: 10000 });
+        return {
+          containerId, hostPort, url: dynamicUrl, status: "failed",
+          error: "Health check failed", logs: logsResult.stdout + logsResult.stderr
         };
       }
 

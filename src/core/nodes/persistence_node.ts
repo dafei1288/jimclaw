@@ -1,5 +1,5 @@
 import { JimClawState } from "../graph_types";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { host } from "../../infra";
 import * as fs from "fs/promises";
 import * as path from "path";
 import { execFile } from "child_process";
@@ -36,7 +36,7 @@ export async function persistenceNode(
     if (state.deploymentStatus?.status === 'running') {
       console.log(`[Persistence] 服务已部署，保留容器: ${state.containerId}`);
     } else {
-      await ShellExecuteSkill.config.run({ command: `docker rm -f ${state.containerId} 2>/dev/null || true` });
+      await host.exec(`docker rm -f ${state.containerId}`, { timeout: 30000 });
     }
   }
   // 只有当上游（QA/deploy）已确认成功、或服务确实在运行时才标记 isDone=true

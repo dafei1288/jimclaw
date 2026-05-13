@@ -5,12 +5,30 @@ import { createCommandExecutor } from "../../executor/command_executor";
 import { resolvePreferredBackend } from "../../executor/backend_resolver";
 import { classifyExecutorFailure, mapExecutorFailureToValidationFailure } from "../../executor/result_classifier";
 import { ExecutorResult } from "../../executor/types";
-import { createLocalShellAdapter, ShellExecuteSkill } from "../../skills/shell_exec";
+import { createLocalShellAdapter } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNote } from "../logic_utils";
 import { host } from "../../infra";
 import { AuditLogger } from "../../utils/audit";
 import { runWithHeartbeat } from "../node_heartbeat";
+
+/**
+ * Host shell 执行 — 通过 HostPlatform 统一执行宿主机命令，返回兼容字符串格式。
+ * 替代直接调用 ShellExecuteSkill.config.run()，解决 Windows 平台 shell 不兼容问题。
+ */
+async function hostExec(
+  command: string,
+  opts?: { workDir?: string; timeout?: number }
+): Promise<string> {
+  const result = await host.exec(command, { cwd: opts?.workDir, timeout: opts?.timeout });
+  if (result.timedOut) {
+    return `Command timed out after ${opts?.timeout ?? 90000}ms\nOutput:\n${result.stdout}\nErrors:\n${result.stderr}`;
+  }
+  if (!result.ok) {
+    return `Command failed with exit code ${result.exitCode}\nOutput:\n${result.stdout}\nErrors:\n${result.stderr}`;
+  }
+  return `Output:\n${result.stdout}\nErrors:\n${result.stderr}`;
+}
 
 /**
  * 从 ShellExecuteSkill 返回值中提取纯 stdout 内容。
@@ -214,11 +232,7 @@ async function runInfraHostCommand(
   let output = "";
   let effectiveTimeout = timeout;
   for (let attempt = 0; attempt < 2; attempt++) {
-    output = await ShellExecuteSkill.config.run({
-      command,
-      workDir: workspace,
-      timeout: effectiveTimeout,
-    });
+    output = await hostExec(command, { workDir: workspace, timeout: effectiveTimeout });
     if (attempt === 0 && isTimeoutOutput(output) && hasCommandProgressOutput(output)) {
       effectiveTimeout = Math.min(Math.round(timeout * 1.8), 900000);
       await AuditLogger.log(
@@ -254,11 +268,7 @@ function extractSkillErrors(raw: string): string {
 function createDockerCliAdapter() {
   return {
     async execute(intent: { command?: string; workspace: string }): Promise<ExecutorResult> {
-      const raw = await ShellExecuteSkill.config.run({
-        command: intent.command || "",
-        workDir: intent.workspace,
-        timeout: 300000,
-      });
+      const raw = await hostExec(intent.command || "", { workDir: intent.workspace, timeout: 300000 });
       const failed = /^Command failed/i.test(String(raw || "").trim());
       const failureType = failed
         ? classifyExecutorFailure({
@@ -368,11 +378,7 @@ async function buildFrontendOnHost(
   // 1. npm install
   let installOk = false;
   try {
-    const installOut = await ShellExecuteSkill.config.run({
-      command: "npm install --loglevel=error",
-      workDir: frontendDir,
-      timeout: 120000,
-    });
+    const installOut = await hostExec("npm install --loglevel=error", { workDir: frontendDir, timeout: 120000 });
     const raw = parseSkillOutput(String(installOut));
     if (isCommandFailureOutput(raw)) {
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Warning:** 前端 npm install 失败: ${raw}`);
@@ -389,11 +395,7 @@ async function buildFrontendOnHost(
   let buildOk = false;
   try {
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Action:** 宿主机构建前端 (cd frontend && npx vite build)`);
-    const buildOut = await ShellExecuteSkill.config.run({
-      command: "npx vite build",
-      workDir: frontendDir,
-      timeout: 60000,
-    });
+    const buildOut = await hostExec("npx vite build", { workDir: frontendDir, timeout: 60000 });
     const raw = parseSkillOutput(String(buildOut));
     if (isCommandFailureOutput(raw)) {
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Warning:** 前端 vite build 失败: ${raw}`);
@@ -688,9 +690,9 @@ export async function infraNode(
       return { containerId: "", testResults: errMsg, allocatedHostPort: hostPort, meetingNotes: [note], lastFailedNode: "infra_setup", lastFailureSummary: errMsg.slice(0, 120) };
     }
 
-    await ShellExecuteSkill.config.run({ command: "docker-compose down", workDir: WORKSPACE }).catch(() => {});
-    await ShellExecuteSkill.config.run({ command: "docker-compose rm -f -s -v", workDir: WORKSPACE }).catch(() => {});
-    const composeOut = await ShellExecuteSkill.config.run({ command: `docker-compose build ${serviceName}`, workDir: WORKSPACE });
+    await hostExec("docker-compose down", { workDir: WORKSPACE }).catch(() => {});
+    await hostExec("docker-compose rm -f -s -v", { workDir: WORKSPACE }).catch(() => {});
+    const composeOut = await hostExec(`docker-compose build ${serviceName}`, { workDir: WORKSPACE });
     await AuditLogger.log(WORKSPACE, "Infrastructure", `**Compose Output:**\n${composeOut}`);
 
     // 构建失败（exit code != 0）立即返回，错误写入 testResults 供 QA 分析
@@ -721,11 +723,7 @@ export async function infraNode(
     let runOut = "";
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
-      runOut = await ShellExecuteSkill.config.run({
-        command: `docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`,
-        workDir: WORKSPACE,
-        timeout: 60000,
-      });
+      runOut = await hostExec(`docker-compose run -d --service-ports ${serviceName} sh -c "tail -f /dev/null"`, { workDir: WORKSPACE, timeout: 60000 });
 
       containerId = extractContainerId(runOut);
       if (containerId) {
@@ -775,12 +773,12 @@ export async function infraNode(
         return finalizeHostBackend();
       }
       console.warn(`[System] 无法直接获取 compose run 产生的容器 ID，尝试回退查询服务容器...`);
-      const fallbackPs = await ShellExecuteSkill.config.run({ command: `docker-compose ps -q ${serviceName}`, workDir: WORKSPACE });
+      const fallbackPs = await hostExec(`docker-compose ps -q ${serviceName}`, { workDir: WORKSPACE });
       containerId = extractContainerId(fallbackPs);
     }
 
     if (!containerId) {
-      const composeLog = await ShellExecuteSkill.config.run({ command: "docker-compose logs --tail=30", workDir: WORKSPACE });
+      const composeLog = await hostExec("docker-compose logs --tail=30", { workDir: WORKSPACE });
       const errMsg = `[基础设施致命错误] docker-compose 启动后未能找到运行中的容器（端口 ${hostPort}）。\n容器日志：\n${parseSkillOutput(composeLog)}`;
       await AuditLogger.log(WORKSPACE, "Infrastructure", `**Fatal:** ${errMsg}`);
       console.error(`[System] ${errMsg}`);
@@ -801,10 +799,8 @@ export async function infraNode(
   const existingContainerId = state.containerId || "";
   if (existingContainerId && !state.forceRebuildContainer && round > 0) {
     // 在宿主机执行 docker inspect 检查容器是否在运行
-    const inspectRaw = await ShellExecuteSkill.config.run({
-      command: `docker inspect --format '{{.State.Running}}' ${existingContainerId}`,
-      timeout: 5000,
-    }).catch(() => "");
+    const inspectResult = await host.exec(`docker inspect --format '{{.State.Running}}' ${existingContainerId}`, { timeout: 5000 }).catch(() => ({ ok: false as const, stdout: "", stderr: "", exitCode: null, timedOut: false }));
+    const inspectRaw = inspectResult.stdout + inspectResult.stderr;
     if (/true/i.test(inspectRaw.trim())) {
       // 容器在运行，复用容器，继续走依赖安装流程
       containerId = existingContainerId;
@@ -819,21 +815,18 @@ export async function infraNode(
   // ── 正常创建流程（非 compose 路径） ──
   if (!hasCompose) {
     // 3. 安全清理并启动单容器 (带端口映射)
-    await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName}` }).catch(() => {});
+    await hostExec(`docker rm -f ${containerName}`).catch(() => {});
     let startOut = "";
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
-      startOut = await ShellExecuteSkill.config.run({
-        command: `docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} ${lang.includes("go") ? "-v jimclaw_go_cache:/go/pkg/mod" : ""} ${lang.includes("java") ? "-v jimclaw_maven_cache:/root/.m2" : ""} ${lang.includes("rust") ? "-v jimclaw_cargo_cache:/usr/local/cargo/registry" : ""} -w /app ${image} tail -f /dev/null`,
-        timeout: 60000,
-      });
+      startOut = await hostExec(`docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} ${lang.includes("go") ? "-v jimclaw_go_cache:/go/pkg/mod" : ""} ${lang.includes("java") ? "-v jimclaw_maven_cache:/root/.m2" : ""} ${lang.includes("rust") ? "-v jimclaw_cargo_cache:/usr/local/cargo/registry" : ""} -w /app ${image} tail -f /dev/null`, { timeout: 60000 });
       containerId = extractContainerId(startOut);
       if (containerId) {
         break;
       }
       if (!isDockerPortConflict(startOut)) {
         if (isRetryableDockerStartupFailure(startOut)) {
-          await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName}` }).catch(() => {});
+          await hostExec(`docker rm -f ${containerName}`).catch(() => {});
           await AuditLogger.log(
             WORKSPACE,
             "Infrastructure",

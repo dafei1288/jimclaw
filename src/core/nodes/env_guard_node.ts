@@ -2,13 +2,12 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { builtinModules } from "module";
 import { JimClawState, RepairLedgerEntry, ConsensusProgress } from "../graph_types";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
+import { createLocalShellAdapter } from "../../skills/shell_exec";
 import { host } from "../../infra";
 import { createCommandExecutor, ResolvedExecutionIntent } from "../../executor/command_executor";
 import { CapabilitySnapshot, ExecutorBackend, ExecutorResult } from "../../executor/types";
 import { AuditLogger } from "../../utils/audit";
 import { buildRepairPlan, buildValidationReport, getDeterministicTemplateScaffold } from "../logic_utils";
-import { createLocalShellAdapter } from "../../skills/shell_exec";
 
 function isNodeLikeProject(language?: string): boolean {
   const lang = String(language || "").toLowerCase();
