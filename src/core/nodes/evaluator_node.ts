@@ -7,6 +7,7 @@ import {
   writeMeetingNote,
 } from "../logic_utils";
 import { host } from "../../infra";
+import { appendSessionEvent } from "../../utils/session_events";
 
 type CheckResult = EvaluationResult["checks"][number];
 
@@ -214,6 +215,12 @@ export async function evaluatorNode(
       lastFailedNode: "evaluator",
       lastFailureSummary: message,
     };
+    await appendSessionEvent(WORKSPACE, {
+      type: "evaluation_failed",
+      node: "evaluator",
+      summary: message,
+      payload: { reason: "missing_sprint_contract" },
+    });
     await saveBoulder({ ...state, ...result }, "evaluator");
     return result;
   }
@@ -275,6 +282,12 @@ ${JSON.stringify(evaluation, null, 2)}
   );
 
   emit("thinking", "System", `[Evaluator] ${evaluation.summary}`, {});
+  await appendSessionEvent(WORKSPACE, {
+    type: "evaluation_completed",
+    node: "evaluator",
+    summary: evaluation.summary,
+    payload: { evaluation },
+  });
 
   const result = {
     evaluationResults,

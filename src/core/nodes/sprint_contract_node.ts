@@ -1,5 +1,6 @@
 import { EvaluationCheck, JimClawState, SprintContract, SprintPlan } from "../graph_types";
 import { writeMeetingNote } from "../logic_utils";
+import { appendSessionEvent } from "../../utils/session_events";
 
 function findActiveSprint(state: JimClawState): SprintPlan | null {
   const sprintPlans = state.sprintPlans || [];
@@ -136,6 +137,12 @@ ${JSON.stringify(contract, null, 2)}
   );
 
   emit("thinking", "System", `[SprintContract] ${sprint.id} 生成 ${contract.evaluatorPlan.checks.length} 个验收检查，状态：${contract.status}`, {});
+  await appendSessionEvent(WORKSPACE, {
+    type: "sprint_contract_agreed",
+    node: "sprint_contract",
+    summary: `${sprint.id} 契约${contract.status === "agreed" ? "已确认" : "未通过"}`,
+    payload: { contract },
+  });
 
   const result = {
     activeSprintId: sprint.id,

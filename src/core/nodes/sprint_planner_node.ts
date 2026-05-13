@@ -1,5 +1,6 @@
 import { JimClawState } from "../graph_types";
 import { buildProductSpec, buildSprintPlans, writeMeetingNote } from "../logic_utils";
+import { appendSessionEvent } from "../../utils/session_events";
 
 export async function sprintPlannerNode(
   state: JimClawState,
@@ -38,6 +39,12 @@ ${JSON.stringify(sprintPlans, null, 2)}
   );
 
   emit("thinking", "System", `[SprintPlanner] 已拆分为 ${sprintPlans.length} 个 Sprint，当前 Sprint：${activeSprintId || "无"}`, {});
+  await appendSessionEvent(WORKSPACE, {
+    type: "sprint_planned",
+    node: "sprint_planner",
+    summary: `拆分为 ${sprintPlans.length} 个 Sprint`,
+    payload: { activeSprintId, sprintPlans },
+  });
 
   const result = {
     productSpec,

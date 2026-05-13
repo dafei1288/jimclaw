@@ -1,5 +1,6 @@
 import { Issue, JimClawState, ProtocolFailure } from "../graph_types";
 import { buildRepairPlan, buildValidationReport, writeMeetingNote } from "../logic_utils";
+import { appendSessionEvent } from "../../utils/session_events";
 
 function evidenceText(value: unknown): string {
   return JSON.stringify(value || {});
@@ -184,6 +185,12 @@ ${JSON.stringify(state.evaluationResults || [], null, 2)}
   );
 
   emit("thinking", "System", `[ReleaseGate] ${summary}`, {});
+  await appendSessionEvent(WORKSPACE, {
+    type: "release_gate_completed",
+    node: "release_gate",
+    summary,
+    payload: { passed: !blocking, failures },
+  });
 
   const result = {
     isDone: !blocking,
