@@ -85,7 +85,7 @@ type ApprovalRequest = {
 
 export function getVerifierNextNode(
   state: JimClawState,
-  evaluatorEnabled: boolean = true
+  evaluatorEnabled: boolean = false
 ): "coder" | "architect" | "env_guard" | "evaluator" | "qa" {
   if (shouldPauseForAgentPending(state)) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
@@ -160,7 +160,7 @@ export function getQaNextNode(
 
 export function getDeployNextNode(
   state: JimClawState,
-  releaseGateEnabled: boolean = true
+  releaseGateEnabled: boolean = false
 ): "qa" | "release_gate" | "post_mortem" {
   if (state.deploymentStatus?.status === "failed" && state.validationReport?.failureType === "runtime_gap") {
     return "qa";
