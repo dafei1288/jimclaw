@@ -22,6 +22,7 @@ import { envGuardNode } from "./nodes/env_guard_node";
 import { infraNode } from "./nodes/infra_node";
 import { terminalNode } from "./nodes/terminal_node";
 import { verifierNode } from "./nodes/verifier_node";
+import { evaluatorNode } from "./nodes/evaluator_node";
 import { qaNode } from "./nodes/qa_node";
 import { deployNode } from "./nodes/deploy_node";
 import { postMortemNode } from "./nodes/post_mortem_node";
@@ -81,18 +82,17 @@ type ApprovalRequest = {
   nextNode: string;
 };
 
-export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "qa" {
+export function getVerifierNextNode(state: JimClawState): "coder" | "architect" | "env_guard" | "evaluator" | "qa" {
   if (shouldPauseForAgentPending(state)) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
-    return "qa";
+    return "evaluator";
   }
   if (state.testResults.includes("文件缺失")) {
     return "coder";
   }
 
-  // verifier 是静态预检，所有失败最终都应由 QA 分析处理
-  // 之前 runtime_gap 路由到 infra_setup 导致无限循环（verifier→infra→terminal→verifier）
-  return "qa";
+  // verifier 是静态预检；非缺文件失败先进入 evaluator 生成可复现证据，再交给 QA 分类。
+  return "evaluator";
 }
 
 export function getInfraNextNode(state: JimClawState): "terminal" | "qa" {
@@ -363,6 +363,7 @@ export async function createJimClawGraph(agents: {
     .addNode("infra_setup", withNodeGuard("infra_setup", (s) => infraNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("terminal", withNodeGuard("terminal", (s) => terminalNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("verifier", withNodeGuard("verifier", (s) => verifierNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
+    .addNode("evaluator", withNodeGuard("evaluator", (s) => evaluatorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("qa", withNodeGuard("qa", (s) => qaNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("deploy", withNodeGuard("deploy", (s) => deployNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("post_mortem", withNodeGuard("post_mortem", (s) => postMortemNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -386,6 +387,7 @@ export async function createJimClawGraph(agents: {
     infra_setup: "infra_setup",
     terminal: "terminal",
     verifier: "verifier",
+    evaluator: "evaluator",
     qa: "qa",
     qa_resume_router: "qa",
     deploy: "deploy",
@@ -446,6 +448,7 @@ export async function createJimClawGraph(agents: {
     infra_setup: "infra_setup",
     terminal: "terminal",
     verifier: "verifier",
+    evaluator: "evaluator",
     qa: "qa",
     fix_plan: "fix_plan",
     architect_mediation: "architect_mediation",
@@ -492,9 +495,15 @@ export async function createJimClawGraph(agents: {
     agent_pending: "agent_pending",
   });
 
-  // verifier：文件缺失直回 coder；其他失败一律走 QA 分析（不再路由 infra/architect/env_guard）
+  // verifier：文件缺失直回 coder；其他结果先走 evaluator 生成可复现验收证据。
   workflow.addConditionalEdges("verifier", routeWithAgentPending((s) => getVerifierNextNode(s)), {
     coder: "coder",
+    evaluator: "evaluator",
+    qa: "qa",
+    agent_pending: "agent_pending",
+  });
+
+  workflow.addConditionalEdges("evaluator", routeWithAgentPending(() => "qa"), {
     qa: "qa",
     agent_pending: "agent_pending",
   });
