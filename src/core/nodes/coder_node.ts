@@ -114,7 +114,7 @@ function isStructuralConfigFile(fileTarget: string): boolean {
 
 function isQaRecoverableDeterministicScaffoldFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
-  return normalized === "public/index.html";
+  return normalized === "public/index.html" || normalized === "tests/setup.test.ts";
 }
 
 function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {

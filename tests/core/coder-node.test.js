@@ -5133,6 +5133,88 @@ test("coder restores qa-failed public index page from deterministic scaffold wit
   }
 });
 
+test("coder restores qa-failed setup test from deterministic scaffold without model extraction", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express",
+    testCommand: "npm test",
+    filesToCreate: ["package.json", "tests/setup.test.ts"],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统" },
+    spec,
+    qaFailures: {
+      isDone: false,
+      failedFiles: ["tests/setup.test.ts"],
+      issues: ["tests/setup.test.ts 代码提取失败"],
+      testErrors: ["Coder 阻塞失败: tests/setup.test.ts -> 代码提取失败或工具执行异常"],
+      summary: "测试基线文件生成失败",
+    },
+    subTasks: [
+      {
+        id: "task-package",
+        description: "package ready",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-setup",
+        description: "restore jest baseline",
+        fileTarget: "tests/setup.test.ts",
+        dependencies: ["package.json"],
+        contextRequirement: "恢复测试基线",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "package.json": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n",
+    }),
+  });
+
+  try {
+    await fs.writeFile(path.join(workspace, "package.json"), "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n");
+
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            throw new Error("tests/setup.test.ts 不应走模型生成");
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.blockedReason, "");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "tests/setup.test.ts").status, "completed");
+    const setupTest = await fs.readFile(path.join(workspace, "tests", "setup.test.ts"), "utf-8");
+    assert.match(setupTest, /Jest \+ ts-jest/);
+    assert.equal(
+      result.codeLog.some(
+        (entry) => entry.file === "tests/setup.test.ts" && entry.generationSource === "deterministic_scaffold"
+      ),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder recovers a previously timed-out file from disk before starting the next retry round", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
