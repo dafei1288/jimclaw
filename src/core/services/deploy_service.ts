@@ -6,6 +6,7 @@ import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { execInContainer } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
 import { host } from "../../infra";
+import { buildDockerRunCommand } from "../docker_cli";
 
 export interface DeployResult {
   containerId: string;
@@ -59,7 +60,14 @@ export class DeployService {
       } else {
         await host.exec(`docker rm -f ${containerName}`, { timeout: 10000 }).catch(() => {});
         const startResult = await host.exec(
-          `docker run -d --name ${containerName} -p ${hostPort}:${targetInternalPort} -v "${workspaceDir}:/app" -w /app ${image} tail -f /dev/null`,
+          buildDockerRunCommand({
+            containerName,
+            hostPort,
+            containerPort: targetInternalPort,
+            workspace: workspaceDir,
+            language: lang,
+            image,
+          }),
           { timeout: 60000 }
         );
         containerId = startResult.stdout.trim().split('\n').pop() || "";

@@ -17,6 +17,7 @@ const {
   rewriteComposePortBindings,
   extractComposePrimaryServiceName,
   hasBuildScript,
+  buildDockerRunCommand,
   infraNode,
 } = require("../../src/core/nodes/infra_node");
 
@@ -59,6 +60,24 @@ test("package manifest with build script requires infra build step", () => {
 
   assert.equal(hasBuildScript(input), true);
   assert.equal(hasBuildScript(JSON.stringify({ scripts: { start: "node index.js" } })), false);
+});
+
+test("single-container docker run uses bind mount syntax for Windows workspace paths", () => {
+  const workspace = "D:\\working\\mycode\\jimclaw\\workspace\\run_20260514";
+
+  const command = buildDockerRunCommand({
+    containerName: "jimclaw_run_20260514",
+    hostPort: 4123,
+    containerPort: 10000,
+    workspace,
+    language: "TypeScript",
+    image: "node:20-alpine",
+  });
+
+  assert.match(command, /docker run -d --name jimclaw_run_20260514/);
+  assert.match(command, /--mount\s+"?type=bind,source=.*D:\\working\\mycode\\jimclaw\\workspace\\run_20260514,target=\/app"?/);
+  assert.doesNotMatch(command, /-v\s+"D:\\working\\mycode\\jimclaw\\workspace\\run_20260514:\/app"/);
+  assert.match(command, /-w \/app node:20-alpine tail -f \/dev\/null/);
 });
 
 test("infra setup retries transient single-container startup failure before escalating", async () => {

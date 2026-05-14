@@ -11,6 +11,9 @@ import { buildRepairPlan, buildValidationReport, execInContainer, writeMeetingNo
 import { host } from "../../infra";
 import { AuditLogger } from "../../utils/audit";
 import { runWithHeartbeat } from "../node_heartbeat";
+import { buildDockerRunCommand } from "../docker_cli";
+
+export { buildDockerRunCommand } from "../docker_cli";
 
 /**
  * Host shell 执行 — 通过 HostPlatform 统一执行宿主机命令，返回兼容字符串格式。
@@ -819,7 +822,17 @@ export async function infraNode(
     let startOut = "";
     containerId = "";
     for (let attempt = 0; attempt < 5; attempt++) {
-      startOut = await hostExec(`docker run -d --name ${containerName} -p ${hostPort}:${containerPort} -v "${WORKSPACE}:/app" ${lang.includes("python") ? "-v jimclaw_pip_cache:/root/.cache/pip" : ""} ${lang.includes("go") ? "-v jimclaw_go_cache:/go/pkg/mod" : ""} ${lang.includes("java") ? "-v jimclaw_maven_cache:/root/.m2" : ""} ${lang.includes("rust") ? "-v jimclaw_cargo_cache:/usr/local/cargo/registry" : ""} -w /app ${image} tail -f /dev/null`, { timeout: 60000 });
+      startOut = await hostExec(
+        buildDockerRunCommand({
+          containerName,
+          hostPort,
+          containerPort,
+          workspace: WORKSPACE,
+          language: lang,
+          image,
+        }),
+        { timeout: 60000 }
+      );
       containerId = extractContainerId(startOut);
       if (containerId) {
         break;
