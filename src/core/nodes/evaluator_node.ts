@@ -21,8 +21,14 @@ function normalizePath(value: string): string {
   return String(value || "").replace(/\\/g, "/");
 }
 
+function materializeHttpPath(value: string): string {
+  return String(value || "")
+    .replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => /id$/i.test(name) ? "1" : "test")
+    .replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => /id$/i.test(name) ? "1" : "test");
+}
+
 function resolveEvaluationUrl(state: JimClawState, rawUrl?: string): { url: string; error?: string } {
-  const value = String(rawUrl || "").trim();
+  const value = materializeHttpPath(String(rawUrl || "").trim());
   if (!value) return { url: "", error: "HTTP 检查缺少 URL" };
   if (/^https?:\/\//i.test(value)) return { url: value };
 
@@ -154,18 +160,33 @@ async function ensureRuntimeForHttpChecks(
 function inferEndpointStem(check: EvaluationCheck): string {
   const raw = String(check.url || check.description || "");
   const clean = raw.split("?")[0].replace(/\/+$/, "");
-  const last = clean.split("/").filter(Boolean).pop() || "";
+  const last = clean.split("/").filter(Boolean).reverse().find((segment) =>
+    !segment.startsWith(":") && !/^\{.+\}$/.test(segment)
+  ) || "";
   const stripped = last.replace(/[:{}]/g, "").toLowerCase();
   if (!stripped) return "";
   return stripped.endsWith("s") ? stripped.slice(0, -1) : stripped;
 }
 
+function inferEntryFiles(state: JimClawState): string[] {
+  const candidates = [
+    state.spec?.entryPoint,
+    ...((state.executionProtocol?.project?.workspaceLayout?.entryFiles || []) as string[]),
+    ...(state.subTasks || [])
+      .map((task) => normalizePath(task.fileTarget))
+      .filter((file) => /(^|\/)(index|app)\.(ts|tsx|js|jsx)$/i.test(file)),
+  ];
+  return unique(candidates.filter(Boolean) as string[]);
+}
+
 function inferSuspectedFilesFromCheck(
   state: JimClawState,
   check: EvaluationCheck,
-  contract: SprintContract
+  contract: SprintContract,
+  failure?: { httpStatus?: number | null }
 ): string[] {
   const stem = inferEndpointStem(check);
+  const entryFiles = inferEntryFiles(state);
   const candidates = [
     ...((state.subTasks || []).map((task) => normalizePath(task.fileTarget))),
     ...(contract.builderPlan.filesLikelyTouched || []).map(normalizePath),
@@ -180,6 +201,18 @@ function inferSuspectedFilesFromCheck(
       normalized.includes("/services/")
     );
   });
+  if (failure?.httpStatus === 404) {
+    const routeMountFiles = candidates.filter((file) => {
+      const normalized = file.toLowerCase();
+      return (
+        entryFiles.includes(file) ||
+        normalized.includes("/routes/") ||
+        normalized.includes("/controllers/") ||
+        Boolean(stem && normalized.includes(stem))
+      );
+    });
+    return unique([...entryFiles, ...routeMountFiles, ...matched]).slice(0, 8);
+  }
   return unique(matched.length > 0 ? matched : candidates).slice(0, 6);
 }
 
@@ -229,7 +262,7 @@ async function runHttpCheck(
       error: result.error,
     },
     reproSteps: [`GET ${resolved.url}`],
-    suspectedFiles: ok ? [] : inferSuspectedFilesFromCheck(state, check, contract),
+    suspectedFiles: ok ? [] : inferSuspectedFilesFromCheck(state, check, contract, { httpStatus: result.statusCode }),
   };
 }
 

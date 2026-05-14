@@ -175,6 +175,57 @@ test("evaluator http failure records suspected files and validation report", asy
   }
 });
 
+test("evaluator attributes http 404 to entry and route mounting files", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  const requestedUrls = [];
+  host.httpGet = async (url) => {
+    requestedUrls.push(url);
+    return { statusCode: 404, body: "Cannot GET" };
+  };
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-HTTP-BOOK-ID",
+          kind: "http",
+          description: "验证 GET /api/books/:id",
+          method: "GET",
+          url: "/api/books/:id",
+          expectedStatus: [200],
+        }])],
+        deploymentStatus: { status: "running", url: "http://127.0.0.1:4100" },
+        spec: {
+          entryPoint: "src/index.ts",
+          filesToCreate: ["src/index.ts", "src/routes/books.ts", "src/services/bookService.ts", "tests/books.test.ts"],
+        },
+        subTasks: [
+          { id: "entry", fileTarget: "src/index.ts", description: "entry", dependencies: [], contextRequirement: "", status: "completed" },
+          { id: "route", fileTarget: "src/routes/books.ts", description: "route", dependencies: [], contextRequirement: "", status: "completed" },
+          { id: "service", fileTarget: "src/services/bookService.ts", description: "service", dependencies: [], contextRequirement: "", status: "completed" },
+        ],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const suspectedFiles = result.evaluationResults[0].checks[0].suspectedFiles;
+    assert.equal(requestedUrls[0], "http://127.0.0.1:4100/api/books/1");
+    assert.equal(suspectedFiles.includes("src/index.ts"), true);
+    assert.equal(suspectedFiles.includes("src/routes/books.ts"), true);
+    assert.equal(result.qaFailures.failedFiles.includes("src/index.ts"), true);
+  } finally {
+    host.httpGet = originalHttpGet;
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("evaluator does not pass command checks without evidence", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
