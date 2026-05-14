@@ -359,12 +359,33 @@ function getPrimaryCrudResource(state: Pick<JimClawState, "apiContract" | "requi
     ? "图书"
     : singularStem === "user"
       ? "用户"
-      : singularStem === "log"
-        ? "日志"
-        : singularStem === "permission"
-          ? "权限"
-          : "数据项";
+      : singularStem === "product"
+        ? "商品"
+        : singularStem === "log"
+          ? "日志"
+          : singularStem === "permission"
+            ? "权限"
+            : "数据项";
   return { pluralStem, singularStem, resourcePath, label, title };
+}
+
+function getResourceEndpointCapabilities(
+  apiContract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined,
+  resourcePath: string
+) {
+  const basePath = normalizeApiResourcePath(resourcePath);
+  const methods = new Set<string>();
+  for (const endpoint of apiContract?.endpoints || []) {
+    const endpointPath = String(endpoint.path || "");
+    if (normalizeApiResourcePath(endpointPath) !== basePath) continue;
+    methods.add(String(endpoint.method || "").toUpperCase());
+  }
+  return {
+    supportsList: methods.has("GET"),
+    supportsCreate: methods.has("POST"),
+    supportsUpdate: methods.has("PUT") || methods.has("PATCH"),
+    supportsDelete: methods.has("DELETE"),
+  };
 }
 
 function parseStateCodeMap(state: Pick<JimClawState, "code">): Record<string, string> {
@@ -3849,6 +3870,105 @@ export default app;
 
   if (normalizedTarget === "public/index.html") {
     const primaryResource = getPrimaryCrudResource(state);
+    const resourceCapabilities = getResourceEndpointCapabilities(state.apiContract, primaryResource.resourcePath);
+    if (!resourceCapabilities.supportsCreate && !resourceCapabilities.supportsUpdate && !resourceCapabilities.supportsDelete) {
+      return `<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>${primaryResource.title}</title>
+    <style>
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: "Segoe UI", "PingFang SC", sans-serif; background: #f4f7fb; color: #1f2937; }
+      .shell { max-width: 960px; margin: 0 auto; padding: 32px 20px 48px; }
+      .hero { display: flex; justify-content: space-between; align-items: center; gap: 16px; margin-bottom: 24px; }
+      .hero h1 { margin: 0; font-size: 32px; }
+      .hero p { margin: 8px 0 0; color: #4b5563; }
+      .panel { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08); }
+      .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+      button { border: none; border-radius: 8px; padding: 10px 14px; cursor: pointer; background: #e5e7eb; color: #111827; font-weight: 600; }
+      .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+      .card { border: 1px solid #e5e7eb; border-radius: 10px; padding: 16px; background: #fff; }
+      .card h3 { margin: 0 0 8px; font-size: 18px; }
+      .card p { margin: 4px 0; color: #4b5563; font-size: 14px; }
+      .status { font-size: 14px; color: #2563eb; min-height: 20px; }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="hero">
+        <div>
+          <h1>${primaryResource.title}</h1>
+          <p>前后端一体页面,直接调用后端 API 展示${primaryResource.label}列表。</p>
+        </div>
+        <div class="status" id="status">正在初始化...</div>
+      </div>
+      <section class="panel">
+        <div class="toolbar">
+          <strong>${primaryResource.label}列表</strong>
+          <button type="button" id="refresh-btn">刷新</button>
+        </div>
+        <div class="cards" id="record-list"></div>
+      </section>
+    </div>
+    <script>
+      const state = { records: [] };
+      const els = {
+        status: document.getElementById("status"),
+        list: document.getElementById("record-list"),
+        refresh: document.getElementById("refresh-btn"),
+      };
+
+      function setStatus(message, isError = false) {
+        els.status.textContent = message;
+        els.status.style.color = isError ? "#dc2626" : "#2563eb";
+      }
+
+      function renderRecords() {
+        if (!state.records.length) {
+          els.list.innerHTML = "<div class='card'><p>暂无${primaryResource.label}数据。</p></div>";
+          return;
+        }
+        els.list.innerHTML = state.records.map((record) => {
+          const title = record.title || record.name || record.label || record.id || "未命名${primaryResource.label}";
+          const description = record.description || record.author || record.category || "";
+          return \`<article class="card">
+            <h3>\${title}</h3>
+            <p>\${description || "-"}</p>
+          </article>\`;
+        }).join("");
+      }
+
+      async function requestJson(url) {
+        const response = await fetch(url, { headers: { "Content-Type": "application/json" } });
+        const text = await response.text();
+        const data = text ? JSON.parse(text) : {};
+        if (!response.ok) {
+          throw new Error(data.message || data.error || \`请求失败: \${response.status}\`);
+        }
+        return data;
+      }
+
+      async function loadRecords() {
+        try {
+          setStatus("正在加载${primaryResource.label}列表...");
+          const data = await requestJson("${primaryResource.resourcePath}");
+          state.records = Array.isArray(data.data) ? data.data : Array.isArray(data) ? data : [];
+          renderRecords();
+          setStatus(\`已加载 \${state.records.length} 条${primaryResource.label}数据\`);
+        } catch (error) {
+          setStatus(error.message, true);
+        }
+      }
+
+      els.refresh.addEventListener("click", loadRecords);
+      loadRecords();
+    </script>
+  </body>
+</html>
+`;
+    }
     return `<!DOCTYPE html>
 <html lang="zh-CN">
   <head>

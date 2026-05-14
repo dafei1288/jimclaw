@@ -38,6 +38,34 @@ function hasCrudEntity(ctx: ScaffoldContext): boolean {
   return (crudEntities.length + entities.length) > 0;
 }
 
+function normalizeApiResourcePath(rawPath: string): string {
+  const normalized = String(rawPath || "").trim().replace(/\/+$/g, "") || "/";
+  return normalized
+    .replace(/\/:[^/]+(?:\/.*)?$/g, "")
+    .replace(/\/\{[^/]+\}(?:\/.*)?$/g, "");
+}
+
+function getResourceCapabilities(ctx: ScaffoldContext, plural: string) {
+  const fallbackPath = `/api/${plural}`;
+  const endpoints = ctx.apiContract?.endpoints || [];
+  const resourcePath =
+    endpoints
+      .map((endpoint: any) => String(endpoint.path || ""))
+      .find((endpointPath: string) => normalizeApiResourcePath(endpointPath) === fallbackPath) || fallbackPath;
+  const basePath = normalizeApiResourcePath(resourcePath);
+  const methods = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (normalizeApiResourcePath(String(endpoint.path || "")) !== basePath) continue;
+    methods.add(String(endpoint.method || "").toUpperCase());
+  }
+  return {
+    resourcePath: basePath,
+    supportsCreate: methods.has("POST"),
+    supportsUpdate: methods.has("PUT") || methods.has("PATCH"),
+    supportsDelete: methods.has("DELETE"),
+  };
+}
+
 // ── 模板生成 ──
 
 function generatePackageJson(ctx: ScaffoldContext): string {
@@ -240,6 +268,78 @@ button:disabled { opacity: 0.6; cursor: not-allowed; }
 function generateCrudListVue(ctx: ScaffoldContext, singular: string, plural: string): string {
   const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
   const titleField = singular === "task" ? "title" : "name";
+  const capabilities = getResourceCapabilities(ctx, plural);
+  if (!capabilities.supportsCreate && !capabilities.supportsUpdate && !capabilities.supportsDelete) {
+    return `<template>
+  <div class="${singular}-list">
+    <h2>${pascal}列表</h2>
+    <table v-if="items.length">
+      <thead>
+        <tr>
+          <th>ID</th>
+          <th>${pascal === "Task" ? "Title" : "Name"}</th>
+          <th>Description</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="item in items" :key="item.id">
+          <td>{{ item.id }}</td>
+          <td>{{ item.${titleField} }}</td>
+          <td>{{ item.description }}</td>
+          <td>{{ item.status }}</td>
+        </tr>
+      </tbody>
+    </table>
+    <p v-else>暂无${pascal}数据</p>
+    <p v-if="error" class="error">{{ error }}</p>
+  </div>
+</template>
+
+<script setup lang="ts">
+import { ref, onMounted } from 'vue';
+import { fetch${pascal}List } from '../api/${plural}';
+
+interface ${pascal}Item {
+  id: number;
+  ${titleField}: string;
+  description?: string;
+  status?: string;
+  [key: string]: any;
+}
+
+const items = ref<${pascal}Item[]>([]);
+const error = ref('');
+
+async function loadItems() {
+  try {
+    error.value = '';
+    items.value = await fetch${pascal}List();
+  } catch (e: any) {
+    error.value = e.message || '加载失败';
+  }
+}
+
+onMounted(loadItems);
+</script>
+
+<style scoped>
+.${singular}-list { margin: 20px 0; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+}
+th, td {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid #eee;
+}
+th { background: #f5f5f5; }
+.error { color: red; margin-top: 12px; }
+</style>
+`;
+  }
   return `<template>
   <div class="${singular}-list">
     <h2>${pascal}管理</h2>
@@ -396,13 +496,9 @@ th { background: #f5f5f5; }
 
 function generateApiModule(ctx: ScaffoldContext, singular: string, plural: string): string {
   const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
-  return `const API_BASE = '/api/${plural}';
-
-export async function fetch${pascal}List(): Promise<any[]> {
-  const res = await fetch(API_BASE);
-  if (!res.ok) throw new Error('Failed to fetch ${plural}');
-  return res.json();
-}
+  const capabilities = getResourceCapabilities(ctx, plural);
+  const createBlock = capabilities.supportsCreate
+    ? `
 
 export async function create${pascal}(data: Record<string, any>): Promise<any> {
   const res = await fetch(API_BASE, {
@@ -413,6 +509,10 @@ export async function create${pascal}(data: Record<string, any>): Promise<any> {
   if (!res.ok) throw new Error('Failed to create ${singular}');
   return res.json();
 }
+`
+    : "";
+  const updateBlock = capabilities.supportsUpdate
+    ? `
 
 export async function update${pascal}(id: number, data: Record<string, any>): Promise<any> {
   const res = await fetch(API_BASE + '/' + id, {
@@ -423,6 +523,10 @@ export async function update${pascal}(id: number, data: Record<string, any>): Pr
   if (!res.ok) throw new Error('Failed to update ${singular}');
   return res.json();
 }
+`
+    : "";
+  const deleteBlock = capabilities.supportsDelete
+    ? `
 
 export async function delete${pascal}(id: number): Promise<void> {
   const res = await fetch(API_BASE + '/' + id, {
@@ -430,6 +534,16 @@ export async function delete${pascal}(id: number): Promise<void> {
   });
   if (!res.ok && res.status !== 204) throw new Error('Failed to delete ${singular}');
 }
+`
+    : "";
+  return `const API_BASE = '/api/${plural}';
+
+export async function fetch${pascal}List(): Promise<any[]> {
+  const res = await fetch(API_BASE);
+  if (!res.ok) throw new Error('Failed to fetch ${plural}');
+  return res.json();
+}
+${createBlock}${updateBlock}${deleteBlock}
 `;
 }
 

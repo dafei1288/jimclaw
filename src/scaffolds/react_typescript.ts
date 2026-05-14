@@ -36,6 +36,34 @@ function hasCrudEntity(ctx: ScaffoldContext): boolean {
   return (crudEntities.length + entities.length) > 0;
 }
 
+function normalizeApiResourcePath(rawPath: string): string {
+  const normalized = String(rawPath || "").trim().replace(/\/+$/g, "") || "/";
+  return normalized
+    .replace(/\/:[^/]+(?:\/.*)?$/g, "")
+    .replace(/\/\{[^/]+\}(?:\/.*)?$/g, "");
+}
+
+function getResourceCapabilities(ctx: ScaffoldContext, plural: string) {
+  const fallbackPath = `/api/${plural}`;
+  const endpoints = ctx.apiContract?.endpoints || [];
+  const resourcePath =
+    endpoints
+      .map((endpoint: any) => String(endpoint.path || ""))
+      .find((endpointPath: string) => normalizeApiResourcePath(endpointPath) === fallbackPath) || fallbackPath;
+  const basePath = normalizeApiResourcePath(resourcePath);
+  const methods = new Set<string>();
+  for (const endpoint of endpoints) {
+    if (normalizeApiResourcePath(String(endpoint.path || "")) !== basePath) continue;
+    methods.add(String(endpoint.method || "").toUpperCase());
+  }
+  return {
+    resourcePath: basePath,
+    supportsCreate: methods.has("POST"),
+    supportsUpdate: methods.has("PUT") || methods.has("PATCH"),
+    supportsDelete: methods.has("DELETE"),
+  };
+}
+
 // ── 模板生成 ──
 
 function generatePackageJson(ctx: ScaffoldContext): string {
@@ -145,7 +173,51 @@ function generateApiModule(ctx: ScaffoldContext): string {
   const singular = inferEntitySingular(ctx);
   const plural = inferEntityPlural(ctx);
   const entityCap = singular.charAt(0).toUpperCase() + singular.slice(1);
-  return `const API_BASE = '/api';
+  const capabilities = getResourceCapabilities(ctx, plural);
+  const apiBase = capabilities.resourcePath.replace(new RegExp(`/${plural}$`, "i"), "") || "/api";
+  const payloadBlock = capabilities.supportsCreate || capabilities.supportsUpdate
+    ? `
+export interface Create${entityCap}Payload {
+  ${singular === "todo" ? "name: string;" : singular === "article" ? "title: string;\n  content: string;" : "name: string;\n  description?: string;"}
+}
+`
+    : "";
+  const createBlock = capabilities.supportsCreate
+    ? `
+
+  create: async (data: Create${entityCap}Payload): Promise<${entityCap}> => {
+    const res = await fetch(\`\${API_BASE}/${plural}\`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(\`Failed to create ${singular}\`);
+    return res.json();
+  },`
+    : "";
+  const updateBlock = capabilities.supportsUpdate
+    ? `
+
+  update: async (id: string, data: Partial<Create${entityCap}Payload>): Promise<${entityCap}> => {
+    const res = await fetch(\`\${API_BASE}/${plural}/\${id}\`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(data),
+    });
+    if (!res.ok) throw new Error(\`Failed to update ${singular}\`);
+    return res.json();
+  },`
+    : "";
+  const deleteBlock = capabilities.supportsDelete
+    ? `
+
+  delete: async (id: string): Promise<void> => {
+    const res = await fetch(\`\${API_BASE}/${plural}/\${id}\`, { method: 'DELETE' });
+    if (!res.ok && res.status !== 204) throw new Error(\`Failed to delete ${singular}\`);
+  },`
+    : "";
+
+  return `const API_BASE = '${apiBase}';
 
 export interface ${entityCap} {
   id: string;
@@ -156,10 +228,7 @@ export interface ${entityCap} {
   createdAt?: string;
   updatedAt?: string;
 }
-
-export interface Create${entityCap}Payload {
-  ${singular === "todo" ? "name: string;" : singular === "article" ? "title: string;\n  content: string;" : "name: string;\n  description?: string;"}
-}
+${payloadBlock}
 
 export const ${singular}Api = {
   list: async (): Promise<${entityCap}[]> => {
@@ -173,31 +242,7 @@ export const ${singular}Api = {
     if (!res.ok) throw new Error(\`Failed to fetch ${singular}\`);
     return res.json();
   },
-
-  create: async (data: Create${entityCap}Payload): Promise<${entityCap}> => {
-    const res = await fetch(\`\${API_BASE}/${plural}\`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) throw new Error(\`Failed to create ${singular}\`);
-    return res.json();
-  },
-
-  update: async (id: string, data: Partial<Create${entityCap}Payload>): Promise<${entityCap}> => {
-    const res = await fetch(\`\${API_BASE}/${plural}/\${id}\`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    if (!res.ok) throw new Error(\`Failed to update ${singular}\`);
-    return res.json();
-  },
-
-  delete: async (id: string): Promise<void> => {
-    const res = await fetch(\`\${API_BASE}/${plural}/\${id}\`, { method: 'DELETE' });
-    if (!res.ok && res.status !== 204) throw new Error(\`Failed to delete ${singular}\`);
-  },
+${createBlock}${updateBlock}${deleteBlock}
 };
 `;
 }
@@ -207,6 +252,54 @@ function generateCrudListTsx(ctx: ScaffoldContext): string {
   const plural = inferEntityPlural(ctx);
   const entityCap = singular.charAt(0).toUpperCase() + singular.slice(1);
   const field = singular === "todo" ? "name" : singular === "article" ? "title" : "name";
+  const capabilities = getResourceCapabilities(ctx, plural);
+
+  if (!capabilities.supportsCreate && !capabilities.supportsUpdate && !capabilities.supportsDelete) {
+    return `import { useState, useEffect, useCallback } from 'react';
+import { ${singular}Api } from '../api';
+
+export default function ${entityCap}List() {
+  const [items, setItems] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+
+  const fetchItems = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError('');
+      const data = await ${singular}Api.list();
+      setItems(data);
+    } catch (e: any) {
+      setError(e.message);
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { fetchItems(); }, [fetchItems]);
+
+  return (
+    <div style={{ maxWidth: 600, margin: '2rem auto', fontFamily: 'sans-serif' }}>
+      <h1>${entityCap} List</h1>
+      {error && <p style={{ color: 'red' }}>{error}</p>}
+      {loading ? (
+        <p>Loading...</p>
+      ) : items.length === 0 ? (
+        <p>No ${plural} yet.</p>
+      ) : (
+        <ul style={{ listStyle: 'none', padding: 0 }}>
+          {items.map((item) => (
+            <li key={item.id} style={{ padding: '0.5rem', borderBottom: '1px solid #eee' }}>
+              <span>{item.${field}}</span>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+`;
+  }
 
   return `import { useState, useEffect, useCallback } from 'react';
 import { ${singular}Api, Create${entityCap}Payload } from '../api';

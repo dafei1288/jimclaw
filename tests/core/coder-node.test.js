@@ -3203,6 +3203,100 @@ test("express template scaffold routes React frontend files to React provider", 
   assert.doesNotMatch(appCode, /<template>/);
 });
 
+test("GET-only frontend scaffold omits write controls for static page", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["展示商品列表", "提供商品列表 API GET /api/products"],
+    acceptanceCriteria: ["页面只展示商品列表。"],
+  });
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "商品目录应用" },
+    requirementProtocol,
+    apiContract: { endpoints: [{ method: "GET", path: "/api/products" }] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      filesToCreate: ["src/index.ts", "public/index.html"],
+    },
+  });
+
+  const html = getDeterministicTemplateScaffold(state, "public/index.html");
+
+  assert.match(html, /商品列表/);
+  assert.doesNotMatch(html, /method = id \? "PUT" : "POST"/);
+  assert.doesNotMatch(html, /method: "DELETE"/);
+  assert.doesNotMatch(html, /新增商品|编辑商品|删除商品|保存商品/);
+});
+
+test("GET-only React frontend scaffold omits write APIs and controls", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["使用 React 展示商品列表", "提供商品列表 API GET /api/products"],
+    acceptanceCriteria: ["React 页面只展示商品列表。"],
+  });
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "商品目录应用" },
+    requirementProtocol,
+    apiContract: { endpoints: [{ method: "GET", path: "/api/products" }] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      frontend: {
+        language: "TypeScript",
+        framework: "React",
+        buildCommand: "cd frontend && npm run build",
+        testCommand: "cd frontend && npx vitest run",
+        outputDir: "frontend/dist",
+        sourceDir: "frontend",
+      },
+      filesToCreate: ["frontend/src/api.ts", "frontend/src/components/ProductList.tsx"],
+    },
+  });
+
+  const apiCode = getDeterministicTemplateScaffold(state, "frontend/src/api.ts");
+  const listCode = getDeterministicTemplateScaffold(state, "frontend/src/components/ProductList.tsx");
+
+  assert.doesNotMatch(apiCode, /create:|update:|delete:/);
+  assert.doesNotMatch(apiCode, /method: 'POST'|method: 'PUT'|method: 'DELETE'/);
+  assert.doesNotMatch(listCode, /handleCreate|handleDelete|CreateProductPayload|Add|Delete/);
+});
+
+test("GET-only Vue frontend scaffold omits write APIs and controls", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["使用 Vue 展示商品列表", "提供商品列表 API GET /api/products"],
+    acceptanceCriteria: ["Vue 页面只展示商品列表。"],
+  });
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "商品目录应用" },
+    requirementProtocol,
+    apiContract: { endpoints: [{ method: "GET", path: "/api/products" }] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      frontend: {
+        language: "TypeScript",
+        framework: "Vue",
+        buildCommand: "cd frontend && npm run build",
+        testCommand: "cd frontend && npx vitest run",
+        outputDir: "frontend/dist",
+        sourceDir: "frontend",
+      },
+      filesToCreate: ["frontend/src/api/products.ts", "frontend/src/components/ProductList.vue"],
+    },
+  });
+
+  const apiCode = getDeterministicTemplateScaffold(state, "frontend/src/api/products.ts");
+  const listCode = getDeterministicTemplateScaffold(state, "frontend/src/components/ProductList.vue");
+
+  assert.doesNotMatch(apiCode, /createProduct|updateProduct|deleteProduct/);
+  assert.doesNotMatch(apiCode, /method: 'POST'|method: 'PUT'|method: 'DELETE'/);
+  assert.doesNotMatch(listCode, /createItem|updateItem|deleteItem|新增|删除/);
+});
+
 test("express template scaffold deterministically generates auth api baseline test", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
