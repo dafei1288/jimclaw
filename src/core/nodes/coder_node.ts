@@ -179,9 +179,18 @@ function isCompactAuthFallbackRuntimeScaffoldFile(state: JimClawState, fileTarge
   );
 }
 
+function isPlanningFallbackCoreRuntimeScaffoldFile(state: JimClawState, fileTarget: string): boolean {
+  if (!isPlanningFallbackActive(state)) return false;
+  const role = getCheckpointRole(state, fileTarget);
+  return ["entry", "route", "controller", "service", "repository", "model", "middleware"].includes(role);
+}
+
 function isAcceptedFallbackValidationArtifact(state: JimClawState, fileTarget: string, generationSource?: string): boolean {
   if (generationSource !== "deterministic_scaffold") return true;
-  return isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget);
+  return (
+    isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget) ||
+    isPlanningFallbackCoreRuntimeScaffoldFile(state, fileTarget)
+  );
 }
 
 function resolveAllowedDeterministicScaffold(state: JimClawState, fileTarget: string): string {
@@ -190,7 +199,8 @@ function resolveAllowedDeterministicScaffold(state: JimClawState, fileTarget: st
   const scaffoldAllowed = Boolean(
     !isPlanningFallbackActive(state) ||
     isSafeDeterministicScaffoldFile(fileTarget) ||
-    isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget)
+    isCompactAuthFallbackRuntimeScaffoldFile(state, fileTarget) ||
+    isPlanningFallbackCoreRuntimeScaffoldFile(state, fileTarget)
   );
   return scaffoldAllowed ? deterministicScaffold : "";
 }
@@ -1781,43 +1791,45 @@ export async function coderNode(
   const qaFailedSet_preWrite = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
   const overwriteSet_preWrite = new Set(state.modifyFilesToOverwrite || []);
   let preWrittenCount = 0;
-  for (const task of subTasks as any[]) {
-    if (task.status === "completed") continue;
-    if (skipOutOfSprintScope(task)) continue;
-    // 增量修改：需要重写的已有文件不走 scaffold 预写入
-    if (overwriteSet_preWrite.has(task.fileTarget)) continue;
-    const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
-    if (!scaffold) continue;
-    const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
-    const isProtected =
-      isStructuralConfigFile(task.fileTarget) ||
-      isQaRecoverableDeterministicScaffoldFile(task.fileTarget);
-    if (fileFailed && !isProtected) continue;
-    const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
-    if (validationError) continue;
-    // 写盘
-    const filePath = path.join(WORKSPACE, task.fileTarget);
-    try {
-      await fs.mkdir(path.dirname(filePath), { recursive: true });
-      await fs.writeFile(filePath, scaffold, "utf-8");
-      filesContent[task.fileTarget] = scaffold;
-      task.status = "completed";
-      delete task.lastError;
-      const alreadyLogged = codeLogEntries.some(
-        (entry) => entry.file === task.fileTarget && entry.status === "written"
-      );
-      if (!alreadyLogged) {
-        codeLogEntries.push({
-          round: currentRetry,
-          file: task.fileTarget,
-          taskTitle: task.description.slice(0, 80),
-          status: "written",
-          generationSource: "deterministic_scaffold",
-        });
+  if (maxParallel <= 1) {
+    for (const task of subTasks as any[]) {
+      if (task.status === "completed") continue;
+      if (skipOutOfSprintScope(task)) continue;
+      // 增量修改：需要重写的已有文件不走 scaffold 预写入
+      if (overwriteSet_preWrite.has(task.fileTarget)) continue;
+      const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
+      if (!scaffold) continue;
+      const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
+      const isProtected =
+        isStructuralConfigFile(task.fileTarget) ||
+        isQaRecoverableDeterministicScaffoldFile(task.fileTarget);
+      if (fileFailed && !isProtected) continue;
+      const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
+      if (validationError) continue;
+      // 写盘
+      const filePath = path.join(WORKSPACE, task.fileTarget);
+      try {
+        await fs.mkdir(path.dirname(filePath), { recursive: true });
+        await fs.writeFile(filePath, scaffold, "utf-8");
+        filesContent[task.fileTarget] = scaffold;
+        task.status = "completed";
+        delete task.lastError;
+        const alreadyLogged = codeLogEntries.some(
+          (entry) => entry.file === task.fileTarget && entry.status === "written"
+        );
+        if (!alreadyLogged) {
+          codeLogEntries.push({
+            round: currentRetry,
+            file: task.fileTarget,
+            taskTitle: task.description.slice(0, 80),
+            status: "written",
+            generationSource: "deterministic_scaffold",
+          });
+        }
+        preWrittenCount++;
+      } catch (e: any) {
+        emit("thinking", "System", `[Coder] 预写入 ${task.fileTarget} 失败: ${e.message}`, {});
       }
-      preWrittenCount++;
-    } catch (e: any) {
-      emit("thinking", "System", `[Coder] 预写入 ${task.fileTarget} 失败: ${e.message}`, {});
     }
   }
   if (preWrittenCount > 0) {

@@ -4577,7 +4577,7 @@ test("coder treats a complete code block response as first progress before the f
   }
 });
 
-test("coder does not auto-scaffold core service files after planning fallback, and blocks on real model timeout instead", async () => {
+test("coder uses deterministic CRUD runtime scaffolds after planning fallback without waiting for the model", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
   let chatCalls = 0;
@@ -4623,7 +4623,7 @@ test("coder does not auto-scaffold core service files after planning fallback, a
         fileTarget: "src/models/book.ts",
         dependencies: ["src/errors.ts"],
         contextRequirement: "none",
-        status: "completed",
+        status: "pending",
       },
       {
         id: "task-service",
@@ -4664,11 +4664,31 @@ test("coder does not auto-scaffold core service files after planning fallback, a
       recorder.save
     );
 
-    assert.equal(chatCalls, 1);
-    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").status, "failed");
-    assert.match(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").lastError || "", /单文件生成超时/);
-    assert.match(result.blockedReason || "", /单文件生成超时/);
-    assert.equal(result.qaFailures.failedFiles.includes("src/services/bookService.ts"), true);
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/models/book.ts").status, "completed");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/services/bookService.ts").status, "completed");
+    assert.equal(result.blockedReason || "", "");
+    const failedFiles = result.qaFailures?.failedFiles || [];
+    assert.equal(failedFiles.includes("src/models/book.ts"), false);
+    assert.equal(failedFiles.includes("src/services/bookService.ts"), false);
+    assert.equal(
+      result.codeLog.some(
+        (entry) =>
+          entry.file === "src/models/book.ts" &&
+          entry.status === "written" &&
+          entry.generationSource === "deterministic_scaffold"
+      ),
+      true
+    );
+    assert.equal(
+      result.codeLog.some(
+        (entry) =>
+          entry.file === "src/services/bookService.ts" &&
+          entry.status === "written" &&
+          entry.generationSource === "deterministic_scaffold"
+      ),
+      true
+    );
   } finally {
     await removeTempWorkspace(workspace);
   }
