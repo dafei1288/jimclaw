@@ -23,6 +23,7 @@
 
 import * as fs from "fs/promises";
 import * as path from "path";
+import { spawn } from "child_process";
 import {
   JimClawState,
   ConsensusEntry,
@@ -60,7 +61,6 @@ import {
   BackendFramework,
 } from "./graph_types";
 // ShellExecuteSkill no longer imported — host-level commands use host.exec() from infra
-// Only execInContainer remains in this file, which also uses host.exec()
 import { AuditLogger } from "../utils/audit";
 import { host } from "../infra";
 
@@ -6095,10 +6095,61 @@ export function prepareReplayStateFromCheckpoint(snapshot: { node: string; state
 /**
  * Docker 容器执行辅助
  */
+export function buildDockerExecArgs(
+  containerId: string,
+  command: string,
+  opts: { background?: boolean } = {}
+): string[] {
+  return [
+    "exec",
+    ...(opts.background ? ["-d"] : []),
+    "-w",
+    "/app",
+    containerId,
+    "sh",
+    "-c",
+    command,
+  ];
+}
+
+async function execDockerCliArgs(
+  args: string[],
+  opts: { timeout?: number } = {}
+): Promise<{ ok: boolean; stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let stdout = "";
+    let stderr = "";
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const child = spawn("docker", args, { env: process.env });
+    const finish = (result: { ok: boolean; stdout: string; stderr: string; exitCode: number | null; timedOut: boolean }) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+    timer = opts.timeout
+      ? setTimeout(() => {
+          child.kill("SIGTERM");
+          finish({ ok: false, stdout, stderr, exitCode: null, timedOut: true });
+        }, opts.timeout)
+      : undefined;
+
+    child.stdout?.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr?.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", (error) => {
+      finish({ ok: false, stdout, stderr: stderr + error.message, exitCode: null, timedOut: false });
+    });
+    child.on("close", (code) => {
+      finish({ ok: code === 0, stdout, stderr, exitCode: code, timedOut: false });
+    });
+  });
+}
+
 export async function execInContainer(containerId: string, command: string, opts: { timeout?: number; background?: boolean } = {}): Promise<string> {
   if (opts.background) {
-    const bgResult = await host.exec(
-      `docker exec -d -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
+    const bgResult = await execDockerCliArgs(
+      buildDockerExecArgs(containerId, command, { background: true }),
       { timeout: 10000 }
     );
     return bgResult.stdout + bgResult.stderr;
@@ -6106,8 +6157,8 @@ export async function execInContainer(containerId: string, command: string, opts
 // ═══════════════════════════════════════════════════════════════════════
 // §11 容器执行 (execInContainer)
 // ═══════════════════════════════════════════════════════════════════════
-  const result = await host.exec(
-    `docker exec -w /app ${containerId} sh -c ${JSON.stringify(command)}`,
+  const result = await execDockerCliArgs(
+    buildDockerExecArgs(containerId, command),
     { timeout: opts.timeout ?? 90000 }
   );
   if (result.timedOut) {
