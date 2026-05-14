@@ -128,6 +128,51 @@ test("orchestrator backfills incomplete task graph into executable plan", async 
   }
 });
 
+test("orchestrator injected frontend task follows GET-only API contract", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["需要前端页面", "提供商品列表 API GET /api/products"],
+    acceptanceCriteria: ["页面展示商品列表。"],
+  });
+  const state = createBaseState({
+    requirementProtocol,
+    spec: {
+      language: "TypeScript",
+      testCommand: "npm test",
+      entryPoint: "src/index.ts",
+      filesToCreate: ["package.json", "src/index.ts", "public/index.html", "tests/products.test.ts"],
+    },
+    manifest: { services: [{ name: "api", port: 10000 }], environment: {}, sharedConfig: {} },
+    apiContract: { endpoints: [{ method: "GET", path: "/api/products", description: "商品列表" }] },
+  });
+  state.executionProtocol = buildExecutionProtocol(state.spec, state.manifest, state.apiContract, requirementProtocol);
+
+  const agent = createPmAgent(JSON.stringify([
+    { id: "task-1", fileTarget: "src/index.ts", description: "入口", dependencies: [], contextRequirement: "启动服务" },
+    { id: "task-2", fileTarget: "tests/products.test.ts", description: "测试", dependencies: ["src/index.ts"], contextRequirement: "业务测试" },
+  ]));
+
+  try {
+    const result = await orchestratorNode(
+      state,
+      { pm: agent },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const frontendTask = result.subTasks.find((task) => task.fileTarget === "public/index.html");
+    assert.ok(frontendTask);
+    assert.match(frontendTask.contextRequirement, /API 契约/);
+    assert.doesNotMatch(frontendTask.contextRequirement, /新增|编辑|删除/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("orchestrator normalizes aliased task graph and keeps simple CRUD plan within budget", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

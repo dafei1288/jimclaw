@@ -4940,12 +4940,15 @@ export function generateFallbackSubTasks(spec: any, apiContract: any): any[] {
     if (file.includes("package.json") && tasks.some(t => t.fileTarget === "package.json")) return;
     const dependencies = inferFallbackDependencies(file, taskFiles, runtime);
 
+    const contextRequirement = /^public\/|^frontend\//i.test(file)
+      ? "基于 API 契约实现前端交互，只调用已声明端点；未声明写接口时保持只读，使用相对路径 fetch('/api/...') 调用后端。"
+      : `根据技术规范实现 ${file} 的核心逻辑`;
     tasks.push({
       id: `fallback_task_${index}`,
       description: `实现文件: ${file}`,
       fileTarget: file,
       dependencies,
-      contextRequirement: `根据技术规范实现 ${file} 的核心逻辑`
+      contextRequirement
     });
   });
 

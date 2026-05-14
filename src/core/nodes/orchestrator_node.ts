@@ -146,7 +146,7 @@ ${JSON.stringify(executionProtocol, null, 2)}
         fileTarget: "public/index.html",
         description: "实现前端页面入口（自动注入）",
         dependencies: ["src/index.ts"].filter((dep) => filesToCreate.includes(dep)),
-        contextRequirement: "用户明确要求前后端。生成单文件前端页面，基于 API 契约提供列表、新增、编辑、删除交互，使用相对路径 fetch('/api/...') 调用后端。",
+        contextRequirement: "用户明确要求前端页面。基于 API 契约实现前端交互，只调用已声明端点；未声明写接口时保持只读，使用相对路径 fetch('/api/...') 调用后端。",
         status: "pending",
       });
     }
