@@ -112,6 +112,11 @@ function isStructuralConfigFile(fileTarget: string): boolean {
   );
 }
 
+function isQaRecoverableDeterministicScaffoldFile(fileTarget: string): boolean {
+  const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
+  return normalized === "public/index.html";
+}
+
 function isSafeDeterministicScaffoldFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
   return (
@@ -1784,7 +1789,9 @@ export async function coderNode(
     const scaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
     if (!scaffold) continue;
     const fileFailed = qaFailedSet_preWrite.has(task.fileTarget.replace(/\\/g, "/"));
-    const isProtected = isStructuralConfigFile(task.fileTarget);
+    const isProtected =
+      isStructuralConfigFile(task.fileTarget) ||
+      isQaRecoverableDeterministicScaffoldFile(task.fileTarget);
     if (fileFailed && !isProtected) continue;
     const validationError = validateGeneratedFileContent(task.fileTarget, scaffold);
     if (validationError) continue;
@@ -1795,6 +1802,19 @@ export async function coderNode(
       await fs.writeFile(filePath, scaffold, "utf-8");
       filesContent[task.fileTarget] = scaffold;
       task.status = "completed";
+      delete task.lastError;
+      const alreadyLogged = codeLogEntries.some(
+        (entry) => entry.file === task.fileTarget && entry.status === "written"
+      );
+      if (!alreadyLogged) {
+        codeLogEntries.push({
+          round: currentRetry,
+          file: task.fileTarget,
+          taskTitle: task.description.slice(0, 80),
+          status: "written",
+          generationSource: "deterministic_scaffold",
+        });
+      }
       preWrittenCount++;
     } catch (e: any) {
       emit("thinking", "System", `[Coder] 预写入 ${task.fileTarget} 失败: ${e.message}`, {});
@@ -2065,7 +2085,10 @@ CMD ["node", "dist/index.js"]`;
       const qaFailedSet = new Set((state.qaFailures?.failedFiles || []).map(f => f.replace(/\\/g, "/")));
       const fileFailedByQa = qaFailedSet.has(task.fileTarget.replace(/\\/g, "/"));
       // 配置文件（Cargo.toml, go.mod, pom.xml 等）即使被 QA 标记也始终使用 scaffold
-      const isProtectedConfig = isStructuralConfigFile(task.fileTarget) && Boolean(deterministicScaffold);
+      const isProtectedConfig =
+        Boolean(deterministicScaffold) &&
+        (isStructuralConfigFile(task.fileTarget) ||
+          isQaRecoverableDeterministicScaffoldFile(task.fileTarget));
       // 增量修改：overwrite 文件必须走 LLM，不用 scaffold
       const isOverwriteTarget = state.modifyFilesToOverwrite?.includes(task.fileTarget);
       const scaffoldAllowed = !isOverwriteTarget && Boolean(deterministicScaffold) && (!fileFailedByQa || isProtectedConfig);

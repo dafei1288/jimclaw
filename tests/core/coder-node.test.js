@@ -5050,6 +5050,89 @@ test("coder allows fallback peripheral ui and test files to use deterministic sc
   }
 });
 
+test("coder restores qa-failed public index page from deterministic scaffold without model extraction", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express",
+    testCommand: "npm test",
+    filesToCreate: ["package.json", "public/index.html"],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统" },
+    spec,
+    qaFailures: {
+      isDone: false,
+      failedFiles: ["public/index.html"],
+      issues: ["public/index.html 文件缺失"],
+      testErrors: ["public/index.html 文件缺失"],
+      summary: "静态页面文件缺失",
+    },
+    subTasks: [
+      {
+        id: "task-package",
+        description: "package ready",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-ui",
+        description: "restore ui shell",
+        fileTarget: "public/index.html",
+        dependencies: ["package.json"],
+        contextRequirement: "恢复页面入口",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "package.json": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n",
+    }),
+  });
+
+  try {
+    await fs.writeFile(path.join(workspace, "package.json"), "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n");
+
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            throw new Error("public/index.html 不应走模型生成");
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.blockedReason, "");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "public/index.html").status, "completed");
+    const html = await fs.readFile(path.join(workspace, "public", "index.html"), "utf-8");
+    assert.match(html, /<!DOCTYPE html>/i);
+    assert.match(html, /图书管理系统/);
+    assert.equal(
+      result.codeLog.some(
+        (entry) => entry.file === "public/index.html" && entry.generationSource === "deterministic_scaffold"
+      ),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder recovers a previously timed-out file from disk before starting the next retry round", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
