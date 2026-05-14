@@ -111,6 +111,36 @@ test("buildExecutionProtocol does not synthesize write endpoints for read-only b
   assert.deepEqual(bookEndpoints, ["GET /api/books"]);
 });
 
+test("ensureRequirementDrivenApiContract prunes unrequested entity write endpoints", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: [
+      "使用 TypeScript 与 Express 创建可运行服务。",
+      "实现商品列表页面路由 GET /products。",
+      "实现商品列表 JSON API 路由 GET /api/products。",
+    ],
+    acceptanceCriteria: ["GET /api/products 返回商品数组。"],
+  });
+
+  const apiContract = ensureRequirementDrivenApiContract(
+    {
+      endpoints: [
+        { method: "GET", path: "/api/products", description: "商品列表" },
+        { method: "POST", path: "/api/products", description: "创建商品" },
+        { method: "PUT", path: "/api/products/:id", description: "更新商品" },
+        { method: "DELETE", path: "/api/products/:id", description: "删除商品" },
+      ],
+    },
+    requirementProtocol
+  );
+
+  const productEndpoints = apiContract.endpoints
+    .map((endpoint) => `${endpoint.method} ${endpoint.path}`)
+    .filter((endpoint) => endpoint.includes("/api/products"));
+
+  assert.deepEqual(productEndpoints, ["GET /api/products"]);
+});
+
 test("ensureRequirementDrivenApiContract synthesizes write endpoints for explicit entity mutations", () => {
   const requirementProtocol = buildRequirementProtocol({
     title: "图书管理系统",

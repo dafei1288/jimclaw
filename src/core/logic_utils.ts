@@ -1204,6 +1204,15 @@ export function ensureRequirementDrivenApiContract(
     const text = String(line || "");
     return /\b(POST|PUT|PATCH|DELETE)\b/i.test(text) || Boolean(writeNearResource?.test(text));
   });
+  if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && !explicitlyWantsWrite) {
+    for (const [key, endpoint] of Array.from(endpointMap.entries())) {
+      const method = String(endpoint.method || "").toUpperCase();
+      if (!["POST", "PUT", "PATCH", "DELETE"].includes(method)) continue;
+      if (normalizeApiResourcePath(endpoint.path) === basePath) {
+        endpointMap.delete(key);
+      }
+    }
+  }
   if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && (explicitlyWantsRead || explicitlyWantsWrite)) {
     ensureEndpoint("GET", basePath, `${resourceLabel}列表`);
   }
