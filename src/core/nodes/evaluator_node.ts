@@ -81,14 +81,18 @@ async function stopPreviousEvaluatorRuntime(workspace: string): Promise<void> {
   }
 }
 
-function buildContainerEvaluatorLaunchCommand(runCmd: string, port: number): string {
-  const effectiveRunCmd = `PORT=${port} HOST=0.0.0.0 ${runCmd}`;
-  const escapedRunCmd = effectiveRunCmd.replace(/"/g, '\\"');
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`;
+}
+
+export function buildContainerEvaluatorLaunchCommand(runCmd: string, port: number): string {
+  const effectiveRunCmd = `exec env PORT=${port} HOST=0.0.0.0 ${runCmd}`;
+  const innerRunCmd = `echo $$ >/tmp/jimclaw/evaluator.pid; ${effectiveRunCmd}`;
   return [
     "mkdir -p /tmp/jimclaw",
     "if [ -f /tmp/jimclaw/evaluator.pid ]; then kill $(cat /tmp/jimclaw/evaluator.pid) 2>/dev/null || true; fi",
     ": > /tmp/jimclaw/evaluator.log",
-    `nohup sh -c "${escapedRunCmd}" >/tmp/jimclaw/evaluator.log 2>&1 & echo $! >/tmp/jimclaw/evaluator.pid`,
+    `sh -c ${shellSingleQuote(innerRunCmd)} >/tmp/jimclaw/evaluator.log 2>&1`,
   ].join("; ");
 }
 
@@ -142,7 +146,7 @@ async function ensureRuntimeForHttpChecks(
 
   if (state.containerId) {
     const containerPort = state.manifest?.services?.[0]?.port || port;
-    await execInContainer(state.containerId, buildContainerEvaluatorLaunchCommand(runCmd, containerPort));
+    await execInContainer(state.containerId, buildContainerEvaluatorLaunchCommand(runCmd, containerPort), { background: true });
     await waitForRuntime(origin);
     return {
       statePatch: {

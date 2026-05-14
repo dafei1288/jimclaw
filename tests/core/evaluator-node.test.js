@@ -11,7 +11,10 @@ const {
 require("ts-node/register/transpile-only");
 
 const { host } = require("../../src/infra");
-const { evaluatorNode } = require("../../src/core/nodes/evaluator_node");
+const {
+  buildContainerEvaluatorLaunchCommand,
+  evaluatorNode,
+} = require("../../src/core/nodes/evaluator_node");
 
 function createSprintContract(checks) {
   return {
@@ -131,6 +134,16 @@ test("evaluator starts a temporary runtime before http checks when deploy has no
     host.killProcess = originalKillProcess;
     await removeTempWorkspace(workspace);
   }
+});
+
+test("container evaluator runtime command runs in foreground for docker exec detached mode", () => {
+  const command = buildContainerEvaluatorLaunchCommand("npm start", 4000);
+
+  assert.doesNotMatch(command, /nohup/);
+  assert.doesNotMatch(command, /& echo/);
+  assert.match(command, /echo \$\$ >\/tmp\/jimclaw\/evaluator\.pid/);
+  assert.match(command, /exec env PORT=4000 HOST=0\.0\.0\.0 npm start/);
+  assert.match(command, />\/tmp\/jimclaw\/evaluator\.log 2>&1/);
 });
 
 test("evaluator http failure records suspected files and validation report", async () => {
