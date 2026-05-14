@@ -131,6 +131,66 @@ test("ensureRequirementDrivenApiContract synthesizes write endpoints for explici
   assert.deepEqual(bookEndpoints, ["GET /api/books", "POST /api/books", "PUT /api/books/:id", "DELETE /api/books/:id"]);
 });
 
+test("buildExecutionProtocol emits frontend contract for React SPA", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["使用 React 构建现代前端页面", "提供商品列表 API GET /api/products"],
+    acceptanceCriteria: ["前端可以展示商品列表。", "GET /api/products 返回商品数组。"],
+  });
+
+  const protocol = buildExecutionProtocol(
+    {
+      language: "TypeScript",
+      framework: "Express.js ^4.18",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      frontend: {
+        language: "TypeScript",
+        framework: "React",
+        buildCommand: "cd frontend && npm run build",
+        testCommand: "cd frontend && npx vitest run",
+        outputDir: "frontend/dist",
+        sourceDir: "frontend",
+      },
+      filesToCreate: [
+        "package.json",
+        "tsconfig.json",
+        "src/index.ts",
+        "tests/products.test.ts",
+        "frontend/package.json",
+        "frontend/index.html",
+        "frontend/src/main.tsx",
+        "frontend/src/App.tsx",
+        "frontend/src/api.ts",
+      ],
+    },
+    {
+      services: [{ name: "api", port: 4100 }],
+    },
+    {
+      endpoints: [{ method: "GET", path: "/api/products", description: "返回商品数组" }],
+    },
+    requirementProtocol
+  );
+
+  assert.deepEqual(protocol.project.workspaceLayout.frontendRoots, ["frontend"]);
+  assert.equal(protocol.contracts.frontend.appType, "spa");
+  assert.equal(protocol.contracts.frontend.framework, "react");
+  assert.equal(protocol.contracts.frontend.rootDir, "frontend");
+  assert.deepEqual(protocol.contracts.frontend.entryFiles, ["frontend/index.html", "frontend/src/main.tsx", "frontend/src/App.tsx"]);
+  assert.deepEqual(protocol.contracts.frontend.apiUsage, [
+    {
+      resourcePath: "/api/products",
+      methods: ["GET"],
+      supportsList: true,
+      supportsCreate: false,
+      supportsUpdate: false,
+      supportsDelete: false,
+    },
+  ]);
+});
+
 test("buildSolutionProtocol reports uncovered frontend requirements when no UI files exist", () => {
   const requirementProtocol = buildRequirementProtocol({
     title: "图书管理系统",

@@ -37,6 +37,8 @@ import {
   TraceTimelineEntry,
   TokenUsageSummary,
   ExecutionProtocol,
+  FrontendApiUsage,
+  FrontendContract,
   ExecutionPlan,
   ExecutionPlanFile,
   ExecutionPlanTask,
@@ -1253,6 +1255,107 @@ export function buildSolutionProtocol(
   };
 }
 
+function detectFrontendRoots(files: string[] = []): string[] {
+  const normalizedFiles = files.map((file) => String(file || "").replace(/\\/g, "/"));
+  if (normalizedFiles.some((file) => /^frontend\//i.test(file))) {
+    return ["frontend"];
+  }
+  if (normalizedFiles.some((file) => /^public\//i.test(file))) {
+    return ["public"];
+  }
+  return [];
+}
+
+function normalizeApiResourcePath(rawPath: string): string {
+  const normalized = String(rawPath || "").trim().replace(/\/+$/g, "") || "/";
+  return normalized
+    .replace(/\/:[^/]+(?:\/.*)?$/g, "")
+    .replace(/\/\{[^/]+\}(?:\/.*)?$/g, "")
+    .replace(/\/[0-9a-f-]{8,}(?:\/.*)?$/gi, "");
+}
+
+function deriveFrontendApiUsage(
+  apiContract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined
+): FrontendApiUsage[] {
+  const resourceMethods = new Map<string, Set<string>>();
+  for (const endpoint of apiContract?.endpoints || []) {
+    const method = String(endpoint.method || "").toUpperCase();
+    const endpointPath = String(endpoint.path || "");
+    if (!method || !endpointPath || /^\/?(api\/)?health\/?$/i.test(endpointPath.replace(/^\/+/, ""))) {
+      continue;
+    }
+    const resourcePath = normalizeApiResourcePath(endpointPath);
+    if (!resourceMethods.has(resourcePath)) {
+      resourceMethods.set(resourcePath, new Set<string>());
+    }
+    resourceMethods.get(resourcePath)?.add(method);
+  }
+
+  const methodOrder = ["GET", "POST", "PUT", "PATCH", "DELETE"];
+  return Array.from(resourceMethods.entries()).map(([resourcePath, methodSet]) => {
+    const methods = Array.from(methodSet).sort((a, b) => {
+      const ai = methodOrder.indexOf(a);
+      const bi = methodOrder.indexOf(b);
+      return (ai === -1 ? methodOrder.length : ai) - (bi === -1 ? methodOrder.length : bi) || a.localeCompare(b);
+    });
+    return {
+      resourcePath,
+      methods,
+      supportsList: methodSet.has("GET"),
+      supportsCreate: methodSet.has("POST"),
+      supportsUpdate: methodSet.has("PUT") || methodSet.has("PATCH"),
+      supportsDelete: methodSet.has("DELETE"),
+    };
+  });
+}
+
+function buildFrontendContract(
+  spec: { frontend?: any; filesToCreate?: string[] } | null | undefined,
+  apiContract: { endpoints?: Array<{ path: string; method: string }> } | null | undefined,
+  files: string[] = []
+): FrontendContract {
+  const roots = detectFrontendRoots(files);
+  const rootDir = roots[0] || "";
+  const frontendFramework = String(spec?.frontend?.framework || "").toLowerCase();
+  const normalizedFiles = files.map((file) => String(file || "").replace(/\\/g, "/"));
+  const framework: FrontendContract["framework"] =
+    rootDir === "frontend"
+      ? frontendFramework.includes("react") || normalizedFiles.some((file) => /\.tsx$/i.test(file))
+        ? "react"
+        : frontendFramework.includes("vue") || normalizedFiles.some((file) => /\.vue$/i.test(file))
+          ? "vue"
+          : frontendFramework.includes("svelte")
+            ? "svelte"
+            : "react"
+      : rootDir === "public"
+        ? "vanilla"
+        : "none";
+  const appType: FrontendContract["appType"] = rootDir === "frontend" ? "spa" : rootDir === "public" ? "static" : "none";
+  const entryFiles = normalizedFiles
+    .filter((file) => {
+      if (rootDir === "frontend") {
+        return /^frontend\/index\.html$/i.test(file) || /^frontend\/src\/(main|app)\.(ts|tsx|js|jsx|vue|svelte)$/i.test(file);
+      }
+      return /^public\/index\.html$/i.test(file);
+    })
+    .sort((a, b) => {
+      const order = ["index.html", "src/main.ts", "src/main.tsx", "src/app.ts", "src/app.tsx", "src/app.vue", "src/app.svelte"];
+      const relA = a.replace(/^frontend\//i, "").replace(/^public\//i, "").toLowerCase();
+      const relB = b.replace(/^frontend\//i, "").replace(/^public\//i, "").toLowerCase();
+      const ai = order.indexOf(relA);
+      const bi = order.indexOf(relB);
+      return (ai === -1 ? order.length : ai) - (bi === -1 ? order.length : bi) || relA.localeCompare(relB);
+    });
+
+  return {
+    appType,
+    framework,
+    rootDir: rootDir as FrontendContract["rootDir"],
+    entryFiles,
+    apiUsage: deriveFrontendApiUsage(apiContract),
+  };
+}
+
 export function buildExecutionProtocol(
   spec: { language?: string; framework?: string; filesToCreate?: string[]; runCommand?: string; testCommand?: string; entryPoint?: string } | null | undefined,
   manifest: { services?: Array<{ port?: number }> } | null | undefined,
@@ -1277,6 +1380,8 @@ export function buildExecutionProtocol(
     (apiContract?.endpoints || []).find((endpoint) => String(endpoint.method || "").toUpperCase() === "GET")?.path ||
     "/api/health";
   const files = normalizedSpec.filesToCreate || [];
+  const frontendRoots = detectFrontendRoots(files);
+  const frontendContract = buildFrontendContract(normalizedSpec, apiContract, files);
   const fileContracts: Record<string, ExecutionProtocolFileContract> = {};
   for (const file of files) {
     const normalizedFile = String(file).replace(/\\/g, "/");
@@ -1301,7 +1406,7 @@ export function buildExecutionProtocol(
       workspaceLayout: {
         sourceRoots: ["src"],
         testRoots: getExpectedJestRoots(normalizedSpec),
-        frontendRoots: hasFrontendFiles(files) ? ["public"] : [],
+        frontendRoots,
         entryFiles: normalizedSpec.entryPoint ? [normalizedSpec.entryPoint.replace(/\\/g, "/")] : [getEntryPoint({ spec: normalizedSpec } as JimClawState)],
         configFiles: files
           .filter((file: string) => inferProtocolFileRole(file) === "config")
@@ -1318,6 +1423,7 @@ export function buildExecutionProtocol(
           method: String(endpoint.method || "").toUpperCase(),
         })),
       },
+      frontend: frontendContract,
       files: fileContracts,
     },
     runtime: {

@@ -523,6 +523,23 @@ export interface ExecutionProtocolFileContract {
   notes?: string[];
 }
 
+export interface FrontendApiUsage {
+  resourcePath: string;
+  methods: string[];
+  supportsList: boolean;
+  supportsCreate: boolean;
+  supportsUpdate: boolean;
+  supportsDelete: boolean;
+}
+
+export interface FrontendContract {
+  appType: "none" | "static" | "spa";
+  framework: "none" | "vanilla" | "react" | "vue" | "svelte";
+  rootDir: "" | "public" | "frontend";
+  entryFiles: string[];
+  apiUsage: FrontendApiUsage[];
+}
+
 export interface RequirementProtocol {
   version: "v1";
   userIntent: {
@@ -644,6 +661,7 @@ export interface ExecutionProtocol {
         ownerFile?: string;
       }>;
     };
+    frontend: FrontendContract;
     files: Record<string, ExecutionProtocolFileContract>;
   };
   runtime: {
