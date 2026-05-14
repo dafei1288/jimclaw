@@ -535,27 +535,37 @@ function buildCrudApiTestScaffold(
   const singularPascal = toPascalCase(singularStem);
   const ownedEndpoints = inferOwnedEndpoints(`src/routes/${normalizedPlural}.ts`, state.apiContract);
   const resourcePath = deriveRouteMountPath(ownedEndpoints, `/api/${normalizedPlural}`);
-  const payloadCode = buildCrudEntityPayloadCode(singularStem);
+  const methodSet = new Set(ownedEndpoints.map((endpoint) => endpoint.split(/\s+/, 1)[0].toUpperCase()));
+  const supportsWrite = methodSet.has("POST");
+  const payloadCode = supportsWrite ? buildCrudEntityPayloadCode(singularStem) : "";
+  const payloadBlock = supportsWrite
+    ? `
+function buildPayload(suffix = "1") {
+  return ${payloadCode};
+}
+`
+    : "";
+  const writeAssertionBlock = supportsWrite
+    ? `
+  it("未认证写入请求返回受控状态", async () => {
+    const response = await request(app).post(RESOURCE_PATH).send(buildPayload("http"));
+    expect([201, 400, 401, 403, 422]).toContain(response.status);
+  });
+`
+    : "";
 
   return `import request from "supertest";
 import app from "../src/index";
 
 const RESOURCE_PATH = "${resourcePath}";
-
-function buildPayload(suffix = "1") {
-  return ${payloadCode};
-}
+${payloadBlock}
 
 describe("${singularPascal} API 基线", () => {
   it("GET 列表接口返回受控响应", async () => {
     const response = await request(app).get(RESOURCE_PATH);
     expect(response.status).toBeLessThan(500);
   });
-
-  it("未认证写入请求返回受控状态", async () => {
-    const response = await request(app).post(RESOURCE_PATH).send(buildPayload("http"));
-    expect([201, 400, 401, 403, 422]).toContain(response.status);
-  });
+${writeAssertionBlock}
 });
 `;
 }

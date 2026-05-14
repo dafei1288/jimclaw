@@ -3073,6 +3073,101 @@ test("express template scaffold deterministically generates bounded crud api tes
   }
 });
 
+test("express template scaffold does not generate write assertions when api contract only declares GET", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统" },
+    requirementProtocol: {
+      version: "v1",
+      userIntent: {
+        title: "图书管理系统",
+        requirements: ["展示图书列表"],
+        acceptanceCriteria: ["GET /api/books 返回图书数组"],
+      },
+      capabilities: {
+        frontendRequired: false,
+        backendRequired: true,
+        authRequired: false,
+        auditLogRequired: false,
+        dockerRequired: false,
+        entities: ["book"],
+        crudEntities: ["book"],
+        uiCapabilities: ["list"],
+      },
+    },
+    apiContract: {
+      endpoints: [
+        { method: "GET", path: "/api/books" },
+      ],
+    },
+    manifest: { services: [{ name: "app", port: 10000 }] },
+    spec: {
+      language: "TypeScript",
+      dependencies: { express: "^4.18.2" },
+      devDependencies: {
+        typescript: "^5.3.3",
+        jest: "^29.7.0",
+        "ts-jest": "^29.1.1",
+        "@types/jest": "^29.5.11",
+        "@types/node": "^20.10.0",
+      },
+      filesToCreate: ["src/index.ts", "tests/books.test.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-index-ready",
+        description: "index ready",
+        fileTarget: "src/index.ts",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-books-test",
+        description: "write books test",
+        fileTarget: "tests/books.test.ts",
+        dependencies: ["src/index.ts"],
+        contextRequirement: "none",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return { content: "```typescript\nexport const nope = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 0);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "tests/books.test.ts").status, "completed");
+    const testCode = await fs.readFile(`${workspace}/tests/books.test.ts`, "utf-8");
+    assert.match(testCode, /request\(app\)\.get\(RESOURCE_PATH\)/);
+    assert.doesNotMatch(testCode, /\.post\(RESOURCE_PATH\)/);
+    assert.doesNotMatch(testCode, /buildPayload/);
+    assert.doesNotMatch(testCode, /未认证写入请求/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("express template scaffold deterministically generates auth api baseline test", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
