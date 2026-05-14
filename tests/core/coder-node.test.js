@@ -5432,6 +5432,138 @@ test("coder detects dependency deadlock instead of spinning forever when subtask
   }
 });
 
+test("coder does not deadlock entry generation on deferred public page dependencies during core phase", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "先完成核心运行时文件",
+        filesLikelyTouched: [
+          "package.json",
+          "tsconfig.json",
+          "jest.config.cjs",
+          "src/models/book.ts",
+          "src/services/bookService.ts",
+          "src/index.ts",
+        ],
+        implementationSteps: ["实现入口和核心运行时"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: [
+          "package.json",
+          "tsconfig.json",
+          "jest.config.cjs",
+          "src/models/book.ts",
+          "src/services/bookService.ts",
+          "src/index.ts",
+        ],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 6,
+      },
+      status: "agreed",
+    }],
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统", requirements: [], acceptanceCriteria: [] },
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      filesToCreate: [
+        "package.json",
+        "tsconfig.json",
+        "jest.config.cjs",
+        "src/models/book.ts",
+        "src/services/bookService.ts",
+        "public/index.html",
+        "src/index.ts",
+        "tests/setup.test.ts",
+        "tests/books.test.ts",
+        "README.md",
+      ],
+      dependencies: { express: "^4.18.2" },
+      devDependencies: { typescript: "^5.3.3", jest: "^29.7.0", "ts-jest": "^29.1.1" },
+    },
+    manifest: { services: [{ name: "api", port: 4000 }] },
+    apiContract: {
+      endpoints: [
+        { method: "GET", path: "/books" },
+        { method: "GET", path: "/api/books" },
+        { method: "GET", path: "/api/health" },
+      ],
+    },
+    code: JSON.stringify({
+      "package.json": "{}",
+      "tsconfig.json": "{}",
+      "jest.config.cjs": "module.exports = {};",
+      "src/models/book.ts": "export interface Book { id: string; title: string; }\n",
+      "src/services/bookService.ts": "export function listBooks() { return []; }\n",
+    }),
+    subTasks: [
+      { id: "task-package", description: "package", fileTarget: "package.json", dependencies: [], contextRequirement: "", status: "completed" },
+      { id: "task-tsconfig", description: "tsconfig", fileTarget: "tsconfig.json", dependencies: ["package.json"], contextRequirement: "", status: "completed" },
+      { id: "task-jest", description: "jest", fileTarget: "jest.config.cjs", dependencies: ["package.json", "tsconfig.json"], contextRequirement: "", status: "completed" },
+      { id: "task-model", description: "model", fileTarget: "src/models/book.ts", dependencies: ["tsconfig.json"], contextRequirement: "", status: "completed" },
+      { id: "task-service", description: "service", fileTarget: "src/services/bookService.ts", dependencies: ["src/models/book.ts"], contextRequirement: "", status: "completed" },
+      { id: "task-public", description: "public page", fileTarget: "public/index.html", dependencies: ["package.json"], contextRequirement: "", status: "pending" },
+      { id: "task-entry", description: "entry", fileTarget: "src/index.ts", dependencies: ["tsconfig.json", "src/services/bookService.ts", "public/index.html"], contextRequirement: "", status: "pending" },
+      { id: "task-setup-test", description: "setup test", fileTarget: "tests/setup.test.ts", dependencies: ["jest.config.cjs", "src/index.ts"], contextRequirement: "", status: "pending" },
+      { id: "task-books-test", description: "books test", fileTarget: "tests/books.test.ts", dependencies: ["jest.config.cjs", "src/index.ts"], contextRequirement: "", status: "pending" },
+      { id: "task-readme", description: "readme", fileTarget: "README.md", dependencies: [], contextRequirement: "", status: "pending" },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请实现\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            return {
+              content: "```typescript\nimport express from \"express\";\nimport { listBooks } from \"./services/bookService\";\nconst app = express();\napp.get(\"/books\", (_req, res) => res.type(\"text/html\").send(\"<h1>图书列表</h1>\"));\napp.get(\"/api/books\", (_req, res) => res.json(listBooks()));\napp.get(\"/api/health\", (_req, res) => res.json({ status: \"ok\" }));\nexport default app;\n```",
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason || "", "");
+    assert.deepEqual(attemptedTargets, ["src/index.ts"]);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/index.ts").status, "completed");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "public/index.html").status, "pending");
+    assert.equal(
+      result.codeLog.some((entry) => entry.file === "src/index.ts" && entry.generationSource === "model"),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder does not treat completed task-id dependencies as deadlock", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

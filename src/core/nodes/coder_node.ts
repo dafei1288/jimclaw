@@ -58,7 +58,7 @@ function getCheckpointRole(state: JimClawState, fileTarget: string): string {
 
 function isAppShellFile(fileTarget: string): boolean {
   const normalized = normalizeTaskFileTarget(fileTarget).toLowerCase();
-  return /(^|\/)(app|server|main)\.(ts|tsx|js|jsx|py|go)$/i.test(normalized);
+  return /(^|\/)(app|server|main|index)\.(ts|tsx|js|jsx|py|go)$/i.test(normalized);
 }
 
 function isPeripheralFile(fileTarget: string): boolean {
@@ -185,6 +185,31 @@ function isPlanningFallbackCoreRuntimeScaffoldFile(state: JimClawState, fileTarg
   return ["entry", "route", "controller", "service", "repository", "model", "middleware"].includes(role);
 }
 
+function isHealthOrRootEndpoint(endpointPath: string): boolean {
+  const normalized = `/${String(endpointPath || "").trim().replace(/^\/+/, "")}`.replace(/\/+$/, "") || "/";
+  return (
+    normalized === "/" ||
+    normalized === "/health" ||
+    normalized === "/api/health" ||
+    normalized.startsWith("/api/health/")
+  );
+}
+
+function hasDedicatedBusinessRouteFile(state: JimClawState): boolean {
+  return (state.spec?.filesToCreate || [])
+    .map((file) => normalizeTaskFileTarget(file).toLowerCase())
+    .some((file) => /^src\/routes\/.+\.(ts|js)$/i.test(file) && !/\/health\.(ts|js)$/i.test(file));
+}
+
+function shouldForceModelForBusinessEntryScaffold(state: JimClawState, fileTarget: string): boolean {
+  const role = getCheckpointRole(state, fileTarget);
+  if (role !== "entry" && !isAppShellFile(fileTarget)) return false;
+  const businessEndpointCount = (state.apiContract?.endpoints || [])
+    .filter((endpoint: any) => !isHealthOrRootEndpoint(String(endpoint?.path || "")))
+    .length;
+  return businessEndpointCount > 0 && !hasDedicatedBusinessRouteFile(state);
+}
+
 function isAcceptedFallbackValidationArtifact(state: JimClawState, fileTarget: string, generationSource?: string): boolean {
   if (generationSource !== "deterministic_scaffold") return true;
   return (
@@ -196,6 +221,7 @@ function isAcceptedFallbackValidationArtifact(state: JimClawState, fileTarget: s
 function resolveAllowedDeterministicScaffold(state: JimClawState, fileTarget: string): string {
   const deterministicScaffold = getDeterministicTemplateScaffold(state, fileTarget);
   if (!deterministicScaffold) return "";
+  if (shouldForceModelForBusinessEntryScaffold(state, fileTarget)) return "";
   const scaffoldAllowed = Boolean(
     !isPlanningFallbackActive(state) ||
     isSafeDeterministicScaffoldFile(fileTarget) ||
@@ -729,6 +755,14 @@ export function normalizeStructuralDependencies(
       }
       for (const dependency of pickSameStemTargets(controllerTargets, fileTarget, dependencyStem)) nextDependencies.add(dependency);
       for (const dependency of pickSameStemTargets(middlewareTargets, fileTarget, dependencyStem, { includeCrossCutting: true })) nextDependencies.add(dependency);
+    }
+
+    if (isAppShellFile(fileTarget)) {
+      for (const dependency of Array.from(nextDependencies)) {
+        if (isCorePhaseDeferredFile(dependency)) {
+          nextDependencies.delete(dependency);
+        }
+      }
     }
 
     task.dependencies = Array.from(nextDependencies);
