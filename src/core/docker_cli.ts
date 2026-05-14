@@ -2,15 +2,28 @@ import * as path from "path";
 
 function quoteShellArg(value: string): string {
   const raw = String(value || "");
-  if (process.platform === "win32") {
-    return `"${raw.replace(/"/g, '""')}"`;
-  }
   return `'${raw.replace(/'/g, `'\\''`)}'`;
 }
 
-function buildDockerBindMountArg(workspace: string, target = "/app"): string {
+function escapeWindowsCmdToken(value: string): string {
+  return String(value || "").replace(/([ \t&()^|<>%])/g, "^$1");
+}
+
+function normalizeDockerBindSourcePath(workspace: string): string {
   const source = path.resolve(workspace);
-  return `--mount ${quoteShellArg(`type=bind,source=${source},target=${target}`)}`;
+  if (process.platform === "win32") {
+    return source.replace(/\\/g, "/");
+  }
+  return source;
+}
+
+function buildDockerBindMountArg(workspace: string, target = "/app"): string {
+  const source = normalizeDockerBindSourcePath(workspace);
+  const mountSpec = `type=bind,source=${source},target=${target}`;
+  if (process.platform === "win32") {
+    return `--mount ${escapeWindowsCmdToken(mountSpec)}`;
+  }
+  return `--mount ${quoteShellArg(mountSpec)}`;
 }
 
 function buildDockerCacheVolumeArgs(language: string): string[] {

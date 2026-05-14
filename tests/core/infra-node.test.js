@@ -75,7 +75,9 @@ test("single-container docker run uses bind mount syntax for Windows workspace p
   });
 
   assert.match(command, /docker run -d --name jimclaw_run_20260514/);
-  assert.match(command, /--mount\s+"?type=bind,source=.*D:\\working\\mycode\\jimclaw\\workspace\\run_20260514,target=\/app"?/);
+  assert.match(command, /--mount type=bind,source=D:\/working\/mycode\/jimclaw\/workspace\/run_20260514,target=\/app/);
+  assert.doesNotMatch(command, /--mount\s+["']/);
+  assert.doesNotMatch(command, /source=D:\\/);
   assert.doesNotMatch(command, /-v\s+"D:\\working\\mycode\\jimclaw\\workspace\\run_20260514:\/app"/);
   assert.match(command, /-w \/app node:20-alpine tail -f \/dev\/null/);
 });
