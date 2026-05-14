@@ -96,10 +96,14 @@ export function buildContainerEvaluatorLaunchCommand(runCmd: string, port: numbe
   ].join("; ");
 }
 
+function isTransientRuntimeReadinessError(error: string): boolean {
+  return /ECONNREFUSED|ECONNRESET|socket hang up|connect|timed?out|timeout/i.test(error);
+}
+
 async function waitForRuntime(origin: string): Promise<void> {
-  for (let attempt = 0; attempt < 10; attempt++) {
+  for (let attempt = 0; attempt < 30; attempt++) {
     const result = await host.httpGet(origin, 1000);
-    if (result.statusCode || (result.error && !/ECONNREFUSED|connect/i.test(result.error))) return;
+    if (result.statusCode || (result.error && !isTransientRuntimeReadinessError(result.error))) return;
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
 }

@@ -136,6 +136,65 @@ test("evaluator starts a temporary runtime before http checks when deploy has no
   }
 });
 
+test("evaluator waits through transient ECONNRESET before http checks", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  const originalStartBackground = host.startBackground;
+  const originalKillProcess = host.killProcess;
+  const calls = [];
+  const responses = [
+    { error: "read ECONNRESET" },
+    { error: "read ECONNRESET" },
+    { statusCode: 200, body: "runtime ready" },
+    { statusCode: 200, body: "books ok" },
+  ];
+  host.startBackground = async () => 22334;
+  host.killProcess = async () => true;
+  host.httpGet = async (url) => {
+    calls.push(url);
+    return responses.shift() || { statusCode: 200, body: "ok" };
+  };
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        executionBackend: "host",
+        allocatedHostPort: 4102,
+        manifest: { services: [{ name: "app", port: 4102 }], environment: {}, sharedConfig: {} },
+        spec: { runCommand: "npm start" },
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-HTTP-1",
+          kind: "http",
+          description: "验证 GET /api/books",
+          method: "GET",
+          url: "/api/books",
+          expectedStatus: [200],
+        }])],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.evaluationResults[0].status, "pass");
+    assert.deepEqual(calls, [
+      "http://127.0.0.1:4102",
+      "http://127.0.0.1:4102",
+      "http://127.0.0.1:4102",
+      "http://127.0.0.1:4102/api/books",
+    ]);
+  } finally {
+    host.httpGet = originalHttpGet;
+    host.startBackground = originalStartBackground;
+    host.killProcess = originalKillProcess;
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("container evaluator runtime command runs in foreground for docker exec detached mode", () => {
   const command = buildContainerEvaluatorLaunchCommand("npm start", 4000);
 
