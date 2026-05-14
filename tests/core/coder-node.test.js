@@ -5215,6 +5215,90 @@ test("coder restores qa-failed setup test from deterministic scaffold without mo
   }
 });
 
+test("coder uses model for qa-failed deterministic scaffold when file is not recoverable", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const spec = {
+    language: "TypeScript",
+    framework: "Express",
+    testCommand: "npm test",
+    filesToCreate: ["package.json", "tests/auth.test.ts"],
+  };
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "图书管理系统" },
+    spec,
+    qaFailures: {
+      isDone: false,
+      failedFiles: ["tests/auth.test.ts"],
+      issues: ["tests/auth.test.ts 断言不符合当前契约"],
+      testErrors: ["tests/auth.test.ts 需要模型重写业务断言"],
+      summary: "业务测试需要重写",
+    },
+    subTasks: [
+      {
+        id: "task-package",
+        description: "package ready",
+        fileTarget: "package.json",
+        dependencies: [],
+        contextRequirement: "none",
+        status: "completed",
+      },
+      {
+        id: "task-auth-test",
+        description: "rewrite auth test",
+        fileTarget: "tests/auth.test.ts",
+        dependencies: ["package.json"],
+        contextRequirement: "重写业务测试",
+        status: "pending",
+      },
+    ],
+    code: JSON.stringify({
+      "package.json": "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n",
+    }),
+  });
+
+  try {
+    await fs.writeFile(path.join(workspace, "package.json"), "{\n  \"name\": \"demo\",\n  \"version\": \"1.0.0\"\n}\n");
+
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat() {
+            chatCalls += 1;
+            return {
+              content: "```typescript\ndescribe(\"auth contract\", () => {\n  it(\"uses model rewrite\", () => {\n    expect(true).toBe(true);\n  });\n});\n```",
+            };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(chatCalls, 1);
+    assert.equal(result.blockedReason, "");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "tests/auth.test.ts").status, "completed");
+    const authTest = await fs.readFile(path.join(workspace, "tests", "auth.test.ts"), "utf-8");
+    assert.match(authTest, /uses model rewrite/);
+    assert.equal(
+      result.codeLog.some(
+        (entry) => entry.file === "tests/auth.test.ts" && entry.generationSource === "model"
+      ),
+      true
+    );
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder recovers a previously timed-out file from disk before starting the next retry round", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

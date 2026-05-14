@@ -2097,16 +2097,15 @@ CMD ["node", "dist/index.js"]`;
       if (scaffoldAllowed) {
         generationSource = "deterministic_scaffold";
         extractResult = { isValid: true, code: deterministicScaffold, error: "" };
-      } else if (fileFailedByQa && deterministicScaffold) {
-        emit(
-          "thinking",
-          "System",
-          `[Coder] ${task.fileTarget} 被 QA 标记失败，跳过确定性骨架，强制走模型生成`,
-          { task }
-        );
-        extractResult = undefined; // 强制走模型生成
       } else {
-        if (deterministicScaffold && isPlanningFallbackActive(state)) {
+        if (fileFailedByQa && deterministicScaffold) {
+          emit(
+            "thinking",
+            "System",
+            `[Coder] ${task.fileTarget} 被 QA 标记失败，跳过确定性骨架，强制走模型生成`,
+            { task }
+          );
+        } else if (deterministicScaffold && isPlanningFallbackActive(state)) {
           emit(
             "thinking",
             "System",
