@@ -11,6 +11,7 @@ const {
   buildCustomerApprovalState,
   buildSystemContext,
   ensureTypeScriptTestBaseline,
+  ensureRequirementDrivenApiContract,
   stabilizeSpecForExecution,
 } = require("../../src/core/logic_utils");
 
@@ -59,6 +60,75 @@ test("buildExecutionProtocol emits normalized layout and file contracts", () => 
   assert.deepEqual(protocol.contracts.files["src/routes/users.ts"].ownedEndpoints, ["GET /api/users"]);
   assert.equal(protocol.runtime.listenPort, 12345);
   assert.equal(protocol.runtime.healthCheckPath, "/");
+});
+
+test("buildExecutionProtocol does not synthesize write endpoints for read-only book APIs", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "TypeScript Express 图书列表应用 MVP",
+    requirements: [
+      "使用 TypeScript 与 Express 创建服务端应用，并提供可启动的 HTTP 服务，包含图书数据的基础领域模型与最小必要的数据来源，以支撑页面与 API 返回一致的图书列表内容。",
+      "实现图书列表页面路由 /books，返回可在浏览器中访问的 HTML 内容，并展示图书列表中的关键信息，满足最小可用的列表浏览需求。",
+      "实现图书列表 JSON API 路由 /api/books，返回图书数组数据，响应格式稳定且可被自动化测试验证。",
+      "提供自动化测试与可执行的验证脚本，覆盖服务启动后对 /books 与 /api/books 的核心行为校验，确保应用功能可重复验证。",
+    ],
+    acceptanceCriteria: [
+      "访问 /books 时返回包含图书列表的 HTML 页面。",
+      "访问 GET /api/books 时返回图书数组 JSON。",
+      "GET /api/books returns a book array.",
+      "自动化测试覆盖 /books 与 GET /api/books。",
+    ],
+  });
+  assert.equal(requirementProtocol.capabilities.crudEntities.includes("book"), true);
+
+  const apiContract = ensureRequirementDrivenApiContract(
+    {
+      endpoints: [{ method: "GET", path: "/api/books", description: "返回图书数组" }],
+    },
+    requirementProtocol
+  );
+
+  const protocol = buildExecutionProtocol(
+    {
+      language: "TypeScript",
+      framework: "Express.js ^4.18",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      filesToCreate: ["package.json", "tsconfig.json", "src/index.ts", "src/bookService.ts", "tests/books.test.ts"],
+    },
+    {
+      services: [{ name: "api", port: 4000 }],
+    },
+    apiContract,
+    requirementProtocol
+  );
+
+  const bookEndpoints = protocol.contracts.api.endpoints
+    .map((endpoint) => `${endpoint.method} ${endpoint.path}`)
+    .filter((endpoint) => endpoint.includes("/api/books"));
+
+  assert.deepEqual(bookEndpoints, ["GET /api/books"]);
+});
+
+test("ensureRequirementDrivenApiContract synthesizes write endpoints for explicit entity mutations", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "图书管理系统",
+    requirements: ["前端页面支持图书列表、添加、编辑、删除。"],
+    acceptanceCriteria: ["用户可以新增图书、编辑图书并删除图书。"],
+  });
+
+  const apiContract = ensureRequirementDrivenApiContract(
+    {
+      endpoints: [{ method: "GET", path: "/api/books", description: "返回图书数组" }],
+    },
+    requirementProtocol
+  );
+
+  const bookEndpoints = apiContract.endpoints
+    .map((endpoint) => `${endpoint.method} ${endpoint.path}`)
+    .filter((endpoint) => endpoint.includes("/api/books"));
+
+  assert.deepEqual(bookEndpoints, ["GET /api/books", "POST /api/books", "PUT /api/books/:id", "DELETE /api/books/:id"]);
 });
 
 test("buildSolutionProtocol reports uncovered frontend requirements when no UI files exist", () => {

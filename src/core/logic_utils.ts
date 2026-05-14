@@ -65,6 +65,10 @@ import {
 import { AuditLogger } from "../utils/audit";
 import { host } from "../infra";
 
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 export function extractFailureEvidence(
   testOutput: string = "",
   deploymentStatus?: { status?: string } | null,
@@ -1157,12 +1161,29 @@ export function ensureRequirementDrivenApiContract(
     ensureEndpoint("GET", "/api/health", "健康检查");
   }
 
-  // 只有当 requirements 文本明确提到 CRUD 相关操作时才注入实体端点
-  // 奥卡姆剃刀:如果已有足够的端点覆盖需求,不额外注入
-  const reqText = (requirementProtocol?.userIntent?.requirements || []).join(" ").toLowerCase();
-  const explicitlyWantsCrud = /列表|list|查询|getAll|删除|delete|更新|update|编辑|edit/i.test(reqText);
-  if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && explicitlyWantsCrud) {
+  // 读写意图必须拆开判断：列表/查询只能补 GET，不能升级成完整 CRUD。
+  // 奥卡姆剃刀:如果已有足够的端点覆盖需求,不额外注入。
+  const intentLines = [...(requirementProtocol?.userIntent?.requirements || []), ...(requirementProtocol?.userIntent?.acceptanceCriteria || [])].map(String);
+  const reqText = intentLines.join(" ").toLowerCase();
+  const explicitlyWantsRead = /列表|查询|检索|浏览|展示|查看|获取|list|query|getall|findall|read/i.test(reqText);
+  const resourceTerms = [singular, plural, resourceLabel, basePath].filter(Boolean).map((term) => escapeRegExp(String(term)));
+  const resourceTermPattern = resourceTerms.length > 0 ? `(?:${resourceTerms.join("|")})` : "";
+  const mutationOperationPattern = "(?:新增|添加|编辑|修改|更新|删除|借阅|归还|预约|add|edit|update|delete|remove|borrow|reserve)";
+  const createOperationPattern = "(?:创建|create)";
+  const writeNearResource = resourceTermPattern
+    ? new RegExp(
+        `(?:${resourceTermPattern}.{0,30}${mutationOperationPattern}|${mutationOperationPattern}.{0,30}${resourceTermPattern}|${resourceTermPattern}.{0,12}${createOperationPattern}|${createOperationPattern}.{0,12}${resourceTermPattern})`,
+        "i"
+      )
+    : null;
+  const explicitlyWantsWrite = intentLines.some((line) => {
+    const text = String(line || "");
+    return /\b(POST|PUT|PATCH|DELETE)\b/i.test(text) || Boolean(writeNearResource?.test(text));
+  });
+  if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && (explicitlyWantsRead || explicitlyWantsWrite)) {
     ensureEndpoint("GET", basePath, `${resourceLabel}列表`);
+  }
+  if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && explicitlyWantsWrite) {
     ensureEndpoint("POST", basePath, `创建${resourceLabel}`);
     ensureEndpoint("PUT", `${basePath}/:id`, `更新${resourceLabel}`);
     ensureEndpoint("DELETE", `${basePath}/:id`, `删除${resourceLabel}`);
