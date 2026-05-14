@@ -1330,7 +1330,20 @@ export async function coderNode(
   const localRetryAttempts: Record<string, number> = {};
   const localRetryArtifacts: Record<string, string> = {};
 
+  const hasExplicitRepairTargetForFile = (fileTarget: string) => {
+    const normalized = normalizeTaskFileTarget(fileTarget);
+    return (
+      (state.repairPlan?.targets || []).some((target) => normalizeTaskFileTarget(target) === normalized) ||
+      (state.repairPlan?.allowedEdits || []).some((target) => normalizeTaskFileTarget(target) === normalized) ||
+      (state.validationReport?.findings || []).some((finding: any) =>
+        normalizeTaskFileTarget(finding?.file || "") === normalized
+      ) ||
+      (state.qaFailures?.failedFiles || []).some((target) => normalizeTaskFileTarget(target) === normalized)
+    );
+  };
+
   const skipOutOfSprintScope = (task: { fileTarget: string; status?: string; lastError?: string }) => {
+    if (hasExplicitRepairTargetForFile(task.fileTarget)) return false;
     if (!activeSprintContract || isFileAllowedBySprintContract(task.fileTarget, activeSprintContract)) return false;
     emit(
       "thinking",
@@ -1343,6 +1356,7 @@ export async function coderNode(
   const hasRepairOverrideForTask = (task: { fileTarget: string }) => {
     const normalized = normalizeTaskFileTarget(task.fileTarget);
     return (
+      hasExplicitRepairTargetForFile(task.fileTarget) ||
       (state.fixPlan || []).some((plan) => normalizeTaskFileTarget(plan.fileTarget) === normalized) ||
       (state.mediationDirectives || []).some((directive: any) =>
         normalizeTaskFileTarget(directive.file || "") === normalized ||

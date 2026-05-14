@@ -579,6 +579,106 @@ test("coder does not deadlock when only future sprint files remain pending", asy
   }
 });
 
+test("coder executes repair plan target even when it is outside active sprint scope", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "完成当前 Sprint 文件",
+        filesLikelyTouched: ["src/current.ts"],
+        implementationSteps: ["实现当前文件"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/current.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 1,
+      },
+      status: "agreed",
+    }],
+    validationReport: {
+      version: "v1",
+      status: "fail",
+      failureType: "planning_gap",
+      blocking: true,
+      findings: [{ type: "planning_gap", summary: "文件缺失: test/health.test.ts", file: "test/health.test.ts", evidence: ["文件缺失: test/health.test.ts"] }],
+    },
+    repairPlan: {
+      version: "v1",
+      repairType: "planning",
+      targets: ["test/health.test.ts"],
+      allowedEdits: ["test/health.test.ts"],
+      expectedEvidence: ["文件缺失: test/health.test.ts"],
+    },
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/current.ts", "test/health.test.ts"],
+    },
+    code: JSON.stringify({ "src/current.ts": "export const current = true;\n" }),
+    subTasks: [
+      {
+        id: "task-current",
+        description: "current",
+        fileTarget: "src/current.ts",
+        dependencies: [],
+        contextRequirement: "",
+        status: "completed",
+      },
+      {
+        id: "task-health",
+        description: "health test",
+        fileTarget: "test/health.test.ts",
+        dependencies: ["src/current.ts"],
+        contextRequirement: "",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请实现\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            return { content: "```typescript\ndescribe('health', () => { it('works', () => expect(true).toBe(true)); });\n```" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason, "");
+    assert.deepEqual(attemptedTargets, ["test/health.test.ts"]);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "test/health.test.ts").status, "completed");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder executes fixPlan target even when stale dependencies are not completed", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
