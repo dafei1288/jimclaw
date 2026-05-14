@@ -2028,6 +2028,7 @@ CMD ["node", "dist/index.js"]`;
       let lintPassed = false;
       let missingTargetDiagnostic = false;
       const unauthorizedWriteTargets = new Set<string>();
+      const authorizedSideEffectWriteTargets = new Set<string>();
       let rawResponseText = "";
 
       const normalizeWriteTarget = (rawTarget: string) => {
@@ -2036,6 +2037,14 @@ CMD ["node", "dist/index.js"]`;
         const absolute = path.isAbsolute(trimmed) ? trimmed : path.join(WORKSPACE, trimmed);
         const relative = path.relative(WORKSPACE, absolute).replace(/\\/g, "/");
         return relative.startsWith("..") ? trimmed.replace(/\\/g, "/") : relative;
+      };
+      const isAllowedSprintSideEffectWrite = (writtenTarget: string) => {
+        if (!activeSprintContract) return false;
+        if (normalizeTaskFileTarget(writtenTarget) === normalizeTaskFileTarget(task.fileTarget)) return false;
+        if (!isFileAllowedBySprintContract(writtenTarget, activeSprintContract)) return false;
+        return subTasks.some((candidate) =>
+          normalizeTaskFileTarget(candidate.fileTarget) === normalizeTaskFileTarget(writtenTarget)
+        );
       };
 
       const deterministicScaffold = resolveAllowedDeterministicScaffold(state, task.fileTarget);
@@ -2098,6 +2107,14 @@ CMD ["node", "dist/index.js"]`;
                         }
                       } catch { /* 忽略读取失败 */ }
                     }
+                  } else if (writtenTarget && isAllowedSprintSideEffectWrite(writtenTarget)) {
+                    authorizedSideEffectWriteTargets.add(writtenTarget);
+                    emit(
+                      "thinking",
+                      "System",
+                      `[Coder] 接受 SprintContract 授权的协同写入: ${writtenTarget}`,
+                      { task, writtenTarget }
+                    );
                   } else if (writtenTarget) {
                     unauthorizedWriteTargets.add(writtenTarget);
                     toolError = `检测到越权写文件：当前任务只允许写入 ${task.fileTarget}，但工具实际写入了 ${writtenTarget}`;
@@ -2286,6 +2303,39 @@ CMD ["node", "dist/index.js"]`;
           status: "written",
           generationSource: generationSource || "model",
         });
+        for (const sideEffectTarget of authorizedSideEffectWriteTargets) {
+          const sideEffectTask = subTasks.find((candidate) =>
+            normalizeTaskFileTarget(candidate.fileTarget) === normalizeTaskFileTarget(sideEffectTarget)
+          );
+          if (sideEffectTask?.status === "completed") continue;
+          const sideEffectDiskResult = await tryLoadValidatedDiskOutput(
+            WORKSPACE,
+            sideEffectTarget,
+            filesContent,
+            state.executionProtocol
+          );
+          if (!sideEffectDiskResult.ok) {
+            emit(
+              "thinking",
+              "System",
+              `[Coder] Sprint 协同写入 ${sideEffectTarget} 已保留，但暂未标记完成：${sideEffectDiskResult.error || "验证失败"}`,
+              { task, sideEffectTarget }
+            );
+            continue;
+          }
+          filesContent[sideEffectTarget] = sideEffectDiskResult.code || "";
+          if (sideEffectTask) {
+            sideEffectTask.status = "completed";
+            delete sideEffectTask.lastError;
+          }
+          codeLogEntries.push({
+            round: currentRetry,
+            file: sideEffectTarget,
+            taskTitle: sideEffectTask?.description?.slice(0, 80) || "Sprint 协同写入",
+            status: "written",
+            generationSource: "recovered_disk",
+          });
+        }
         const incrementalResult = {
           code: JSON.stringify(filesContent, null, 2),
           subTasks: [...subTasks],

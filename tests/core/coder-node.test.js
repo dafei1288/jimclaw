@@ -313,6 +313,105 @@ test("coder prompt includes active sprint contract context", async () => {
   }
 });
 
+test("coder accepts sibling file writes when active sprint contract allows them", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  let chatCalls = 0;
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "组装 Express app 与启动入口",
+        filesLikelyTouched: ["src/app.ts", "src/index.ts"],
+        implementationSteps: ["实现 app", "接入入口"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/app.ts", "src/index.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 2,
+      },
+      status: "agreed",
+    }],
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      testCommand: "npm test",
+      filesToCreate: ["src/app.ts", "src/index.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-app",
+        description: "app",
+        fileTarget: "src/app.ts",
+        dependencies: [],
+        contextRequirement: "实现 app 并保证入口可复用",
+        status: "pending",
+      },
+      {
+        id: "task-index",
+        description: "index",
+        fileTarget: "src/index.ts",
+        dependencies: ["src/app.ts"],
+        contextRequirement: "导入 app 并监听",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(_messages, onEvent) {
+            chatCalls += 1;
+            await fs.mkdir(path.join(workspace, "src"), { recursive: true });
+            await fs.writeFile(
+              path.join(workspace, "src", "app.ts"),
+              "import express from \"express\";\nconst app = express();\napp.get(\"/api/health\", (_req, res) => res.json({ status: \"ok\" }));\nexport default app;\n",
+              "utf-8"
+            );
+            await fs.writeFile(
+              path.join(workspace, "src", "index.ts"),
+              "import app from \"./app\";\nconst PORT = 4000;\nif (require.main === module) app.listen(PORT, \"0.0.0.0\");\nexport default app;\n",
+              "utf-8"
+            );
+            onEvent({ type: "tool_use", tool: "write_file", content: "Successfully wrote to src/app.ts", sender: "测试Coder" });
+            onEvent({ type: "tool_use", tool: "write_file", content: "Successfully wrote to src/index.ts", sender: "测试Coder" });
+            onEvent({ type: "tool_use", tool: "diagnose_code", content: "[SUCCESS] No TypeScript errors found.", sender: "测试Coder" });
+            return { content: "已完成 app 与入口接入。" };
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.blockedReason, "");
+    assert.equal(chatCalls, 1);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/app.ts").status, "completed");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/index.ts").status, "completed");
+    assert.match(await fs.readFile(path.join(workspace, "src", "index.ts"), "utf-8"), /import app from "\.\/app"/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder skips future sprint files instead of treating them as blocking failures", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
