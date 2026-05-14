@@ -12,6 +12,7 @@ const {
 } = require("./test-helpers");
 const { architectNode } = require("../../src/core/nodes/architect_node");
 const { AgentTimeoutError } = require("../../src/core/agent");
+const { buildCustomerApprovalState } = require("../../src/core/logic_utils");
 
 function createArchitectAgent(responses) {
   let index = 0;
@@ -85,6 +86,73 @@ test("architect emits technology decision on covered plan", async () => {
     assert.equal(result.solutionProtocol.coverage.coverageMatrix.length > 0, true);
     const specJson = JSON.parse(await fs.readFile(path.join(workspace, "spec.json"), "utf-8"));
     assert.equal(specJson.entryPoint, "src/index.ts");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("architect preserves previously approved requirements checkpoint", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const customerApprovalState = buildCustomerApprovalState({
+    autoApprove: { requirements: false, solution: false, deploy: false },
+    summaries: { requirements: "需求已人工确认" },
+  });
+  customerApprovalState.checkpoints = customerApprovalState.checkpoints.map((checkpoint) =>
+    checkpoint.stage === "requirements"
+      ? { ...checkpoint, approved: true, approvedBy: "customer", timestamp: "2026-05-14 13:00:00" }
+      : checkpoint
+  );
+  const state = createBaseState({
+    contract: {
+      title: "图书系统",
+      requirements: ["提供图书列表 API"],
+      acceptanceCriteria: ["GET /api/books 返回 200"],
+    },
+    customerApprovalState,
+  });
+  const agent = createArchitectAgent([
+    JSON.stringify({
+      spec: {
+        architecture: "Express API",
+        language: "TypeScript",
+        framework: "Express.js ^4.18",
+        testCommand: "npm test",
+        runCommand: "npm start",
+        entryPoint: "src/index.ts",
+        filesToCreate: ["package.json", "tsconfig.json", "src/index.ts", "tests/books.test.ts"],
+        interfaces: "REST API",
+        dependencies: { express: "^4.18.2" },
+        devDependencies: { typescript: "^5.0.0", jest: "^29.7.0", "ts-jest": "^29.1.1" },
+      },
+      manifest: {
+        services: [{ name: "api", port: 10000, description: "api" }],
+        environment: {},
+        sharedConfig: {},
+      },
+      apiContract: {
+        endpoints: [{ path: "/api/books", method: "GET", description: "图书列表" }],
+      },
+    }),
+    "# README",
+  ]);
+
+  try {
+    const result = await architectNode(
+      state,
+      { architect: agent },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const requirements = result.customerApprovalState.checkpoints.find((item) => item.stage === "requirements");
+    const solution = result.customerApprovalState.checkpoints.find((item) => item.stage === "solution");
+    assert.equal(requirements.approved, true);
+    assert.equal(requirements.approvedBy, "customer");
+    assert.equal(requirements.timestamp, "2026-05-14 13:00:00");
+    assert.equal(solution.approved, false);
   } finally {
     await removeTempWorkspace(workspace);
   }

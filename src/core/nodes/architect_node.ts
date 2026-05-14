@@ -1105,6 +1105,7 @@ ${langFileConstraints}
   const solutionProtocol = buildSolutionProtocol(requirementProtocol, spec, apiContract);
   const executionProtocol = buildExecutionProtocol(spec, manifest, apiContract, requirementProtocol);
   const customerApprovalState = buildCustomerApprovalState({
+    previous: state.customerApprovalState,
     autoApprove: state.customerApprovalState?.autoApprove,
     summaries: {
       requirements: state.customerApprovalState?.checkpoints?.find((item) => item.stage === "requirements")?.summary || `${state.contract?.title || "项目"}需求已确认`,

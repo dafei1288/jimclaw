@@ -59,6 +59,7 @@ import {
   VerificationKind,
   ProjectRuntime,
   BackendFramework,
+  CustomerApprovalState,
 } from "./graph_types";
 // ShellExecuteSkill no longer imported — host-level commands use host.exec() from infra
 import { AuditLogger } from "../utils/audit";
@@ -1514,6 +1515,7 @@ export function buildCustomerApprovalState(
   opts: {
     autoApprove?: Partial<{ requirements: boolean; solution: boolean; deploy: boolean }>;
     summaries?: Partial<Record<"requirements" | "solution" | "deploy", string>>;
+    previous?: CustomerApprovalState | null;
   } = {}
 ) {
   const autoApprove = {
@@ -1521,16 +1523,19 @@ export function buildCustomerApprovalState(
     solution: Boolean(opts.autoApprove?.solution),
     deploy: Boolean(opts.autoApprove?.deploy),
   };
+  const previousByStage = new Map(
+    (opts.previous?.checkpoints || []).map((checkpoint) => [checkpoint.stage, checkpoint])
+  );
   return {
     version: "v1" as const,
     autoApprove,
     checkpoints: (["requirements", "solution", "deploy"] as const).map((stage) => ({
       stage,
       required: true,
-      approved: autoApprove[stage],
-      approvedBy: autoApprove[stage] ? ("default-authorization" as const) : undefined,
+      approved: autoApprove[stage] || Boolean(previousByStage.get(stage)?.approved),
+      approvedBy: previousByStage.get(stage)?.approvedBy || (autoApprove[stage] ? ("default-authorization" as const) : undefined),
       summary: opts.summaries?.[stage] || "",
-      timestamp: autoApprove[stage] ? getBeijingTime() : undefined,
+      timestamp: previousByStage.get(stage)?.timestamp || (autoApprove[stage] ? getBeijingTime() : undefined),
     })),
   };
 }

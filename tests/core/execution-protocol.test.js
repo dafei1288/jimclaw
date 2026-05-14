@@ -127,6 +127,37 @@ test("control-plane builders produce technology, validation, repair and approval
   assert.equal(customerApprovalState.checkpoints[1].approved, false);
 });
 
+test("customer approval rebuild preserves existing manual approvals", () => {
+  const previous = buildCustomerApprovalState({
+    autoApprove: { requirements: false, solution: false, deploy: false },
+    summaries: { requirements: "旧需求摘要", solution: "旧方案摘要" },
+  });
+  previous.checkpoints = previous.checkpoints.map((checkpoint) =>
+    checkpoint.stage === "requirements"
+      ? {
+          ...checkpoint,
+          approved: true,
+          approvedBy: "customer",
+          timestamp: "2026-05-14 13:00:00",
+        }
+      : checkpoint
+  );
+
+  const rebuilt = buildCustomerApprovalState({
+    previous,
+    autoApprove: previous.autoApprove,
+    summaries: { requirements: "新需求摘要", solution: "新方案摘要" },
+  });
+
+  const requirements = rebuilt.checkpoints.find((item) => item.stage === "requirements");
+  const solution = rebuilt.checkpoints.find((item) => item.stage === "solution");
+  assert.equal(requirements.approved, true);
+  assert.equal(requirements.approvedBy, "customer");
+  assert.equal(requirements.timestamp, "2026-05-14 13:00:00");
+  assert.equal(requirements.summary, "新需求摘要");
+  assert.equal(solution.approved, false);
+});
+
 test("buildSystemContext includes control-plane summaries", () => {
   const requirementProtocol = buildRequirementProtocol({
     title: "demo",
