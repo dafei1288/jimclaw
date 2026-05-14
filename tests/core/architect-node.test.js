@@ -355,3 +355,44 @@ test("architect node falls back to a deterministic executable skeleton when mode
     await removeTempWorkspace(workspace);
   }
 });
+
+test("architect deterministic fallback plans React frontend files when explicitly requested", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const state = createBaseState({
+    userGoal: "创建一个 React 前后端分离商品目录应用，后端提供 GET /api/products",
+    contract: {
+      title: "商品目录应用",
+      requirements: ["使用 React 构建现代前端页面", "后端提供商品列表 API"],
+      acceptanceCriteria: ["React 页面可以展示商品列表。", "GET /api/products 返回商品数组。"],
+    },
+  });
+
+  try {
+    const result = await architectNode(
+      state,
+      {
+        architect: {
+          getPersona() {
+            return { name: "测试架构师" };
+          },
+          async chat() {
+            throw new AgentTimeoutError("测试架构师", 10);
+          },
+        },
+      },
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.spec.frontend.framework, "React");
+    assert.equal(result.spec.filesToCreate.includes("frontend/src/App.tsx"), true);
+    assert.equal(result.spec.filesToCreate.includes("frontend/src/main.tsx"), true);
+    assert.equal(result.spec.filesToCreate.includes("frontend/src/App.vue"), false);
+    assert.equal(result.spec.filesToCreate.includes("public/index.html"), false);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});

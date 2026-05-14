@@ -1033,7 +1033,8 @@ export function ensureRequirementDrivenFiles(
     }
   };
 
-  if (frontendRequired) {
+  const hasModernFrontend = Boolean((nextSpec as any).frontend) || files.some((file) => /^frontend\//i.test(String(file).replace(/\\/g, "/")));
+  if (frontendRequired && !hasModernFrontend) {
     ensureFile("public/index.html");
   }
 
@@ -3205,8 +3206,8 @@ function tryExternalScaffoldProvider(
     const { findScaffoldProvider, getScaffoldProviderById } = require("../scaffolds") as typeof import("../scaffolds");
     // 前端文件：使用前端 scaffold provider
     if (normalizedTarget.startsWith("frontend/")) {
-      // 根据架构师决定的前端框架选择 scaffold
-      const feFramework = state.spec?.framework?.toLowerCase() || "";
+      // 根据架构师决定的前端框架选择 scaffold，不能使用后端 framework。
+      const feFramework = String((state.spec as any)?.frontend?.framework || state.spec?.framework || "").toLowerCase();
       const feProviderId = feFramework.includes("react") ? "react-typescript" : "vue-typescript";
       const feProvider = getScaffoldProviderById(feProviderId);
       if (feProvider && feProvider.canHandle(ctx, normalizedTarget)) {
@@ -3234,8 +3235,13 @@ export function getDeterministicTemplateScaffold(
   state: JimClawState,
   fileTarget: string
 ): string | null {
+  const normalizedTarget = fileTarget.replace(/\\/g, "/");
+  if (normalizedTarget.startsWith("frontend/")) {
+    return tryExternalScaffoldProvider(state, normalizedTarget);
+  }
+
   // ── 确定性 requirements.txt(裸包名,无版本约束) ──
-  const _reqFile = fileTarget.replace(/\\/g, "/").toLowerCase();
+  const _reqFile = normalizedTarget.toLowerCase();
   if (_reqFile === "requirements.txt" && (state.spec as any)?._pinnedRequirements) {
     return (state.spec as any)._pinnedRequirements;
   }
@@ -3248,7 +3254,6 @@ export function getDeterministicTemplateScaffold(
     return null;
   }
 
-  const normalizedTarget = fileTarget.replace(/\\/g, "/");
   const port = state.manifest?.services?.[0]?.port || state.consensusCore?.port || 10000;
   const declaredFiles = new Set((state.spec?.filesToCreate || []).map((file) => String(file).replace(/\\/g, "/")));
   const codeMap = parseStateCodeMap(state);

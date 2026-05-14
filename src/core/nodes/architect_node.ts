@@ -67,9 +67,9 @@ function isSimpleApiGoal(goal: string): boolean {
 function detectTargetStack(userGoal: string, contractTitle: string): { language: string; framework: string; templateId: string; frontend?: "Vue" | "React" | "Svelte" } {
   const text = String(userGoal + " " + (contractTitle || "")).toLowerCase();
   // 检测混合项目（前端 + 后端）
-  const hasVue = /vue|前端页面|前端界面/.test(text);
   const hasReact = /react/.test(text);
-  const frontend = hasVue ? "Vue" : hasReact ? "React" : undefined;
+  const hasVue = /vue/.test(text);
+  const frontend = hasReact ? "React" : hasVue ? "Vue" : undefined;
 
   if (/python|flask|fastapi|django/.test(text)) {
     const framework = /fastapi/.test(text) ? "FastAPI" : /flask/.test(text) ? "Flask" : /django/.test(text) ? "Django" : "FastAPI";
@@ -85,7 +85,7 @@ function detectTargetStack(userGoal: string, contractTitle: string): { language:
     return { language: "Go", framework: "Gin ^1.9", templateId: "gin-go", frontend };
   }
   // 默认 Express + TypeScript
-  return { language: "TypeScript", framework: "Express.js ^5.0", templateId: "express-typescript" };
+  return { language: "TypeScript", framework: "Express.js ^5.0", templateId: "express-typescript", frontend };
 }
 
 /**
@@ -190,6 +190,9 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
     architecture = `确定性降级骨架：基于 Express + TypeScript 的单体应用，围绕 ${singular} 资源提供 API 与部署入口。`;
   }
 
+  const frontendFiles = buildFrontendFiles(targetStack, singular, plural);
+  if (frontendFiles) filesToCreate.push(...frontendFiles);
+
   const spec = stabilizeSpecForExecution(normalizeNodeDependencyLayout({
     architecture,
     language: "TypeScript",
@@ -198,6 +201,7 @@ async function buildDeterministicArchitectOutput(state: JimClawState) {
     runCommand: "npm start",
     entryPoint: "src/index.ts",
     authScaffoldMode: "compact",
+    frontend: buildFrontendSpec(targetStack),
     filesToCreate,
     interfaces: "REST API",
     dependencies: {
@@ -480,6 +484,26 @@ function buildFrontendFiles(
         `frontend/src/components/${pascal}List.vue`,
         `frontend/src/api/${plural}.ts`,
         `frontend/tests/${pascal}List.test.ts`,
+      );
+    }
+    return files;
+  }
+  if (fw === "react") {
+    const files = [
+      "frontend/package.json",
+      "frontend/vite.config.ts",
+      "frontend/tsconfig.json",
+      "frontend/index.html",
+      "frontend/src/main.tsx",
+      "frontend/src/App.tsx",
+      "frontend/src/api.ts",
+    ];
+    if (singular && plural) {
+      const pascal = singular.charAt(0).toUpperCase() + singular.slice(1);
+      files.push(
+        `frontend/src/components/${pascal}List.tsx`,
+        `frontend/src/components/__tests__/${pascal}List.test.tsx`,
+        "frontend/src/setupTests.ts",
       );
     }
     return files;

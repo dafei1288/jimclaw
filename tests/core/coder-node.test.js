@@ -19,6 +19,7 @@ const {
   buildExecutionProtocol,
   buildRequirementProtocol,
   buildSystemContext,
+  getDeterministicTemplateScaffold,
 } = require("../../src/core/logic_utils");
 const {
   classifyPrettierFailure,
@@ -3166,6 +3167,40 @@ test("express template scaffold does not generate write assertions when api cont
   } finally {
     await removeTempWorkspace(workspace);
   }
+});
+
+test("express template scaffold routes React frontend files to React provider", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["使用 React 构建现代前端页面", "提供商品列表 API"],
+    acceptanceCriteria: ["React 页面可以展示商品列表。"],
+  });
+  const state = createBaseState({
+    templateId: "express-typescript",
+    contract: { title: "商品目录应用" },
+    requirementProtocol,
+    apiContract: {
+      endpoints: [{ method: "GET", path: "/api/products" }],
+    },
+    spec: {
+      language: "TypeScript",
+      framework: "Express.js ^5.0",
+      frontend: {
+        language: "TypeScript",
+        framework: "React",
+        buildCommand: "cd frontend && npm run build",
+        testCommand: "cd frontend && npx vitest run",
+        outputDir: "frontend/dist",
+        sourceDir: "frontend",
+      },
+      filesToCreate: ["src/index.ts", "frontend/src/App.tsx", "frontend/src/components/ProductList.tsx"],
+    },
+  });
+
+  const appCode = getDeterministicTemplateScaffold(state, "frontend/src/App.tsx");
+
+  assert.match(appCode, /from '\.\/components\/ProductList'/);
+  assert.doesNotMatch(appCode, /<template>/);
 });
 
 test("express template scaffold deterministically generates auth api baseline test", async () => {

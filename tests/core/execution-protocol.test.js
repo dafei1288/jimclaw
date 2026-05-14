@@ -12,6 +12,7 @@ const {
   buildSystemContext,
   ensureTypeScriptTestBaseline,
   ensureRequirementDrivenApiContract,
+  ensureRequirementDrivenFiles,
   stabilizeSpecForExecution,
 } = require("../../src/core/logic_utils");
 
@@ -189,6 +190,33 @@ test("buildExecutionProtocol emits frontend contract for React SPA", () => {
       supportsDelete: false,
     },
   ]);
+});
+
+test("ensureRequirementDrivenFiles preserves modern frontend files without static fallback", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品目录应用",
+    requirements: ["使用 React 构建现代前端页面", "提供商品列表 API"],
+    acceptanceCriteria: ["用户可以在 React 页面查看商品列表。"],
+  });
+
+  const nextSpec = ensureRequirementDrivenFiles(
+    {
+      language: "TypeScript",
+      frontend: {
+        language: "TypeScript",
+        framework: "React",
+        buildCommand: "cd frontend && npm run build",
+        testCommand: "cd frontend && npx vitest run",
+        outputDir: "frontend/dist",
+        sourceDir: "frontend",
+      },
+      filesToCreate: ["src/index.ts", "frontend/package.json", "frontend/index.html", "frontend/src/main.tsx", "frontend/src/App.tsx"],
+    },
+    requirementProtocol
+  );
+
+  assert.equal(nextSpec.filesToCreate.includes("frontend/src/App.tsx"), true);
+  assert.equal(nextSpec.filesToCreate.includes("public/index.html"), false);
 });
 
 test("buildSolutionProtocol reports uncovered frontend requirements when no UI files exist", () => {
