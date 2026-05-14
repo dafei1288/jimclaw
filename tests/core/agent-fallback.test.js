@@ -213,6 +213,56 @@ test("base agent raises resumable service-unavailable error after exhausting ret
   }
 });
 
+test("base agent can fail fast for deterministic-fallback callers", async () => {
+  const workspace = await createTempWorkspace();
+  let defaultCalls = 0;
+  let codingCalls = 0;
+
+  const createConnectionError = () => {
+    const error = new Error("Connection error.");
+    error.code = "EACCES";
+    return error;
+  };
+
+  const agent = new BaseAgent(
+    {
+      name: "快速降级Agent",
+      role: "测试",
+      specialty: "验证确定性降级快速失败",
+      personality: "严谨",
+    },
+    [],
+    new Map([
+      ["default", createFakeModel(async () => {
+        defaultCalls += 1;
+        throw createConnectionError();
+      })],
+      ["coding", createFakeModel(async () => {
+        codingCalls += 1;
+        throw createConnectionError();
+      })],
+    ])
+  );
+
+  try {
+    await assert.rejects(
+      () => agent.chat(
+        [{ role: "user", content: "请快速失败，让节点使用确定性降级" }],
+        undefined,
+        { workspaceDir: workspace, retryAttempts: 1, fallbackModeLimit: 1 }
+      ),
+      (error) => {
+        assert.equal(error.name, "AgentServiceUnavailableError");
+        return true;
+      }
+    );
+    assert.equal(defaultCalls, 1);
+    assert.equal(codingCalls, 0);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("base agent falls back to alternate model after quota exhaustion", async () => {
   const workspace = await createTempWorkspace();
   let defaultCalls = 0;

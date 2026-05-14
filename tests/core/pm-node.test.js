@@ -111,6 +111,8 @@ test("pm node passes a bounded timeout to model calls", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
   let observedTimeoutMs = 0;
+  let observedRetryAttempts = 0;
+  let observedFallbackModeLimit = 0;
   const state = createBaseState({
     userGoal: "图书管理系统",
   });
@@ -125,6 +127,8 @@ test("pm node passes a bounded timeout to model calls", async () => {
           },
           async chat(_messages, _onEvent, options) {
             observedTimeoutMs = Number(options?.timeoutMs || 0);
+            observedRetryAttempts = Number(options?.retryAttempts || 0);
+            observedFallbackModeLimit = Number(options?.fallbackModeLimit || 0);
             return {
               content: JSON.stringify({
                 title: "图书管理系统",
@@ -142,6 +146,8 @@ test("pm node passes a bounded timeout to model calls", async () => {
     );
 
     assert.equal(observedTimeoutMs > 0, true);
+    assert.equal(observedRetryAttempts, 1);
+    assert.equal(observedFallbackModeLimit, 1);
   } finally {
     await removeTempWorkspace(workspace);
   }

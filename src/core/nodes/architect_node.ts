@@ -759,6 +759,8 @@ ${prevFilesToCreate}
         brief: buildSystemContext(state),
         workspaceDir: WORKSPACE,
         timeoutMs: 45000,
+        retryAttempts: 1,
+        fallbackModeLimit: 1,
       });
 
       const content = extractText(response.content);
@@ -868,6 +870,8 @@ ${langFileConstraints}
           brief: buildSystemContext(state),
           workspaceDir: WORKSPACE,
           timeoutMs: ARCHITECT_MODEL_TIMEOUT_MS,
+          retryAttempts: 1,
+          fallbackModeLimit: 1,
         }
       );
 
@@ -1180,6 +1184,8 @@ API 接口：${JSON.stringify(apiContract, null, 2)}
           brief: buildSystemContext(state),
           workspaceDir: WORKSPACE,
           // 不设 agent 级超时，由 Promise.race 控制
+          retryAttempts: 1,
+          fallbackModeLimit: 1,
         }
       );
       const readmeResponse = await Promise.race([

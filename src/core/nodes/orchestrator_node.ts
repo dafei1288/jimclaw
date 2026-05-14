@@ -78,6 +78,8 @@ ${JSON.stringify(executionProtocol, null, 2)}
         brief: buildSystemContext(state),
         workspaceDir: WORKSPACE,
         timeoutMs: ORCHESTRATOR_MODEL_TIMEOUT_MS,
+        retryAttempts: 1,
+        fallbackModeLimit: 1,
       }
     );
     rawSubTasks = parseJsonFromResponse(extractText(response.content), []);

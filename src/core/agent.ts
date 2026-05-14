@@ -87,6 +87,11 @@ function extractTokenUsage(response: any): { inputTokens: number; outputTokens: 
   };
 }
 
+function normalizePositiveInteger(value: unknown, fallback: number): number {
+  const parsed = Math.floor(Number(value));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 export interface AgentPersona {
   name: string;
   role: string;
@@ -202,9 +207,10 @@ export class BaseAgent {
     model: any,
     messages: BaseMessage[],
     workspaceDir?: string,
-    options?: { timeoutMs?: number; signal?: AbortSignal }
+    options?: { timeoutMs?: number; signal?: AbortSignal; retryAttempts?: number }
   ) {
-    for (let attempt = 0; attempt < 3; attempt++) {
+    const maxAttempts = normalizePositiveInteger(options?.retryAttempts, 3);
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const timeoutMs = options?.timeoutMs;
       const upstreamSignal = options?.signal;
       const controller = new AbortController();
@@ -233,7 +239,7 @@ export class BaseAgent {
         if (didTimeout) {
           throw new AgentTimeoutError(this.persona.name, timeoutMs!);
         }
-        if (attempt < 2 && isRetryableError(error)) {
+        if (attempt < maxAttempts - 1 && isRetryableError(error)) {
           const delay = 1000 * Math.pow(2, attempt);
           console.warn(`[Agent] ${this.persona.name} 第 ${attempt + 1} 次调用失败，${delay}ms 后重试...`);
           await sleep(delay);
@@ -255,9 +261,11 @@ export class BaseAgent {
     messages: BaseMessage[],
     mode: string | undefined,
     workspaceDir?: string,
-    options?: { timeoutMs?: number; signal?: AbortSignal }
+    options?: { timeoutMs?: number; signal?: AbortSignal; retryAttempts?: number; fallbackModeLimit?: number }
   ) {
-    const chain = this.buildFallbackChain(mode);
+    const fullChain = this.buildFallbackChain(mode);
+    const fallbackModeLimit = normalizePositiveInteger(options?.fallbackModeLimit, fullChain.length);
+    const chain = fullChain.slice(0, Math.min(fullChain.length, fallbackModeLimit));
     let lastError: any;
 
     for (let idx = 0; idx < chain.length; idx++) {
@@ -379,6 +387,8 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
    * @param options.workspaceDir 当前运行的 workspace 路径，注入 system prompt 防止 agent 在错误目录操作
    * @param options.timeoutMs    单次模型调用超时时间，超时后主动中断请求
    * @param options.signal       外部中断信号，可用于提前取消当前模型调用
+   * @param options.retryAttempts 单个模型模式的最大尝试次数，默认 3
+   * @param options.fallbackModeLimit 最多尝试多少个模型模式，默认尝试完整 fallback 链
    */
   async chat(messages: any[], eventCallback?: (event: any) => void, options?: {
     mode?: string;
@@ -386,6 +396,8 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
     workspaceDir?: string;
     timeoutMs?: number;
     signal?: AbortSignal;
+    retryAttempts?: number;
+    fallbackModeLimit?: number;
   }) {
     const systemPrompt = this.getSystemPrompt(options?.brief, options?.workspaceDir);
     const formattedMessages: BaseMessage[] = [
@@ -415,6 +427,8 @@ If you find a contradiction in the requirements or spec, speak up in the team ch
       const invoked = await this.invokeWithFallback(currentMessages, activeMode, options?.workspaceDir, {
         timeoutMs: options?.timeoutMs,
         signal: options?.signal,
+        retryAttempts: options?.retryAttempts,
+        fallbackModeLimit: options?.fallbackModeLimit,
       });
       response = invoked.response;
       activeMode = invoked.usedMode;

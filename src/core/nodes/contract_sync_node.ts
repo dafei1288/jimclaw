@@ -66,6 +66,8 @@ ${validationErrors.length > 0 ? validationErrors.join("\n") : "无"}
         brief: buildSystemContext(state),
         workspaceDir: WORKSPACE,
         timeoutMs: CONTRACT_SYNC_MODEL_TIMEOUT_MS,
+        retryAttempts: 1,
+        fallbackModeLimit: 1,
       }
     );
     validatedContract = parseJsonFromResponse(extractText(response.content), state.apiContract);
