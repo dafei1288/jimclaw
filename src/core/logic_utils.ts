@@ -1196,13 +1196,24 @@ export function ensureRequirementDrivenApiContract(
   const createOperationPattern = "(?:创建|create)";
   const writeNearResource = resourceTermPattern
     ? new RegExp(
-        `(?:${resourceTermPattern}.{0,30}${mutationOperationPattern}|${mutationOperationPattern}.{0,30}${resourceTermPattern}|${resourceTermPattern}.{0,12}${createOperationPattern}|${createOperationPattern}.{0,12}${resourceTermPattern})`,
+        `(?:${resourceTermPattern}.{0,30}${mutationOperationPattern}|${mutationOperationPattern}.{0,30}${resourceTermPattern})`,
         "i"
       )
     : null;
+  const createNearResource = resourceTermPattern
+    ? new RegExp(
+        `(?:${resourceTermPattern}.{0,12}${createOperationPattern}|${createOperationPattern}.{0,12}${resourceTermPattern})`,
+        "i"
+      )
+    : null;
+  const projectCreationClause = /(?:创建|create).{0,40}(?:应用|系统|项目|服务|网站|页面|工具|平台|程序|目录应用|mvp|app|application|system|service|project|website|page|tool|platform)/i;
   const explicitlyWantsWrite = intentLines.some((line) => {
     const text = String(line || "");
-    return /\b(POST|PUT|PATCH|DELETE)\b/i.test(text) || Boolean(writeNearResource?.test(text));
+    if (/\b(POST|PUT|PATCH|DELETE)\b/i.test(text)) return true;
+    return text.split(/[，。；;,.]/).some((clause) => {
+      if (writeNearResource?.test(clause)) return true;
+      return Boolean(createNearResource?.test(clause)) && !projectCreationClause.test(clause);
+    });
   });
   if ((requirementProtocol?.capabilities?.crudEntities || []).length > 0 && !explicitlyWantsWrite) {
     for (const [key, endpoint] of Array.from(endpointMap.entries())) {
@@ -5030,7 +5041,7 @@ export function ensureTypeScriptTestBaseline(spec: any): any {
 export function isNodeJestProject(spec: any): boolean {
   const language = String(spec?.language || "").toLowerCase();
   const testCommand = String(spec?.testCommand || "").toLowerCase();
-  return /typescript|javascript|node/.test(language) && /(npm test|jest|ts-jest)/.test(testCommand);
+  return /typescript|javascript|node/.test(language) && /(npm test|jest|ts-jest|vitest)/.test(testCommand);
 }
 
 export function normalizeNodeJestTestFilePath(fileTarget: string): string {

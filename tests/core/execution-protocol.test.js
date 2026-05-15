@@ -115,7 +115,7 @@ test("ensureRequirementDrivenApiContract prunes unrequested entity write endpoin
   const requirementProtocol = buildRequirementProtocol({
     title: "商品目录应用",
     requirements: [
-      "使用 TypeScript 与 Express 创建可运行服务。",
+      "使用 TypeScript 与 Express 创建一个可运行的商品目录应用。",
       "实现商品列表页面路由 GET /products。",
       "实现商品列表 JSON API 路由 GET /api/products。",
     ],
@@ -139,6 +139,27 @@ test("ensureRequirementDrivenApiContract prunes unrequested entity write endpoin
     .filter((endpoint) => endpoint.includes("/api/products"));
 
   assert.deepEqual(productEndpoints, ["GET /api/products"]);
+});
+
+test("ensureRequirementDrivenApiContract treats entity creation as write only outside project creation context", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "商品管理系统",
+    requirements: ["用户可以在页面中创建商品记录。"],
+    acceptanceCriteria: ["提交商品表单后产生新的商品记录。"],
+  });
+
+  const apiContract = ensureRequirementDrivenApiContract(
+    {
+      endpoints: [{ method: "GET", path: "/api/products", description: "商品列表" }],
+    },
+    requirementProtocol
+  );
+
+  const productEndpoints = apiContract.endpoints
+    .map((endpoint) => `${endpoint.method} ${endpoint.path}`)
+    .filter((endpoint) => endpoint.includes("/api/products"));
+
+  assert.deepEqual(productEndpoints, ["GET /api/products", "POST /api/products", "PUT /api/products/:id", "DELETE /api/products/:id"]);
 });
 
 test("ensureRequirementDrivenApiContract synthesizes write endpoints for explicit entity mutations", () => {
@@ -418,12 +439,12 @@ test("buildSystemContext includes control-plane summaries", () => {
 
   const context = buildSystemContext(state).join("\n");
   assert.match(context, /\[需求协议\]/);
-  assert.match(context, /frontendRequired：是/);
+  assert.match(context, /frontendRequired:是/);
   assert.match(context, /\[方案覆盖\]/);
   assert.match(context, /\[执行协议\]/);
-  assert.match(context, /testRoots：tests/);
-  assert.match(context, /frontendRoots：public/);
-  assert.match(context, /healthCheckPath：\/api\/health/);
+  assert.match(context, /testRoots:tests/);
+  assert.match(context, /frontendRoots:public/);
+  assert.match(context, /healthCheckPath:\/api\/health/);
   assert.match(context, /\[技术决策\]/);
   assert.match(context, /backend: express-typescript/);
   assert.match(context, /\[验证报告\]/);
@@ -569,7 +590,7 @@ test("stabilizeSpecForExecution compacts aliased simple CRUD files into a bounde
   assert.equal(nextSpec.filesToCreate.includes("src/services/authCredentialService.ts"), true);
   assert.equal(nextSpec.filesToCreate.includes("src/services/authAccountPolicyService.ts"), true);
   assert.equal(nextSpec.filesToCreate.includes("src/errors.ts"), true);
-  assert.equal(nextSpec.filesToCreate.includes("scripts/verify.ts"), true);
+  assert.equal(nextSpec.filesToCreate.includes("scripts/verify.ts"), false);
   assert.equal(nextSpec.filesToCreate.includes("src/repositories/bookRepository.ts"), false);
   assert.equal(nextSpec.filesToCreate.includes("src/app.ts"), false);
   assert.equal(nextSpec.filesToCreate.length <= 30, true);

@@ -169,3 +169,14 @@
 - **预防**: 每次宣布成功前必须执行完整验证清单
 - **首次发现**: 2026-04-10
 - **标签**: `process`, `verification`, `critical`, `meta`
+
+---
+
+## FP-016: 项目创建语义被误判为资源写接口
+
+- **症状**: 用户只要求 `GET /products` 和 `GET /api/products`，但 `apiContract` / `executionProtocol` / 前端页面被扩展出 `POST/PUT/DELETE /api/products`，页面出现新增、编辑、删除控件。
+- **根因**: 写意图识别把“创建一个商品目录应用”中的“创建……应用”误判为“创建商品记录”；同时 `contract_sync` 修改 `apiContract` 后没有同步重建 `solutionProtocol` / `executionProtocol`，导致协议层漂移。
+- **修复**: `ensureRequirementDrivenApiContract()` 按句段区分项目创建与实体创建；`contract_sync` 对 LLM 审查后的契约再次执行需求裁剪，并同步重建下游协议。
+- **预防**: smoke 必须同时核对 `apiContract`、`executionProtocol.contracts.api`、`executionProtocol.contracts.frontend.apiUsage` 与生成页面控件，不能只看部署 200。
+- **首次发现**: 2026-05-15, `run_1778782372300`
+- **标签**: `api-contract`, `contract-sync`, `frontend`, `intent-detection`, `contract-drift`

@@ -3,7 +3,10 @@ import * as path from "path";
 import { JimClawState, ApiEndpointSchema } from "../graph_types";
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
 import {
-  buildSystemContext
+  buildExecutionProtocol,
+  buildSolutionProtocol,
+  buildSystemContext,
+  ensureRequirementDrivenApiContract,
 } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
@@ -76,8 +79,13 @@ ${validationErrors.length > 0 ? validationErrors.join("\n") : "无"}
     emit("thinking", "System", `契约校验模型暂不可用，沿用当前 API 契约继续执行：${error.message || error}`, {});
   }
 
+  validatedContract = ensureRequirementDrivenApiContract(validatedContract, state.requirementProtocol || null);
+
+  const solutionProtocol = buildSolutionProtocol(state.requirementProtocol || null, state.spec || null, validatedContract);
+  const executionProtocol = buildExecutionProtocol(state.spec || null, state.manifest || null, validatedContract, state.requirementProtocol || null);
+
   await fs.writeFile(path.join(WORKSPACE, "api_contract_validated.json"), JSON.stringify(validatedContract, null, 2));
-  const result = { apiContract: validatedContract };
+  const result = { apiContract: validatedContract, solutionProtocol, executionProtocol };
   await saveBoulder({ ...state, ...result }, "contract_sync");
   return result;
 }

@@ -2026,7 +2026,13 @@ export async function coderNode(
 
       // 动态端口注入
       const appPort = state.manifest?.services?.[0]?.port || 8080;
-      prompt += `\n\n[硬性技术规范]：\n本项目统一使用端口 ${appPort}。如果该文件涉及服务启动、端口监听或 Docker 配置，请务必将其设置为 ${appPort}。严禁使用其他端口。`;
+      prompt += `\n\n[硬性技术规范]：
+本项目统一运行端口来自 manifest：${appPort}。
+如果该文件涉及服务启动、端口监听或 Docker 配置：
+- 端口必须写成环境变量优先：const PORT = Number(process.env.PORT || ${appPort});
+- 监听主机必须写成环境变量优先：const HOST = process.env.HOST || "0.0.0.0";
+- Express 启动必须使用 app.listen(PORT, HOST, ...)，不要省略 HOST。
+- 禁止只写 const PORT = ${appPort}; 这种纯硬编码端口，也禁止使用 3000/8080 等猜测端口。`;
 
       // Express req.params 类型安全提示
       if (/\.(ts|js)$/i.test(task.fileTarget) && /express/i.test(state.spec?.framework || "")) {
@@ -2038,7 +2044,7 @@ export async function coderNode(
         prompt += `\n\n[Express 入口文件关键约束]：
 1. 默认导出必须是 Express Application 实例：\n   正确：const app = express(); ... export default app;\n   错误：export default createApp; (函数)\n   错误：export default { app, server }; (对象)\n   错误：export default createApp(); (每次调用创建新实例)\n   原因：测试文件使用 supertest，需要 import app from "../src/index" 直接获得 Express 实例。
 
-2. 必须在模块顶层启动服务器（不能包在函数里！）：\n   正确：\n     const PORT = process.env.PORT || 3000;\n     if (process.env.NODE_ENV !== 'test') {\n       app.listen(PORT, () => console.log('Server on port', PORT));\n     }\n     export default app;\n   错误：把 app.listen 放在 startServer() 函数里但不调用它 → npm start 什么都不会发生\n   原因：npm start 执行 node dist/src/index.js，需要在加载模块时直接启动服务器。
+2. 必须在模块顶层启动服务器（不能包在函数里！）：\n   正确：\n     const PORT = Number(process.env.PORT || ${appPort});\n     const HOST = process.env.HOST || "0.0.0.0";\n     if (process.env.NODE_ENV !== 'test') {\n       app.listen(PORT, HOST, () => console.log('Server on', HOST, PORT));\n     }\n     export default app;\n   错误：const PORT = ${appPort}; app.listen(PORT) → 端口纯硬编码且未绑定 0.0.0.0\n   错误：把 app.listen 放在 startServer() 函数里但不调用它 → npm start 什么都不会发生\n   原因：npm start 执行 node dist/src/index.js，需要在加载模块时直接启动服务器。
    注意：测试环境下 (NODE_ENV=test) 不要启动服务器，避免端口冲突。
 
 3. 必须注册根路径 GET / 处理器，返回 API 导航信息（JSON 对象）：
