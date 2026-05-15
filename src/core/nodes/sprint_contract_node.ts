@@ -31,11 +31,15 @@ function endpointPathOnly(value: string): string {
   return normalizeEndpointUrl(value).split("#")[0].split("?")[0].replace(/\/+$/, "") || "/";
 }
 
+function isWildcardEndpointUrl(value: string): boolean {
+  return endpointPathOnly(value).includes("*");
+}
+
 function extractGetUrls(text: string): string[] {
   const urls: string[] = [];
   for (const match of String(text || "").matchAll(/\bGET\s+(\/[^\s，。；;、)）\]]+)/gi)) {
     const url = normalizeEndpointUrl(match[1]);
-    if (url) urls.push(url);
+    if (url && !isWildcardEndpointUrl(url)) urls.push(url);
   }
   return Array.from(new Set(urls));
 }
@@ -193,6 +197,7 @@ function buildDefaultEvaluationChecks(state: JimClawState, sprint: SprintPlan): 
     const method = String(endpoint.method || "").toUpperCase();
     if (method !== "GET") continue;
     const url = normalizeEndpointUrl(endpoint.path);
+    if (isWildcardEndpointUrl(url)) continue;
     const endpointTexts = [
       String((endpoint as any).description || ""),
       ...validationTexts,

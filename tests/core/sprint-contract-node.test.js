@@ -265,6 +265,69 @@ test("sprint contract creates lowStock query check from Chinese filter wording w
   }
 });
 
+test("sprint contract does not create positive http checks for wildcard fallback endpoints", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await sprintContractNode(
+      createBaseState({
+        activeSprintId: "SP-2",
+        productSpec: {
+          version: "v1",
+          title: "库存看板",
+          userGoal: "查看商品库存",
+          userStories: [{ id: "US-1", story: "用户可以查看库存", priority: "must" }],
+          acceptanceCriteria: [
+            { id: "AC-1", description: "GET /api/products 返回 HTTP 200，响应体为商品数组。", verificationKind: "api" },
+            { id: "AC-2", description: "当访问未定义的接口时，应用返回非 200 状态码及可识别错误信息。", verificationKind: "api" },
+          ],
+          nonGoals: [],
+        },
+        sprintPlans: [{
+          id: "SP-2",
+          title: "库存 API 闭环",
+          goal: "完成库存列表与错误处理",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-1", "AC-2"],
+          deliverables: ["库存 API", "错误处理"],
+          allowedScope: ["src/", "tests/"],
+          dependencies: ["SP-1"],
+          estimatedComplexity: "medium",
+          doneWhen: [
+            "GET /api/products 返回 HTTP 200，响应体为商品数组。",
+            "当访问未定义的接口时，应用返回非 200 状态码及可识别错误信息。",
+          ],
+        }],
+        apiContract: {
+          endpoints: [
+            { path: "/api/products", method: "GET", description: "商品库存列表" },
+            { path: "/*", method: "GET", description: "未定义接口兜底错误处理" },
+          ],
+        },
+        spec: {
+          language: "TypeScript",
+          framework: "Express",
+          testCommand: "npm test",
+          filesToCreate: ["src/index.ts", "tests/products.test.ts"],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const checks = result.sprintContracts[0].evaluatorPlan.checks;
+    assert.equal(checks.some((check) => check.url === "/*"), false);
+    assert.equal(result.sprintContracts[0].evaluatorPlan.requiredEvidence.some((item) => item.includes("GET /*")), false);
+    assert.ok(checks.find((check) => check.url === "/api/products"));
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("sprint contract does not apply product semantic assertions to health checks", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

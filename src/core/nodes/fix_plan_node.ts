@@ -101,6 +101,22 @@ function unique(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function normalizeFileTarget(file: string | undefined): string {
+  return String(file || "").trim().replace(/\\/g, "/");
+}
+
+function isEvidenceBackedRepairTarget(
+  file: string | undefined,
+  evidenceRepairTargets: Set<string>,
+  activeContract: ReturnType<typeof getActiveSprintContract>
+): boolean {
+  const normalized = normalizeFileTarget(file);
+  if (!normalized) return false;
+  if (!evidenceRepairTargets.has(normalized)) return false;
+  if (activeContract && !isFileAllowedBySprintContract(normalized, activeContract)) return false;
+  return true;
+}
+
 function buildRepairContractsFromEvaluation(
   state: JimClawState,
   fixPlan: FixPlanItem[],
@@ -283,6 +299,11 @@ export async function fixPlanNode(
   const summarizedTestResults = summarizeBlock(state.testResults || "", 1800);
   const summarizedIssues = summarizeIssues(openIssues, 6);
   const summarizedFiles = summarizeFailingFiles(fileContents, 4);
+  const activeContract = getActiveSprintContract(state);
+  const evidenceRepairTargets = new Set(failingFiles.map(normalizeFileTarget));
+  const allowedRepairTargets = failingFiles
+    .map(normalizeFileTarget)
+    .filter((file) => isEvidenceBackedRepairTarget(file, evidenceRepairTargets, activeContract));
 
   const coderPrompt = `你是星河（全栈开发工程师）。在动手写代码之前，请先仔细分析失败原因，制定修复计划。
 
@@ -295,7 +316,11 @@ ${summarizedIssues}
 [失败文件的当前内容]：
 ${summarizedFiles}
 
+[本轮允许进入 fixPlan 的修复文件]：
+${allowedRepairTargets.length ? allowedRepairTargets.map((file) => `- ${file}`).join("\n") : "（无）"}
+
 ⚠️ 重要约束：你**只允许读取上面列出的失败文件**。不要用 read_file 读取其他文件。你的输出必须是 JSON 格式的修复计划。
+⚠️ 修复计划里的 file 必须来自“本轮允许进入 fixPlan 的修复文件”，不要新增未被失败证据指向的重构、拆分或优化文件。
 
 请认真阅读以上内容，输出你的修复计划（JSON格式）：
 {
@@ -369,10 +394,15 @@ ${summarizedIssues}
 [星河的修复计划]：
 ${summarizeCoderPlan(coderPlan)}
 
+[本轮允许进入 fixPlan 的修复文件]：
+${allowedRepairTargets.length ? allowedRepairTargets.map((file) => `- ${file}`).join("\n") : "（无）"}
+
 请逐项审查：
 1. 根因理解是否正确？（特别关注 confidence=low 的项）
 2. 提出的具体修改是否能解决问题？
 3. 是否有遗漏的修复点（测试还会继续失败的地方）？
+
+⚠️ additional_fixes 只能包含“本轮允许进入 fixPlan 的修复文件”。不要把没有失败证据的拆分、重构或优化文件加入 additional_fixes。
 
 输出审查结果（JSON格式）：
 {
@@ -434,6 +464,7 @@ ${summarizeCoderPlan(coderPlan)}
   const fixPlan: FixPlanItem[] = degradedByFallback
     ? buildDeterministicFixPlan(failingFiles, openIssues, state, coderPlan)
     : [];
+  const ignoredFixTargets: Array<{ file: string; reason: string }> = [];
   let protocolPatches: ProtocolPatch[] = buildProtocolPatchesForFixPlan(
     failingFiles,
     state.executionProtocol,
@@ -442,10 +473,18 @@ ${summarizeCoderPlan(coderPlan)}
 
   if (!degradedByFallback) {
     for (const item of (coderPlan.items || [])) {
+      const targetFile = normalizeFileTarget(item.file);
+      if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+        ignoredFixTargets.push({
+          file: targetFile || String(item.file || ""),
+          reason: "Coder 修复项不在本轮失败证据文件集合或 Sprint 允许范围内。",
+        });
+        continue;
+      }
       const review = (qaReview.items || []).find((r: any) => r.file === item.file);
       if (review && review.approved === false) {
         fixPlan.push({
-          fileTarget: item.file,
+          fileTarget: targetFile,
           diagnosis: review.feedback || item.my_understanding,
           proposedChange: review.feedback || item.proposed_change,
           qaApproval: "corrected",
@@ -453,7 +492,7 @@ ${summarizeCoderPlan(coderPlan)}
         });
       } else {
         fixPlan.push({
-          fileTarget: item.file,
+          fileTarget: targetFile,
           diagnosis: item.my_understanding,
           proposedChange: item.proposed_change,
           qaApproval: "approved",
@@ -463,9 +502,17 @@ ${summarizeCoderPlan(coderPlan)}
 
     // 把 QA 发现的遗漏文件也加入计划
     for (const extra of (qaReview.additional_fixes || [])) {
-      if (!fixPlan.some(p => p.fileTarget === extra.file)) {
+      const targetFile = normalizeFileTarget(extra.file);
+      if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+        ignoredFixTargets.push({
+          file: targetFile || String(extra.file || ""),
+          reason: "QA additional_fixes 不在本轮失败证据文件集合或 Sprint 允许范围内。",
+        });
+        continue;
+      }
+      if (!fixPlan.some(p => p.fileTarget === targetFile)) {
         fixPlan.push({
-          fileTarget: extra.file,
+          fileTarget: targetFile,
           diagnosis: extra.diagnosis,
           proposedChange: extra.proposed_change,
           qaApproval: "approved",
@@ -481,11 +528,19 @@ ${summarizeCoderPlan(coderPlan)}
   }
 
   for (const file of failingFiles) {
-    if (fixPlan.some((item) => item.fileTarget === file)) continue;
+    const targetFile = normalizeFileTarget(file);
+    if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+      ignoredFixTargets.push({
+        file: targetFile,
+        reason: "失败文件不在 Sprint 允许范围内，未写入 fixPlan。",
+      });
+      continue;
+    }
+    if (fixPlan.some((item) => item.fileTarget === targetFile)) continue;
     const issue = openIssues.find((item: any) => item.relatedFiles?.includes(file));
     const matchingError = (state.qaFailures?.testErrors || []).find((msg: string) => msg.includes(file));
     fixPlan.push({
-      fileTarget: file,
+      fileTarget: targetFile,
       diagnosis: issue?.description || matchingError || `${file} 已被 QA 标记为需重开修复，但协商输出遗漏了该文件。`,
       proposedChange: issue?.description
         ? `围绕以下问题做最小修复：${issue.description}`
@@ -514,6 +569,9 @@ ${summarizeCoderPlan(coderPlan)}
     `## QA 的整体评估\n${qaReview.overall_assessment}\n`,
     degradedByFallback ? `## 降级说明\n本轮因模型资源不足，改用规则化修复计划，避免修复链路整体中断。\n` : "",
     `## 批准后的修复计划\n\`\`\`json\n${JSON.stringify(fixPlan, null, 2)}\n\`\`\`\n`,
+    ignoredFixTargets.length > 0
+      ? `## 已忽略的无证据修复目标\n\`\`\`json\n${JSON.stringify(ignoredFixTargets, null, 2)}\n\`\`\`\n`
+      : "",
     `## 协议补丁\n\`\`\`json\n${JSON.stringify(protocolPatches, null, 2)}\n\`\`\`\n`,
     correctedCount > 0
       ? `## QA 纠正的项目（${correctedCount}项）\n${fixPlan.filter(p => p.qaApproval === "corrected").map(p => `- **${p.fileTarget}**: ${p.qaFeedback}`).join("\n")}\n`

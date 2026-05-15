@@ -268,3 +268,25 @@
 - **预防**: Query 语义不能只依赖 URL 字面量；常见中文筛选意图必须转成独立 evaluator check。
 - **首次发现**: 2026-05-15, `run_1778825147796`
 - **标签**: `sprint-contract`, `evaluator`, `semantic-evidence`, `query-derivation`, `low-stock`
+
+---
+
+## FP-025: fix_plan 接收无失败证据的额外修复目标
+
+- **症状**: Evaluator 明确只失败 `src/productService.ts` / `tests/products.test.ts`，但 QA `additional_fixes` 可能额外加入 `src/product.ts` 等拆分或优化目标，恢复轮范围被放大。
+- **根因**: `fix_plan_node` 在合并 Coder items 和 QA additional_fixes 时没有先按失败证据集合过滤；只在后续 `repairContracts` 层裁剪 allowedFiles，`fixPlan` 本体仍可能影响 Coder 执行范围。
+- **修复**: 生成 fixPlan 前构建“本轮允许进入 fixPlan 的修复文件”集合，要求 Coder items、QA additional_fixes、遗漏回填都必须同时来自失败证据和 active Sprint 允许范围；被忽略目标写入会议纪要。
+- **预防**: 恢复轮目标必须来自 evaluator/QA/protocol 的明确失败证据；QA 可以纠正目标上的修法，但不能把无证据重构加入 fixPlan。
+- **首次发现**: 2026-05-15, `run_1778826572388`
+- **标签**: `fix-plan`, `qa`, `scope-control`, `evaluator`, `managed-harness`
+
+---
+
+## FP-026: 通配符兜底接口被生成正向 2xx 验收
+
+- **症状**: “访问未定义接口返回非 200” 被 Architect/契约层表示为 `GET /*` 后，SprintContract 又生成 `CHK-HTTP-*`，并期望状态 `[200,201,204]`，导致 evaluator 对 `GET /*` 报 404 失败。
+- **根因**: `sprint_contract_node` 把 `apiContract.endpoints` 中的通配符路径当成普通正向 HTTP 端点处理；文本提取 `GET /*` 时也没有排除 wildcard。
+- **修复**: 默认正向 HTTP checks 跳过包含 `*` 的 endpoint；`extractGetUrls()` 也过滤 wildcard URL，避免从验收文本二次生成 `GET /*`。
+- **预防**: wildcard/fallback/error-handling 路径不能复用正向 2xx 端点验收逻辑；后续若要覆盖未定义接口，应显式生成负向 expectedStatus 检查。
+- **首次发现**: 2026-05-15, `run_1778828038950`
+- **标签**: `sprint-contract`, `wildcard`, `error-handling`, `evaluator`, `managed-harness`

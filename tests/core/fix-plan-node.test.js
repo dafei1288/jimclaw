@@ -128,6 +128,141 @@ test("fix plan creates repair contract from failed evaluation result", async () 
   }
 });
 
+test("fix plan ignores qa additional fixes that are not backed by failure evidence", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const failingFile = "src/productService.ts";
+  const unrelatedFile = "src/product.ts";
+  await fs.mkdir(path.join(workspace, "src"), { recursive: true });
+  await fs.writeFile(path.join(workspace, failingFile), "export const isLowStock = (stock) => stock <= 10;\n", "utf8");
+  await fs.writeFile(path.join(workspace, unrelatedFile), "export interface Product { id: string }\n", "utf8");
+
+  const state = createBaseState({
+    retryCount: 1,
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "修复低库存筛选",
+        filesLikelyTouched: [failingFile, unrelatedFile],
+        implementationSteps: ["修复服务过滤"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{
+          id: "CHK-LOW-STOCK",
+          kind: "http",
+          description: "验证 GET /api/products?lowStock=true",
+          method: "GET",
+          url: "/api/products?lowStock=true",
+          expectedStatus: [200],
+          assertions: [{
+            id: "CHK-LOW-STOCK-A1",
+            type: "jsonEvery",
+            field: "stock",
+            operator: "gt",
+            value: 0,
+          }],
+        }],
+        requiredEvidence: ["验证 GET /api/products?lowStock=true"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: [failingFile, unrelatedFile, "tests/products.test.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 4,
+      },
+      status: "agreed",
+    }],
+    evaluationResults: [{
+      version: "v1",
+      sprintId: "SP-1",
+      status: "fail",
+      checks: [{
+        checkId: "CHK-LOW-STOCK",
+        status: "fail",
+        evidence: {
+          httpStatus: 200,
+          httpBodySnippet: "[{\"id\":\"6\",\"name\":\"Webcam\",\"stock\":0}]",
+          assertions: [{
+            id: "CHK-LOW-STOCK-A1",
+            type: "jsonEvery",
+            status: "fail",
+            message: "第 0 个元素不满足 stock gt 0",
+          }],
+          error: "第 0 个元素不满足 stock gt 0",
+        },
+        reproSteps: ["GET /api/products?lowStock=true"],
+        suspectedFiles: [failingFile],
+      }],
+      summary: "SP-1 验收失败：CHK-LOW-STOCK",
+    }],
+    qaFailures: {
+      failedFiles: [failingFile],
+      testErrors: ["SP-1 验收失败：CHK-LOW-STOCK"],
+      failedTestNames: [],
+    },
+    subTasks: [
+      {
+        id: "task-service",
+        fileTarget: failingFile,
+        description: "修复低库存服务",
+        dependencies: [],
+        contextRequirement: "排除 stock=0",
+        status: "completed",
+      },
+      {
+        id: "task-model",
+        fileTarget: unrelatedFile,
+        description: "商品模型",
+        dependencies: [],
+        contextRequirement: "定义 Product",
+        status: "completed",
+      },
+    ],
+  });
+
+  const agents = {
+    coder: {
+      getPersona() { return { name: "星河" }; },
+      async chat() {
+        return {
+          content: '{"overall_diagnosis":"低库存过滤包含了缺货商品","items":[{"file":"src/productService.ts","issue_id":"BUG-EVAL-SP-1-CHK-LOW-STOCK","my_understanding":"isLowStock 没有排除 stock=0","proposed_change":"把过滤条件改为 stock > 0 && stock < 10","confidence":"high"}]}',
+        };
+      },
+    },
+    qa: {
+      getPersona() { return { name: "清扬" }; },
+      async chat() {
+        return {
+          content: '{"overall_assessment":"服务修复正确，但我想顺手拆模型文件","items":[{"file":"src/productService.ts","approved":true,"feedback":""}],"additional_fixes":[{"file":"src/product.ts","diagnosis":"Product 类型最好独立维护","proposed_change":"新增 Product 模型文件并调整导入"}]}',
+        };
+      },
+    },
+  };
+
+  try {
+    const result = await fixPlanNode(
+      state,
+      agents,
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.deepEqual(result.fixPlan.map((item) => item.fileTarget), [failingFile]);
+    assert.deepEqual(result.repairContracts[0].repairScope, [failingFile]);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === failingFile).status, "pending");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === unrelatedFile).status, "completed");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("fix plan falls back to deterministic repair plan when model calls are exhausted", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
