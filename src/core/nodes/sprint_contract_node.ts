@@ -85,7 +85,7 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
 
   if (isApi) {
     const fields = new Set<string>();
-    if (/\bid\b|编号|标识/i.test(normalizedText)) fields.add("id");
+    if (/\bid\b|编号/i.test(normalizedText)) fields.add("id");
     if (/\bname\b|名称|商品名称/i.test(normalizedText)) fields.add("name");
     if (/\bstock\b|库存/i.test(normalizedText)) fields.add("stock");
     if (/\bstatus\b|库存状态|状态文本/i.test(normalizedText)) fields.add("status");

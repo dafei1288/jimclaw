@@ -152,7 +152,7 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
           userStories: [{ id: "US-1", story: "用户可以查看库存", priority: "must" }],
           acceptanceCriteria: [
             { id: "AC-1", description: "启动应用后，GET /api/products 返回 HTTP 200，响应体为数组，数组元素至少包含 id、name、stock 字段。", verificationKind: "api" },
-            { id: "AC-2", description: "启动应用后，当请求 GET /api/products?lowStock=true 时返回 HTTP 200，响应结果仅包含低库存商品，且每条商品数据都满足预设低库存判定条件。", verificationKind: "api" },
+            { id: "AC-2", description: "启动应用后，当请求 GET /api/products?lowStock=true 时返回 HTTP 200，响应结果仅包含低库存商品，且每个商品的 status 必须标识为低库存。", verificationKind: "api" },
           ],
           nonGoals: [],
         },
@@ -168,7 +168,7 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
           estimatedComplexity: "medium",
           doneWhen: [
             "启动应用后，GET /api/products 返回 HTTP 200，响应体为数组，数组元素至少包含 id、name、stock 字段。",
-            "启动应用后，当请求 GET /api/products?lowStock=true 时返回 HTTP 200，响应结果仅包含低库存商品，且每条商品数据都满足预设低库存判定条件。",
+            "启动应用后，当请求 GET /api/products?lowStock=true 时返回 HTTP 200，响应结果仅包含低库存商品，且每个商品的 status 必须标识为低库存。",
           ],
         }],
         apiContract: { endpoints: [{ path: "/api/products", method: "GET", description: "商品库存列表" }] },
@@ -195,6 +195,8 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonArray"), true);
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "stock"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "lt"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "status"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "id"), false);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "lowStock"), false);
   } finally {
     await removeTempWorkspace(workspace);
