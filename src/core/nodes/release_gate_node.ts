@@ -87,6 +87,22 @@ function hasUiEvidence(state: JimClawState): boolean {
     }));
 }
 
+function requiresSemanticEvidence(text: string): boolean {
+  return /筛选|仅包含|字段|包含|不包含|lowStock|isLowStock/i.test(String(text || ""));
+}
+
+function hasPassingSemanticEvidence(state: JimClawState, sprintIds?: string[]): boolean {
+  const allowedSprintIds = sprintIds?.length ? new Set(sprintIds) : null;
+  return (state.evaluationResults || [])
+    .filter((result) => result.status === "pass")
+    .filter((result) => !allowedSprintIds || allowedSprintIds.has(result.sprintId))
+    .some((result) => result.checks.some((check) => {
+      if (check.status !== "pass") return false;
+      const assertions = check.evidence?.assertions || [];
+      return assertions.some((assertion) => assertion.status === "pass");
+    }));
+}
+
 function criterionHasEvidence(state: JimClawState, criterion: { id: string; description: string }): boolean {
   const passedSprintIds = new Set(
     (state.evaluationResults || [])
@@ -192,6 +208,41 @@ export async function releaseGateNode(
       evidence: [criterion.description],
       blocking: true,
     });
+  }
+
+  for (const criterion of productSpec?.acceptanceCriteria || []) {
+    if (!requiresSemanticEvidence(criterion.description)) continue;
+    const owningSprintIds = (state.sprintPlans || [])
+      .filter((plan) => (plan.acceptanceCriteriaIds || []).includes(criterion.id))
+      .map((plan) => plan.id);
+    if (!hasPassingSemanticEvidence(state, owningSprintIds)) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `${criterion.id} 缺少 semantic assertion 语义证据`,
+        evidence: [
+          criterion.description,
+          "ReleaseGate 要求包含筛选、字段、包含/不包含等语义验收时，必须有 evaluator 产生的 passing assertion evidence",
+        ],
+        blocking: true,
+      });
+    }
+  }
+
+  for (const plan of state.sprintPlans || []) {
+    const semanticDoneWhen = (plan.doneWhen || []).filter(requiresSemanticEvidence);
+    if (semanticDoneWhen.length > 0 && !hasPassingSemanticEvidence(state, [plan.id])) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `${plan.id} 缺少 semantic assertion 语义证据`,
+        evidence: [
+          ...semanticDoneWhen,
+          "Sprint doneWhen 包含语义验收，必须由 evaluator assertion evidence 覆盖",
+        ],
+        blocking: true,
+      });
+    }
   }
 
   for (const endpointPath of getPublicGetEndpoints(state)) {
