@@ -262,9 +262,9 @@
 
 ## FP-024: 低库存筛选文案缺少显式 query 时 evaluator 未覆盖筛选路径
 
-- **症状**: Smoke 最终放行，但 `evaluationResults` 只验证了 `/api/products` 基础列表，没有验证 `/api/products?lowStock=true`；低库存筛选只能靠人工 curl 确认。
+- **症状**: Smoke 最终放行，但 `evaluationResults` 只验证了 `/api/products` 基础列表，没有验证 `/api/products?lowStock=true`；低库存筛选只能靠人工 curl 确认。补 query 后又发现仅检查 `stock < 10` 会把 `stock = 0` 的缺货商品误判为低库存。
 - **根因**: `sprint_contract_node` 只在验收文本显式写出 `?lowStock=true` 时才新增 query 级检查；“以低库存筛选方式请求 GET /api/products”这类中文描述只命中基础端点。
-- **修复**: 当 API 端点相关文本同时包含“低库存”和“筛选/过滤/仅返回”等意图时，自动合成 `?lowStock=true` 检查，并绑定 `jsonNonEmpty` 与 `jsonEvery stock lt 10` 语义断言。
+- **修复**: 当 API 端点相关文本同时包含“低库存”和“筛选/过滤/仅返回”等意图时，自动合成 `?lowStock=true` 检查，并绑定 `jsonNonEmpty`、`stock > 0`、`stock < 10` 语义断言。
 - **预防**: Query 语义不能只依赖 URL 字面量；常见中文筛选意图必须转成独立 evaluator check。
 - **首次发现**: 2026-05-15, `run_1778825147796`
 - **标签**: `sprint-contract`, `evaluator`, `semantic-evidence`, `query-derivation`, `low-stock`

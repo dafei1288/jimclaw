@@ -195,6 +195,7 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonArray"), true);
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "stock"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "lt"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "gt" && item.value === 0), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "status"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "id"), false);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "lowStock"), false);
@@ -258,6 +259,7 @@ test("sprint contract creates lowStock query check from Chinese filter wording w
     assert.ok(lowStockCheck);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonNonEmpty"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "lt"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "gt" && item.value === 0), true);
   } finally {
     await removeTempWorkspace(workspace);
   }
@@ -390,6 +392,7 @@ test("sprint contract respects explicit quantity field and requires non-empty lo
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "stock"), false);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonNonEmpty"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "quantity"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "quantity" && item.operator === "gt" && item.value === 0), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock"), false);
   } finally {
     await removeTempWorkspace(workspace);

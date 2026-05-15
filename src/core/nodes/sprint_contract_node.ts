@@ -117,6 +117,7 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
   if (isApi && isLowStockUrl && isLowStockText) {
     const quantityField = /\bquantity\b/i.test(normalizedText) ? "quantity" : "stock";
     templates.push({ type: "jsonNonEmpty" });
+    templates.push({ type: "jsonEvery", field: quantityField, operator: "gt", value: 0 });
     templates.push({ type: "jsonEvery", field: quantityField, operator: "lt", value: 10 });
   }
 
