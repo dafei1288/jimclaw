@@ -521,6 +521,17 @@ git commit -m "docs: record managed harness smoke findings"
 
 - 基线 commit：`4e41885 fix: keep read-only API contracts stable`
 - 下一步：Task 1，打开 managed harness 并跑真实 smoke。
+- Task 1 执行：
+  - focused suite 初跑失败，根因是 legacy verifier 路由被过度简化、`agent_pending` 图内自旋清空恢复状态、部署测试仍 mock 旧 `ShellExecuteSkill` 边界；已修复并验证。
+  - 验证通过：`node --test tests/core/managed-harness-types.test.js tests/core/sprint-planner.test.js tests/core/sprint-planner-node.test.js tests/core/sprint-contract-node.test.js tests/core/evaluator-node.test.js tests/core/release-gate-node.test.js tests/core/workflow-replay.test.js`
+  - 验证通过：`npx tsc --noEmit`
+  - managed smoke run：`run_1778807069282`
+  - container id：`89ce7b9903aa102bbb157c1586ebeeadaa86e437b97a4b7d31c0bf251b6d8c16`
+  - URL：`http://100.74.126.56:4001`
+  - sprint events：已出现 `sprint_planned`、`sprint_contract_agreed`、`evaluation_completed`。
+  - release gate：已参与；第 1 轮 `release_gate_completed` 阻塞，原因是“前端验收缺少 UI 证据”。
+  - blocking failure：smoke 超过 40 分钟未收敛，最后快照为 `coder_task_task-07` / `retryCount=5`；过程中出现 Product 契约漂移，`src/app.ts` 访问未授权的 `stock/status` 字段，触发 `TS2339`，后续仲裁冻结字段为 `id/name/price`。
+  - 手工核验：run 目录内最终代码 `npm run build` 与 `npm test` 在容器中通过，但图执行未进入最终 deploy/release/persistence；下一步优先修 release/evaluator evidence 与修复回路。
 
 ---
 

@@ -180,3 +180,14 @@
 - **预防**: smoke 必须同时核对 `apiContract`、`executionProtocol.contracts.api`、`executionProtocol.contracts.frontend.apiUsage` 与生成页面控件，不能只看部署 200。
 - **首次发现**: 2026-05-15, `run_1778782372300`
 - **标签**: `api-contract`, `contract-sync`, `frontend`, `intent-detection`, `contract-drift`
+
+---
+
+## FP-017: agent_pending 在图内自旋导致无法恢复
+
+- **症状**: Coder 模型连接失败后进入 `agent_pending`，但图内自动重试到耗尽并清空 `agentRecoveryPending`，最终状态不再可 `--resume`。
+- **根因**: `agent_pending` 节点承担了“等待恢复”和“自动重试”两个职责，覆盖了 `withNodeGuard` 已落盘的恢复状态；同时相关回放测试仍按控制面设计预期挂起。
+- **修复**: `agent_pending` 只保存并保留恢复状态，然后结束当前图执行；恢复动作交给 CLI/Web 的 resume 流程。
+- **预防**: `agent_pending` 必须是持久化暂停点，不应在图内部循环清空 `agentRecoveryPending`。
+- **首次发现**: 2026-05-15, managed harness focused suite
+- **标签**: `agent-pending`, `resume`, `graph`, `control-plane`

@@ -86,7 +86,7 @@ type ApprovalRequest = {
 export function getVerifierNextNode(
   state: JimClawState,
   evaluatorEnabled: boolean = false
-): "coder" | "architect" | "env_guard" | "evaluator" | "qa" {
+): "coder" | "architect" | "env_guard" | "infra_setup" | "evaluator" | "qa" {
   if (shouldPauseForAgentPending(state)) return "qa";
   if (!state.testResults?.startsWith("[Verifier 预检失败]")) {
     return evaluatorEnabled ? "evaluator" : "qa";
@@ -95,8 +95,14 @@ export function getVerifierNextNode(
     return "coder";
   }
 
-  // verifier 是静态预检；非缺文件失败先进入 evaluator 生成可复现证据，再交给 QA 分类。
-  return evaluatorEnabled ? "evaluator" : "qa";
+  // managed harness 需要 evaluator 先补可复现证据；legacy 路径继续按静态分类收口。
+  if (evaluatorEnabled) return "evaluator";
+
+  const failureType = state.validationReport?.failureType;
+  if (failureType === "planning_gap") return "architect";
+  if (failureType === "environment_gap") return "env_guard";
+  if (failureType === "runtime_gap") return "infra_setup";
+  return "qa";
 }
 
 export function getInfraNextNode(state: JimClawState): "terminal" | "qa" {
@@ -348,31 +354,15 @@ export async function createJimClawGraph(agents: {
     .addNode("approval", withNodeGuard("approval", (s) => approvalNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder, options?.requestApproval)))
     .addNode("approval_pending", async (s: JimClawState) => s)
     .addNode("agent_pending", async (s: JimClawState) => {
-      const retryCount = (s.agentRecoveryRetryCount || 0) + 1;
       const reason = s.agentRecoveryReason || "";
-      const isDebugFailure = /Debug Failure/i.test(reason);
-      const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
-      const maxRetries = isDebugFailure ? 5 : 3; // ts-node 编译器瞬时错误需要更多重试
-
-      if (isRetryable && retryCount <= maxRetries) {
-        // 可重试的临时故障：等待后重试（Debug Failure 需要更长延迟让 ts-node GC）
-        const delay = isDebugFailure ? 5000 : 2000;
-        console.log(`[AgentPending] 第 ${retryCount}/${maxRetries} 次重试: ${s.agentRecoveryNode} (${reason.slice(0, 80)})`);
-        emit("thinking", "System", `模型服务临时不可用（${reason.slice(0, 60)}），第 ${retryCount}/${maxRetries} 次重试...`, {});
-        await new Promise(resolve => setTimeout(resolve, delay));
-        return {
-          agentRecoveryPending: false,
-          agentRecoveryRetryCount: retryCount,
-        } as Partial<JimClawState>;
-      } else {
-        // 不可重试或已达上限：放弃
-        console.log(`[AgentPending] 无法恢复: ${reason.slice(0, 80)}`);
-        emit("thinking", "System", `模型服务不可恢复（${reason.slice(0, 60)}），终止运行`, {});
-        return {
-          agentRecoveryPending: false,
-          agentRecoveryRetryCount: retryCount,
-        } as Partial<JimClawState>;
-      }
+      console.log(`[AgentPending] 已挂起: ${s.agentRecoveryNode || "unknown"} (${reason.slice(0, 80)})`);
+      emit("thinking", "System", `模型服务暂不可用（${reason.slice(0, 60)}），已保存状态，等待恢复执行`, {});
+      return {
+        agentRecoveryPending: true,
+        agentRecoveryNode: s.agentRecoveryNode,
+        agentRecoveryReason: s.agentRecoveryReason,
+        resumeFromNode: s.resumeFromNode || s.agentRecoveryNode || "",
+      } as Partial<JimClawState>;
     })
     .addNode("orchestrator", withNodeGuard("orchestrator", (s) => orchestratorNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
     .addNode("sprint_planner", withNodeGuard("sprint_planner", (s) => sprintPlannerNode(s, agents, WORKSPACE, emit, startSpan, saveBoulder)))
@@ -443,42 +433,7 @@ export async function createJimClawGraph(agents: {
     agent_pending: "agent_pending",
   });
   workflow.addEdge("approval_pending", END);
-  // agent_pending: 可重试时回到失败节点，不可重试时结束
-  workflow.addConditionalEdges("agent_pending", (state: JimClawState) => {
-    const retryCount = state.agentRecoveryRetryCount || 0;
-    const reason = state.agentRecoveryReason || "";
-    const isDebugFailure = /Debug Failure/i.test(reason);
-    const isRetryable = /Connection error|超时|502|Debug Failure/i.test(reason);
-    const maxRetries = isDebugFailure ? 5 : 3;
-
-    if (isRetryable && retryCount <= maxRetries) {
-      const targetNode = state.agentRecoveryNode || "pm";
-      console.log(`[AgentPending] 路由回 ${targetNode} 进行重试`);
-      return targetNode as any;
-    }
-    return "__end__";
-  }, {
-    pm: "pm",
-    architect: "architect",
-    contract_sync: "contract_sync",
-    orchestrator: "orchestrator",
-    sprint_planner: "sprint_planner",
-    sprint_contract: "sprint_contract",
-    coder: "coder",
-    env_guard: "env_guard",
-    infra_setup: "infra_setup",
-    terminal: "terminal",
-    verifier: "verifier",
-    evaluator: "evaluator",
-    qa: "qa",
-    fix_plan: "fix_plan",
-    architect_mediation: "architect_mediation",
-    deploy: "deploy",
-    release_gate: "release_gate",
-    post_mortem: "post_mortem",
-    persistence: "persistence",
-    __end__: END,
-  });
+  workflow.addEdge("agent_pending", END);
   workflow.addConditionalEdges("orchestrator", routeWithAgentPending(() => managedHarnessEnabled ? "sprint_planner" : "env_guard"), {
     sprint_planner: "sprint_planner",
     env_guard: "env_guard",
@@ -518,9 +473,12 @@ export async function createJimClawGraph(agents: {
     agent_pending: "agent_pending",
   });
 
-  // verifier：文件缺失直回 coder；其他结果先走 evaluator 生成可复现验收证据。
+  // verifier：文件缺失直回 coder；managed harness 下其他结果先走 evaluator 生成可复现证据。
   workflow.addConditionalEdges("verifier", routeWithAgentPending((s) => getVerifierNextNode(s, evaluatorEnabled)), {
     coder: "coder",
+    architect: "architect",
+    env_guard: "env_guard",
+    infra_setup: "infra_setup",
     evaluator: "evaluator",
     qa: "qa",
     agent_pending: "agent_pending",

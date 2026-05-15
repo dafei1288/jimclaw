@@ -6,6 +6,8 @@ const {
   removeTempWorkspace,
   createBaseState,
   createSnapshotRecorder,
+  createHostExecMock,
+  shellOk,
 } = require("./test-helpers");
 const { createJimClawGraph, getVerifierNextNode, getQaNextNode, getInfraNextNode, getDeployNextNode, hasPendingExecutorApproval } = require("../../src/core/graph");
 const { deployNode } = require("../../src/core/nodes/deploy_node");
@@ -15,6 +17,7 @@ const { buildResumeStateFromCurrentSnapshot, loadTraceIndex } = require("../../s
 const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
 const { GetServerIPSkill } = require("../../src/skills/get_server_ip");
 const { AgentResourceExhaustedError, AgentServiceUnavailableError } = require("../../src/core/agent");
+const { host } = require("../../src/infra");
 
 function createWorkflowAgents({ qaContent = '{"issues":[]}' } = {}) {
   return {
@@ -610,6 +613,14 @@ test("deploy node persists deploy failure evidence and runtime ownership", async
   const workspace = await createTempWorkspace();
   const originalShellRun = ShellExecuteSkill.config.run;
   const originalGetServerIP = GetServerIPSkill.config.run;
+  const originalHttpGet = host.httpGet;
+  const originalSetTimeout = global.setTimeout;
+  const hostExecMock = createHostExecMock([
+    [/^docker exec container-123 sh -c "netstat/, shellOk("")],
+    [/^docker exec container-123 sh -c "cat \/tmp\/jimclaw\/server\.log/, shellOk("listen EADDRNOTAVAIL")],
+    [/^docker exec container-123 sh -c "cat \/tmp\/jimclaw\/server\.pid/, shellOk("123")],
+    [/^docker logs container-123/, shellOk("app crashed on startup\nlisten EADDRNOTAVAIL")],
+  ]);
 
   ShellExecuteSkill.config.run = async ({ command }) => {
     if (command.startsWith("curl ")) return "Output:\n000\nErrors:\n";
@@ -618,6 +629,11 @@ test("deploy node persists deploy failure evidence and runtime ownership", async
     if (command.startsWith("docker rm -f")) return "Output:\nremoved\nErrors:\n";
     return "Output:\n\nErrors:\n";
   };
+  global.setTimeout = ((fn, _ms, ...args) => {
+    fn(...args);
+    return 0;
+  });
+  host.httpGet = async () => ({ statusCode: 0, body: "", error: "connect ECONNREFUSED 127.0.0.1:4000" });
   GetServerIPSkill.config.run = async () => "127.0.0.1";
 
   try {
@@ -673,6 +689,9 @@ test("deploy node persists deploy failure evidence and runtime ownership", async
   } finally {
     ShellExecuteSkill.config.run = originalShellRun;
     GetServerIPSkill.config.run = originalGetServerIP;
+    host.httpGet = originalHttpGet;
+    global.setTimeout = originalSetTimeout;
+    hostExecMock.restore();
     await removeTempWorkspace(workspace);
   }
 });

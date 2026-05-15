@@ -7,9 +7,12 @@ const {
   createNoopEmit,
   createNoopStartSpan,
   createSnapshotRecorder,
+  createHostExecMock,
+  shellOk,
 } = require("./test-helpers");
 const { ShellExecuteSkill } = require("../../src/skills/shell_exec");
 const { GetServerIPSkill } = require("../../src/skills/get_server_ip");
+const { host } = require("../../src/infra");
 
 require("ts-node/register/transpile-only");
 
@@ -424,6 +427,13 @@ test("deploy failure emits structured runtime gap diagnostics instead of raw tex
   const originalShellRun = ShellExecuteSkill.config.run;
   const originalGetServerIP = GetServerIPSkill.config.run;
   const originalSetTimeout = global.setTimeout;
+  const originalHttpGet = host.httpGet;
+  const hostExecMock = createHostExecMock([
+    [/^docker exec container-123 sh -c "netstat/, shellOk("")],
+    [/^docker exec container-123 sh -c "cat \/tmp\/jimclaw\/server\.log/, shellOk("listen EADDRNOTAVAIL")],
+    [/^docker exec container-123 sh -c "cat \/tmp\/jimclaw\/server\.pid/, shellOk("123")],
+    [/^docker logs container-123/, shellOk("app crashed on startup\nlisten EADDRNOTAVAIL")],
+  ]);
 
   global.setTimeout = ((fn, _ms, ...args) => {
     fn(...args);
@@ -431,6 +441,7 @@ test("deploy failure emits structured runtime gap diagnostics instead of raw tex
   });
 
   GetServerIPSkill.config.run = async () => "127.0.0.1";
+  host.httpGet = async () => ({ statusCode: 0, body: "", error: "connect ECONNREFUSED 127.0.0.1:4000" });
   ShellExecuteSkill.config.run = async ({ command }) => {
     if (command.startsWith("curl ")) {
       return "Output:\n000\nErrors:\n";
@@ -493,6 +504,8 @@ test("deploy failure emits structured runtime gap diagnostics instead of raw tex
     ShellExecuteSkill.config.run = originalShellRun;
     GetServerIPSkill.config.run = originalGetServerIP;
     global.setTimeout = originalSetTimeout;
+    host.httpGet = originalHttpGet;
+    hostExecMock.restore();
     await removeTempWorkspace(workspace);
   }
 });
