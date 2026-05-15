@@ -244,7 +244,7 @@ function allowedRolesForProtocolFile(role: ProtocolFileRole): ProtocolFileRole[]
   const base: ProtocolFileRole[] = ["model", "config", "other"];
   switch (role) {
     case "entry":
-      return ["route", "controller", "service", "repository", "middleware", ...base];
+      return ["entry", "route", "controller", "service", "repository", "middleware", ...base];
     case "route":
       return ["controller", "service", "repository", "middleware", ...base];
     case "controller":

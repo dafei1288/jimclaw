@@ -89,6 +89,7 @@ test("buildExecutionProtocol treats Express app module as route-mounting entry",
 
   assert.equal(protocol.contracts.files["src/app.ts"].role, "entry");
   assert.equal(protocol.contracts.files["src/app.ts"].allowedDependencyRoles.includes("route"), true);
+  assert.equal(protocol.contracts.files["src/index.ts"].allowedDependencyRoles.includes("entry"), true);
 });
 
 test("buildExecutionProtocol does not synthesize write endpoints for read-only book APIs", () => {

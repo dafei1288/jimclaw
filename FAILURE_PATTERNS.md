@@ -229,9 +229,9 @@
 
 ## FP-021: Express app 模块被误标为 other 导致 route 挂载被拦截
 
-- **症状**: Coder 写出 `src/app.ts` 并 `import productsRouter from "./routes/products"` 后，执行协议校验报 `src/app.ts(other) 不允许依赖 src/routes/products.ts(route)`，流程进入 QA/fix_plan 盲修代码。
-- **根因**: `inferProtocolFileRole()` 只把 `src/index.ts` 识别为 `entry`，没有把常见 Express 应用模块 `src/app.ts` / `src/server.ts` 识别为可挂载 route 的入口类文件。
-- **修复**: 将 `src/app.ts`、`src/app.js`、`src/server.ts`、`src/server.js` 归类为 `entry`，继承 entry 对 route/controller/service/middleware 的合法依赖。
+- **症状**: Coder 写出 `src/app.ts` 并 `import productsRouter from "./routes/products"` 后，执行协议校验报 `src/app.ts(other) 不允许依赖 src/routes/products.ts(route)`；修复后又出现 `src/index.ts(entry) 不允许依赖 src/app.ts(entry)`，流程进入 QA/fix_plan 盲修代码。
+- **根因**: `inferProtocolFileRole()` 只把 `src/index.ts` 识别为 `entry`，没有把常见 Express 应用模块 `src/app.ts` / `src/server.ts` 识别为可挂载 route 的入口类文件；同时 `entry` 角色不允许依赖另一个 `entry`，误伤 `index.listen(app)` 结构。
+- **修复**: 将 `src/app.ts`、`src/app.js`、`src/server.ts`、`src/server.js` 归类为 `entry`，继承 entry 对 route/controller/service/middleware 的合法依赖；允许 `entry` 依赖 `entry`。
 - **预防**: 协议角色校验拦截前，必须先确认 role inference 覆盖主流框架入口命名；smoke 中的协议阻塞应优先判断是不是规划/协议错误，而不是默认让 Coder 改代码。
 - **首次发现**: 2026-05-15, `run_1778811083795`
 - **标签**: `execution-protocol`, `express`, `role-inference`, `coder`, `smoke`

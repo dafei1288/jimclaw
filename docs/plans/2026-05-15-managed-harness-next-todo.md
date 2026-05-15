@@ -562,6 +562,8 @@ git commit -m "docs: record managed harness smoke findings"
   - route evidence：已出现 `sprint_planned`、`sprint_contract_agreed`，SP-1 可写范围被限定到 package/tsconfig/src/tests 文件。
   - blocking failure：`src/app.ts` 被 `ExecutionProtocol` 标成 `other`，导致合法挂载 `src/routes/products.ts(route)` 被依赖角色校验拦截。
   - 已修复：`buildExecutionProtocol` 将 Express/Node `src/app.ts`、`src/server.ts` 归类为 `entry`，允许其依赖 route/controller/service/middleware。
+  - blocking failure 2：修复后 `src/index.ts(entry)` 又被禁止依赖 `src/app.ts(entry)`，导致常见 Express `index.listen(app)` 结构被误拦截。
+  - 已修复：`entry` 角色允许依赖另一个 `entry`，覆盖 `src/index.ts -> src/app.ts` / `src/server.ts -> src/app.ts` 入口组合。
   - 验证通过：`node --test tests/core/execution-protocol.test.js tests/core/coder-node.test.js`
   - 验证通过：`node --test tests/core/managed-harness-types.test.js tests/core/sprint-planner.test.js tests/core/sprint-planner-node.test.js tests/core/sprint-contract-node.test.js tests/core/evaluator-node.test.js tests/core/release-gate-node.test.js tests/core/workflow-replay.test.js`
   - 验证通过：`npx tsc --noEmit`
