@@ -1,4 +1,4 @@
-import { EvaluationCheck, JimClawState, SprintContract, SprintPlan } from "../graph_types";
+import { EvaluationAssertion, EvaluationCheck, JimClawState, SprintContract, SprintPlan } from "../graph_types";
 import { getNextRunnableSprintPlan, writeMeetingNote } from "../logic_utils";
 import { appendSessionEvent } from "../../utils/session_events";
 
@@ -19,6 +19,90 @@ function scopeAllowsFile(fileTarget: string, scopeEntry: string): boolean {
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values.filter(Boolean).map(normalizeScopePath)));
+}
+
+function normalizeEndpointUrl(value: string): string {
+  const raw = String(value || "").trim().replace(/[，。；;、)）\]]+$/g, "");
+  if (!raw) return "";
+  return raw.startsWith("/") ? raw : `/${raw}`;
+}
+
+function endpointPathOnly(value: string): string {
+  return normalizeEndpointUrl(value).split("#")[0].split("?")[0].replace(/\/+$/, "") || "/";
+}
+
+function extractGetUrls(text: string): string[] {
+  const urls: string[] = [];
+  for (const match of String(text || "").matchAll(/\bGET\s+(\/[^\s，。；;、)）\]]+)/gi)) {
+    const url = normalizeEndpointUrl(match[1]);
+    if (url) urls.push(url);
+  }
+  return Array.from(new Set(urls));
+}
+
+function collectSprintValidationTexts(state: JimClawState, sprint: SprintPlan): string[] {
+  const criteria = state.productSpec?.acceptanceCriteria || [];
+  const sprintCriteria = criteria
+    .filter((criterion) => (sprint.acceptanceCriteriaIds || []).includes(criterion.id))
+    .map((criterion) => criterion.description);
+  return Array.from(new Set([...(sprint.doneWhen || []), ...sprintCriteria].filter(Boolean)));
+}
+
+function textTargetsUrl(text: string, url: string): boolean {
+  const extractedUrls = extractGetUrls(text);
+  if (extractedUrls.length === 0) return true;
+  const normalizedUrl = normalizeEndpointUrl(url);
+  return extractedUrls.some((candidate) => normalizeEndpointUrl(candidate) === normalizedUrl);
+}
+
+function buildSemanticAssertionTemplates(url: string, text: string): Omit<EvaluationAssertion, "id">[] {
+  const normalizedText = String(text || "");
+  const normalizedUrl = normalizeEndpointUrl(url);
+  const isApi = endpointPathOnly(normalizedUrl).startsWith("/api/");
+  const isLowStockUrl = /[?&]lowStock=true/i.test(normalizedUrl);
+  const isLowStockText = /低库存|lowStock|筛选|过滤/i.test(normalizedText);
+  const templates: Omit<EvaluationAssertion, "id">[] = [];
+
+  if (isApi && /json|数组|列表|每条|字段|数据|低库存|lowStock/i.test(normalizedText)) {
+    templates.push({ type: "jsonArray" });
+  }
+
+  if (isApi) {
+    const fields = new Set<string>();
+    if (/\bid\b|编号|标识/i.test(normalizedText)) fields.add("id");
+    if (/\bname\b|名称|商品名称/i.test(normalizedText)) fields.add("name");
+    if (/\bstock\b|库存/i.test(normalizedText)) fields.add("stock");
+    if (/lowStock|低库存状态字段/i.test(normalizedText)) fields.add("lowStock");
+    for (const field of fields) {
+      templates.push({ type: "jsonFieldExists", field, scope: "each" });
+    }
+  }
+
+  if (isApi && isLowStockUrl && isLowStockText) {
+    templates.push({ type: "jsonEvery", field: "stock", operator: "lt", value: 10 });
+  }
+
+  if (!isApi && /页面|html|展示|显示/i.test(normalizedText)) {
+    if (/商品/i.test(normalizedText)) templates.push({ type: "bodyContains", text: "商品" });
+    if (/库存/i.test(normalizedText)) templates.push({ type: "bodyContains", text: "库存" });
+  }
+
+  return templates;
+}
+
+function buildSemanticAssertionsForCheck(checkId: string, url: string, texts: string[]): EvaluationAssertion[] {
+  const deduped = new Map<string, Omit<EvaluationAssertion, "id">>();
+  for (const text of texts) {
+    if (!textTargetsUrl(text, url)) continue;
+    for (const assertion of buildSemanticAssertionTemplates(url, text)) {
+      const key = JSON.stringify(assertion);
+      if (!deduped.has(key)) deduped.set(key, assertion);
+    }
+  }
+  return Array.from(deduped.values()).map((assertion, index) => ({
+    id: `${checkId}-A${index + 1}`,
+    ...assertion,
+  }));
 }
 
 function normalizeAllowedFiles(state: JimClawState, sprint: SprintPlan): string[] {
@@ -55,18 +139,47 @@ function normalizeAllowedFiles(state: JimClawState, sprint: SprintPlan): string[
 
 function buildDefaultEvaluationChecks(state: JimClawState, sprint: SprintPlan): EvaluationCheck[] {
   const checks: EvaluationCheck[] = [];
+  const validationTexts = collectSprintValidationTexts(state, sprint);
+  const getEndpointPaths = new Set<string>();
 
   for (const endpoint of state.apiContract?.endpoints || []) {
     const method = String(endpoint.method || "").toUpperCase();
     if (method !== "GET") continue;
-    checks.push({
+    const url = normalizeEndpointUrl(endpoint.path);
+    getEndpointPaths.add(endpointPathOnly(url));
+    const check: EvaluationCheck = {
       id: `CHK-HTTP-${checks.length + 1}`,
       kind: "http",
-      description: `验证 ${method} ${endpoint.path}`,
+      description: `验证 ${method} ${url}`,
       method,
-      url: endpoint.path,
+      url,
       expectedStatus: [200, 201, 204],
-    });
+    };
+    const assertions = buildSemanticAssertionsForCheck(check.id, url, [
+      String((endpoint as any).description || ""),
+      ...validationTexts,
+    ]);
+    if (assertions.length > 0) check.assertions = assertions;
+    checks.push(check);
+  }
+
+  for (const text of validationTexts) {
+    for (const url of extractGetUrls(text)) {
+      if (!url.includes("?")) continue;
+      if (!getEndpointPaths.has(endpointPathOnly(url))) continue;
+      if (checks.some((check) => normalizeEndpointUrl(check.url || "") === url)) continue;
+      const check: EvaluationCheck = {
+        id: `CHK-HTTP-${checks.length + 1}`,
+        kind: "http",
+        description: `验证 GET ${url}：${text}`,
+        method: "GET",
+        url,
+        expectedStatus: [200, 201, 204],
+      };
+      const assertions = buildSemanticAssertionsForCheck(check.id, url, [text]);
+      if (assertions.length > 0) check.assertions = assertions;
+      checks.push(check);
+    }
   }
 
   if (!checks.length && state.spec?.testCommand) {
