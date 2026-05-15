@@ -567,6 +567,18 @@ git commit -m "docs: record managed harness smoke findings"
   - 验证通过：`node --test tests/core/execution-protocol.test.js tests/core/coder-node.test.js`
   - 验证通过：`node --test tests/core/managed-harness-types.test.js tests/core/sprint-planner.test.js tests/core/sprint-planner-node.test.js tests/core/sprint-contract-node.test.js tests/core/evaluator-node.test.js tests/core/release-gate-node.test.js tests/core/workflow-replay.test.js`
   - 验证通过：`npx tsc --noEmit`
+- Task 7 最终 smoke：
+  - run：`run_1778813451610`
+  - container id：`2073963dc62977bedd1730faa5b021a1585378a6676d35c2456e291106370663`
+  - URL：`http://100.74.126.56:4003`
+  - events：包含 `sprint_planned`、2 次 `sprint_contract_agreed`、2 次 `evaluation_completed`、1 次 `release_gate_completed`。
+  - SP-1：Evaluator HTTP evidence 通过 `/products`、`/api/products`、`/api/health`。
+  - SP-2：Evaluator HTTP evidence 通过 `/products`、`/api/products`、`/api/health`，ReleaseGate 放行。
+  - 部署后端点验证：`/products`、`/api/products`、`/api/health` 均返回 HTTP 200。
+  - 手工 curl：`/products` 返回 HTML；`/api/products` 返回 JSON；`/api/products?lowStock=true` 返回低库存子集；`/api/health` 返回 JSON。
+  - 容器内验证通过：`npm test` 2 个 suite / 2 个 test 通过；`npm run build` 通过，`dist/src/app.js`、`dist/src/index.js`、`dist/src/productService.js` 存在。
+  - audit 核查：`Infrastructure.md` 和 `Terminal.md` 未出现未解释的 `Critical Error` / `exit code` / `not found`；`boulder.json` 中 `isDone=true`、`deploymentStatus.status=running`。
+  - 后续质量点：当前 evaluator/release gate 对低库存语义仍偏浅，主要验证 HTTP evidence 与响应片段；下一步应加入 semantic/body assertion，避免“200 但业务语义不足”。
 
 ---
 

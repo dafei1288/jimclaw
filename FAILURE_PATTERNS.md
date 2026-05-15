@@ -235,3 +235,14 @@
 - **预防**: 协议角色校验拦截前，必须先确认 role inference 覆盖主流框架入口命名；smoke 中的协议阻塞应优先判断是不是规划/协议错误，而不是默认让 Coder 改代码。
 - **首次发现**: 2026-05-15, `run_1778811083795`
 - **标签**: `execution-protocol`, `express`, `role-inference`, `coder`, `smoke`
+
+---
+
+## FP-022: Endpoint evidence 通过但业务语义断言偏浅
+
+- **症状**: Managed smoke 已通过 evaluator 与 ReleaseGate，公开端点均返回 200；但手工检查发现 gate 主要依赖 HTTP 状态、Content-Type 和响应片段，低库存筛选等业务语义缺少结构化断言。
+- **根因**: `SprintContract.evaluatorPlan.checks` 当前以 HTTP 可达性为主，没有从 acceptance criteria 派生 JSONPath/contains/excludes/count 等 body-level semantic checks。
+- **修复**: 待实现：Evaluator 应支持语义断言，例如 JSON 数组字段存在、筛选后所有元素满足阈值、页面 HTML 包含/不包含指定商品文本；ReleaseGate 应要求每条 acceptance criteria 有对应 semantic evidence。
+- **预防**: 复杂 smoke 不能只看 endpoint 200，应把用户验收语义转成可执行证据。
+- **首次发现**: 2026-05-15, `run_1778813451610`
+- **标签**: `evaluator`, `release-gate`, `semantic-evidence`, `acceptance-criteria`, `smoke`
