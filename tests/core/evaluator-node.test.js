@@ -249,6 +249,149 @@ test("evaluator http failure records suspected files and validation report", asy
   }
 });
 
+test("evaluator fails an http check when json semantic assertion fails", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  host.httpGet = async () => ({
+    statusCode: 200,
+    body: JSON.stringify([
+      { id: 1, name: "Low stock item", stock: 3 },
+      { id: 2, name: "Normal stock item", stock: 45 },
+    ]),
+  });
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-LOW-STOCK",
+          kind: "http",
+          description: "验证 GET /api/products?lowStock=true 仅返回低库存商品",
+          method: "GET",
+          url: "/api/products?lowStock=true",
+          expectedStatus: [200],
+          assertions: [
+            { id: "A-array", type: "jsonArray" },
+            { id: "A-name", type: "jsonFieldExists", field: "name", scope: "each" },
+            { id: "A-stock-low", type: "jsonEvery", field: "stock", operator: "lt", value: 10 },
+          ],
+        }])],
+        deploymentStatus: { status: "running", url: "http://127.0.0.1:4100" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(result.evaluationResults[0].status, "fail");
+    assert.equal(check.status, "fail");
+    assert.equal(check.evidence.httpStatus, 200);
+    assert.equal(check.evidence.assertions.some((item) => item.id === "A-stock-low" && item.status === "fail"), true);
+    assert.equal(result.validationReport.status, "fail");
+  } finally {
+    host.httpGet = originalHttpGet;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("evaluator records passing semantic assertion evidence", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  host.httpGet = async () => ({
+    statusCode: 200,
+    body: JSON.stringify([
+      { id: 1, name: "Low stock item", stock: 3 },
+      { id: 2, name: "Another low stock item", stock: 8 },
+    ]),
+  });
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-LOW-STOCK",
+          kind: "http",
+          description: "验证 GET /api/products?lowStock=true 仅返回低库存商品",
+          method: "GET",
+          url: "/api/products?lowStock=true",
+          expectedStatus: [200],
+          assertions: [
+            { id: "A-array", type: "jsonArray" },
+            { id: "A-name", type: "jsonFieldExists", field: "name", scope: "each" },
+            { id: "A-stock-low", type: "jsonEvery", field: "stock", operator: "lt", value: 10 },
+          ],
+        }])],
+        deploymentStatus: { status: "running", url: "http://127.0.0.1:4100" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(result.evaluationResults[0].status, "pass");
+    assert.equal(check.status, "pass");
+    assert.equal(check.evidence.assertions.length, 3);
+    assert.equal(check.evidence.assertions.every((item) => item.status === "pass"), true);
+  } finally {
+    host.httpGet = originalHttpGet;
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("evaluator fails an http check when html body semantic assertion fails", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  host.httpGet = async () => ({
+    statusCode: 200,
+    body: "<html><body><h1>Low stock</h1><p>USB-C Hub</p></body></html>",
+  });
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-LOW-STOCK-PAGE",
+          kind: "http",
+          description: "验证 GET /products?lowStock=true 页面不展示非低库存商品",
+          method: "GET",
+          url: "/products?lowStock=true",
+          expectedStatus: [200],
+          assertions: [
+            { id: "A-title", type: "bodyContains", text: "Low stock" },
+            { id: "A-no-normal-item", type: "bodyNotContains", text: "USB-C Hub" },
+          ],
+        }])],
+        deploymentStatus: { status: "running", url: "http://127.0.0.1:4100" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(result.evaluationResults[0].status, "fail");
+    assert.equal(check.status, "fail");
+    assert.equal(check.evidence.assertions.some((item) => item.id === "A-no-normal-item" && item.status === "fail"), true);
+  } finally {
+    host.httpGet = originalHttpGet;
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("evaluator attributes http 404 to entry and route mounting files", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
