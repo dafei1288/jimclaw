@@ -434,6 +434,20 @@ test("buildSystemContext includes control-plane summaries", () => {
     executionProtocol: protocol,
     validationReport,
     repairPlan,
+    repairContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      sourceEvaluationResultId: "SP-1:CHK-HTTP-1",
+      failedChecks: ["CHK-HTTP-1"],
+      reproSteps: ["GET /api/health"],
+      suspectedFiles: ["src/index.ts", "src/admin.ts"],
+      allowedRepairFiles: ["src/index.ts"],
+      rerunChecks: ["CHK-HTTP-1"],
+      repairScope: ["src/index.ts"],
+      instructions: ["src/index.ts: 修复 /api/health 500"],
+      expectedEvidence: ["GET /api/health 返回 200"],
+      status: "open",
+    }],
     customerApprovalState,
   });
 
@@ -451,6 +465,10 @@ test("buildSystemContext includes control-plane summaries", () => {
   assert.match(context, /failureType: planning_gap/);
   assert.match(context, /\[修复计划\]/);
   assert.match(context, /repairType: planning/);
+  assert.match(context, /\[修复契约\]/);
+  assert.match(context, /failedChecks: CHK-HTTP-1/);
+  assert.match(context, /allowedRepairFiles: src\/index\.ts/);
+  assert.match(context, /reproSteps: GET \/api\/health/);
   assert.match(context, /\[客户确认\]/);
   assert.match(context, /deploy=否/);
 });

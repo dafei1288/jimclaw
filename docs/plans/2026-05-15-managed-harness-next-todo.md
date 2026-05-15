@@ -551,6 +551,12 @@ git commit -m "docs: record managed harness smoke findings"
   - 已修复：release gate 会逐一检查 `apiContract.endpoints` 中所有公开 GET 是否有 passing HTTP evidence；`<!doctype>/<html>/<body>/text/html` 页面响应可作为 UI evidence。
   - 验证通过：`node --test tests/core/release-gate-node.test.js`
   - 验证通过：`npx tsc --noEmit`
+- Task 6 执行：
+  - 新增回归：failed evaluator check 同时怀疑 sprint 内文件与 sprint 外文件时，`repairContract.repairScope` 只能保留 active `SprintContract.agreedScope.allowedFiles` 内的文件。
+  - 已修复：`RepairContract` 记录 `failedChecks`、`reproSteps`、`suspectedFiles`、`allowedRepairFiles`、`rerunChecks`，并把状态标记为 `open`。
+  - 已修复：`buildSystemContext()` 注入 `[修复契约]` 摘要，后续 Agent 能看到 failed check、复现步骤和允许修复文件，不再只依赖普通 issue title。
+  - 验证通过：`node --test tests/core/fix-plan-node.test.js tests/core/workflow-replay.test.js tests/core/execution-protocol.test.js`
+  - 验证通过：`npx tsc --noEmit`
 
 ---
 

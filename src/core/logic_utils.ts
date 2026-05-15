@@ -5510,6 +5510,7 @@ export function buildSystemContext(state: JimClawState): string[] {
   const solutionProtocol = state.solutionProtocol || protocol?.solution || null;
   const validationReport = state.validationReport || null;
   const repairPlan = state.repairPlan || null;
+  const openRepairContracts = (state.repairContracts || []).filter((contract) => contract.status !== "closed");
   const customerApprovalState = state.customerApprovalState || null;
 
   if (!core) {
@@ -5626,6 +5627,26 @@ export function buildSystemContext(state: JimClawState): string[] {
     lines.push("[修复计划]");
     lines.push(`• repairType: ${repairPlan.repairType}`);
     lines.push(`• targets: ${repairPlan.targets.join(", ") || "无"}`);
+  }
+
+  if (openRepairContracts.length > 0) {
+    lines.push("");
+    lines.push("[修复契约]");
+    for (const contract of openRepairContracts.slice(0, 3)) {
+      lines.push(`• sprintId: ${contract.sprintId}`);
+      lines.push(`  failedChecks: ${contract.failedChecks.join(", ") || "无"}`);
+      if (contract.reproSteps?.length) {
+        lines.push(`  reproSteps: ${contract.reproSteps.join(" | ")}`);
+      }
+      if (contract.allowedRepairFiles?.length) {
+        lines.push(`  allowedRepairFiles: ${contract.allowedRepairFiles.join(", ")}`);
+      } else if (contract.repairScope.length) {
+        lines.push(`  repairScope: ${contract.repairScope.join(", ")}`);
+      }
+      if (contract.rerunChecks?.length) {
+        lines.push(`  rerunChecks: ${contract.rerunChecks.join(", ")}`);
+      }
+    }
   }
 
   if (customerApprovalState) {

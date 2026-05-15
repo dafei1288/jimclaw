@@ -68,7 +68,7 @@ test("fix plan creates repair contract from failed evaluation result", async () 
         status: "fail",
         evidence: { httpStatus: 500, httpBodySnippet: "server error" },
         reproSteps: ["GET /api/books"],
-        suspectedFiles: [failingFile],
+        suspectedFiles: [failingFile, "src/admin.ts"],
       }],
       summary: "SP-1 验收失败：CHK-HTTP-1",
     }],
@@ -117,6 +117,10 @@ test("fix plan creates repair contract from failed evaluation result", async () 
     assert.equal(result.repairContracts[0].sprintId, "SP-1");
     assert.deepEqual(result.repairContracts[0].failedChecks, ["CHK-HTTP-1"]);
     assert.deepEqual(result.repairContracts[0].repairScope, [failingFile]);
+    assert.deepEqual(result.repairContracts[0].allowedRepairFiles, [failingFile]);
+    assert.deepEqual(result.repairContracts[0].suspectedFiles, [failingFile, "src/admin.ts"]);
+    assert.deepEqual(result.repairContracts[0].reproSteps, ["GET /api/books"]);
+    assert.deepEqual(result.repairContracts[0].rerunChecks, ["CHK-HTTP-1"]);
     assert.match(result.repairContracts[0].instructions[0], /GET \/api\/books/);
     assert.equal(result.subTasks.find((task) => task.fileTarget === failingFile).status, "pending");
   } finally {

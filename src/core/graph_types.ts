@@ -465,9 +465,14 @@ export interface RepairContract {
   sprintId: string;
   sourceEvaluationResultId?: string;
   failedChecks: string[];
+  reproSteps?: string[];
+  suspectedFiles?: string[];
+  allowedRepairFiles?: string[];
+  rerunChecks?: string[];
   repairScope: string[];
   instructions: string[];
   expectedEvidence: string[];
+  status?: "open" | "closed";
 }
 
 /**

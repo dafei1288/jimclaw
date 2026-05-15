@@ -2,7 +2,7 @@ import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState, FixPlanItem, ProtocolPatch, RepairContract } from "../graph_types";
 import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
-import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, getActiveSprintContract, writeMeetingNote } from "../logic_utils";
+import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, getActiveSprintContract, isFileAllowedBySprintContract, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
 
 const FIX_PLAN_CODER_TIMEOUT_MS = 120000;
@@ -115,11 +115,16 @@ function buildRepairContractsFromEvaluation(
   const activeContract = getActiveSprintContract(state);
   const nextContracts = failedResults.map((result) => {
     const failedChecks = result.checks.filter((check) => check.status !== "pass");
-    const repairScope = unique([
+    const suspectedFiles = unique(failedChecks.flatMap((check) => check.suspectedFiles || []));
+    const rawRepairScope = unique([
       ...failedChecks.flatMap((check) => check.suspectedFiles || []),
       ...failingFiles,
       ...fixPlan.map((item) => item.fileTarget),
     ]);
+    const allowedRepairFiles = activeContract
+      ? rawRepairScope.filter((file) => isFileAllowedBySprintContract(file, activeContract))
+      : rawRepairScope;
+    const repairScope = allowedRepairFiles;
     const instructions = fixPlan
       .filter((item) => repairScope.includes(item.fileTarget))
       .map((item) => `${item.fileTarget}: ${item.proposedChange}`);
@@ -127,15 +132,22 @@ function buildRepairContractsFromEvaluation(
       ...(activeContract?.evaluatorPlan.requiredEvidence || []),
       ...failedChecks.flatMap((check) => check.reproSteps || []),
     ]);
+    const reproSteps = unique(failedChecks.flatMap((check) => check.reproSteps || []));
+    const rerunChecks = failedChecks.map((check) => check.checkId);
 
     return {
       version: "v1" as const,
       sprintId: result.sprintId,
       sourceEvaluationResultId: `${result.sprintId}:${failedChecks.map((check) => check.checkId).join(",")}`,
-      failedChecks: failedChecks.map((check) => check.checkId),
+      failedChecks: rerunChecks,
+      reproSteps,
+      suspectedFiles,
+      allowedRepairFiles,
+      rerunChecks,
       repairScope,
       instructions,
       expectedEvidence,
+      status: "open" as const,
     };
   });
 

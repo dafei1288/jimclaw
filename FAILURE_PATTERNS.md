@@ -213,3 +213,14 @@
 - **预防**: release gate 的放行条件必须绑定具体端点 evidence，不能只看 sprint pass 或 health check。
 - **首次发现**: 2026-05-15, `run_1778807069282`
 - **标签**: `release-gate`, `evaluator`, `ui-evidence`, `health-only`, `endpoint-coverage`
+
+---
+
+## FP-020: Evaluator 修复范围未与 SprintContract 取交集
+
+- **症状**: Evaluator 的 failed check 同时怀疑 sprint 内文件和 sprint 外文件时，修复计划可能把越界文件纳入 `repairScope`，Coder 后续容易追错文件或破坏其他智能体边界。
+- **根因**: `repairContract` 直接合并 `suspectedFiles`、失败文件和 `fixPlan` 文件，没有和 active `SprintContract.agreedScope.allowedFiles` 做交集；共享上下文也没有展示 failed check、复现步骤和 allowed repair files。
+- **修复**: 生成 `RepairContract` 时保存 `failedChecks`、`reproSteps`、`suspectedFiles`、`allowedRepairFiles`、`rerunChecks`，并将 `repairScope` 限定为 active sprint 允许文件；`buildSystemContext()` 注入 `[修复契约]` 摘要。
+- **预防**: evaluator 驱动的修复必须先绑定 failed check，再通过 SprintContract 做边界裁剪；禁止只按 QA issue title 盲修。
+- **首次发现**: 2026-05-15, Task 6 managed harness regression
+- **标签**: `evaluator`, `repair-contract`, `sprint-contract`, `fix-plan`, `scope-control`
