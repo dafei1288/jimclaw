@@ -362,3 +362,88 @@ test("release gate passes semantic acceptance with passing semantic evidence", a
     await removeTempWorkspace(workspace);
   }
 });
+
+test("release gate ignores stale failed evaluation when the same sprint later passes", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const staleFailure = {
+      version: "v1",
+      sprintId: "SP-2",
+      status: "fail",
+      checks: [{
+        checkId: "CHK-LOW-STOCK",
+        status: "fail",
+        evidence: {
+          httpStatus: 200,
+          httpBodySnippet: "[]",
+          assertions: [
+            { id: "A-array", type: "jsonArray", status: "pass", message: "响应体是 JSON 数组" },
+            { id: "A-non-empty", type: "jsonNonEmpty", status: "fail", message: "响应体 JSON 数组为空" },
+          ],
+        },
+        reproSteps: ["GET /api/products?lowStock=true"],
+        suspectedFiles: ["src/services/productService.ts"],
+      }],
+      summary: "SP-2 验收失败：CHK-LOW-STOCK",
+    };
+    const latestPass = {
+      ...staleFailure,
+      status: "pass",
+      checks: [{
+        checkId: "CHK-LOW-STOCK",
+        status: "pass",
+        evidence: {
+          httpStatus: 200,
+          httpBodySnippet: "[{\"name\":\"低库存商品A\",\"stock\":3}]",
+          assertions: [
+            { id: "A-array", type: "jsonArray", status: "pass", message: "响应体是 JSON 数组" },
+            { id: "A-non-empty", type: "jsonNonEmpty", status: "pass", message: "响应体 JSON 数组非空" },
+            { id: "A-stock-low", type: "jsonEvery", status: "pass", message: "所有元素满足 stock lt 10" },
+          ],
+        },
+        reproSteps: ["GET /api/products?lowStock=true"],
+        suspectedFiles: [],
+      }],
+      summary: "SP-2 验收通过",
+    };
+
+    const result = await releaseGateNode(
+      createBaseState({
+        productSpec: createProductSpec([
+          { id: "AC-LOW-STOCK", description: "GET /api/products?lowStock=true 仅返回低库存商品", verificationKind: "api" },
+        ]),
+        apiContract: {
+          endpoints: [
+            { method: "GET", path: "/api/products" },
+          ],
+        },
+        sprintPlans: [{
+          id: "SP-2",
+          title: "低库存筛选",
+          goal: "完成低库存筛选 API",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-LOW-STOCK"],
+          deliverables: ["API"],
+          allowedScope: ["src/", "tests/"],
+          dependencies: [],
+          estimatedComplexity: "small",
+          doneWhen: ["GET /api/products?lowStock=true 仅返回低库存商品"],
+        }],
+        evaluationResults: [staleFailure, latestPass],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, true);
+    assert.equal(result.validationReport.status, "pass");
+    assert.equal(result.lastFailedNode, "");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});

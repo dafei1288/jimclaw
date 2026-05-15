@@ -975,7 +975,7 @@ export const JimClawState = Annotation.Root({
     reducer: (x, y) => y !== undefined ? y : (x || []),
   }),
   evaluationResults: Annotation<EvaluationResult[]>({
-    reducer: (x, y) => [...(x || []), ...(y || [])],
+    reducer: (x, y) => y !== undefined ? y : (x || []),
   }),
   repairContracts: Annotation<RepairContract[]>({
     reducer: (x, y) => {

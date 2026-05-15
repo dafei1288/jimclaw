@@ -246,3 +246,14 @@
 - **预防**: 复杂 smoke 不能只看 endpoint 200，应把用户验收语义转成可执行证据。
 - **首次发现**: 2026-05-15, `run_1778813451610`
 - **标签**: `evaluator`, `release-gate`, `semantic-evidence`, `acceptance-criteria`, `smoke`
+
+---
+
+## FP-023: ReleaseGate 使用历史 evaluator 失败覆盖最新通过
+
+- **症状**: 同一 Sprint 的最新 evaluator 已通过，且低库存筛选有 `jsonNonEmpty` 与 `jsonEvery` 语义证据；ReleaseGate 仍引用该 Sprint 旧一轮失败结果并阻塞发布。
+- **根因**: `evaluationResults` 在 LangGraph reducer 中追加节点返回的完整列表，导致历史结果重复累积；ReleaseGate 又扫描全部历史结果，没有按 `sprintId` 取最新结果。
+- **修复**: `evaluationResults` reducer 改为以节点返回值替换；ReleaseGate 在所有证据判断中按每个 Sprint 的最新 evaluator 结果计算。
+- **预防**: 对“先失败、后通过”的状态写回路径必须有回归测试；ReleaseGate 的判断应使用当前 canonical state，历史记录留给 audit/session events。
+- **首次发现**: 2026-05-15, `run_1778821870073`
+- **标签**: `release-gate`, `evaluator`, `langgraph-reducer`, `stale-state`, `managed-harness`

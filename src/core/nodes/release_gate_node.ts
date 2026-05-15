@@ -1,9 +1,18 @@
-import { Issue, JimClawState, ProtocolFailure } from "../graph_types";
+import { EvaluationResult, Issue, JimClawState, ProtocolFailure } from "../graph_types";
 import { buildRepairPlan, buildValidationReport, writeMeetingNote } from "../logic_utils";
 import { appendSessionEvent } from "../../utils/session_events";
 
 function evidenceText(value: unknown): string {
   return JSON.stringify(value || {});
+}
+
+function getLatestEvaluationResults(state: JimClawState): EvaluationResult[] {
+  const latestBySprint = new Map<string, EvaluationResult>();
+  for (const result of state.evaluationResults || []) {
+    if (!result?.sprintId) continue;
+    latestBySprint.set(result.sprintId, result);
+  }
+  return Array.from(latestBySprint.values());
 }
 
 function normalizeEndpointPath(value: string): string {
@@ -43,7 +52,7 @@ function checkCoversEndpoint(check: any, endpointPath: string): boolean {
 }
 
 function hasEndpointEvidence(state: JimClawState, endpointPath: string): boolean {
-  return (state.evaluationResults || [])
+  return getLatestEvaluationResults(state)
     .filter((result) => result.status === "pass")
     .some((result) => result.checks.some((check) => checkCoversEndpoint(check, endpointPath)));
 }
@@ -71,7 +80,7 @@ function isHtmlPageEvidence(check: any): boolean {
 }
 
 function hasUiEvidence(state: JimClawState): boolean {
-  return (state.evaluationResults || [])
+  return getLatestEvaluationResults(state)
     .filter((result) => result.status === "pass")
     .some((result) => result.checks.some((check) => {
       const text = [
@@ -93,7 +102,7 @@ function requiresSemanticEvidence(text: string): boolean {
 
 function hasPassingSemanticEvidence(state: JimClawState, sprintIds?: string[]): boolean {
   const allowedSprintIds = sprintIds?.length ? new Set(sprintIds) : null;
-  return (state.evaluationResults || [])
+  return getLatestEvaluationResults(state)
     .filter((result) => result.status === "pass")
     .filter((result) => !allowedSprintIds || allowedSprintIds.has(result.sprintId))
     .some((result) => result.checks.some((check) => {
@@ -104,8 +113,9 @@ function hasPassingSemanticEvidence(state: JimClawState, sprintIds?: string[]): 
 }
 
 function criterionHasEvidence(state: JimClawState, criterion: { id: string; description: string }): boolean {
+  const latestEvaluationResults = getLatestEvaluationResults(state);
   const passedSprintIds = new Set(
-    (state.evaluationResults || [])
+    latestEvaluationResults
       .filter((result) => result.status === "pass")
       .map((result) => result.sprintId)
   );
@@ -117,7 +127,7 @@ function criterionHasEvidence(state: JimClawState, criterion: { id: string; desc
     return owningSprintIds.some((id) => passedSprintIds.has(id));
   }
 
-  return (state.evaluationResults || [])
+  return latestEvaluationResults
     .filter((result) => result.status === "pass")
     .some((result) => {
       const text = [
@@ -170,7 +180,8 @@ export async function releaseGateNode(
     });
   }
 
-  const failedEvaluations = (state.evaluationResults || []).filter((result) => result.status !== "pass");
+  const latestEvaluationResults = getLatestEvaluationResults(state);
+  const failedEvaluations = latestEvaluationResults.filter((result) => result.status !== "pass");
   for (const result of failedEvaluations) {
     failures.push({
       type: "runtime_mismatch",
@@ -182,7 +193,7 @@ export async function releaseGateNode(
   }
 
   const passedSprintIds = new Set(
-    (state.evaluationResults || [])
+    latestEvaluationResults
       .filter((result) => result.status === "pass")
       .map((result) => result.sprintId)
   );
@@ -307,7 +318,7 @@ ${JSON.stringify(validationReport, null, 2)}
 
 ## EvaluationResults
 \`\`\`json
-${JSON.stringify(state.evaluationResults || [], null, 2)}
+${JSON.stringify(latestEvaluationResults, null, 2)}
 \`\`\`
 `
   );
