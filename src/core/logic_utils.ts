@@ -1114,8 +1114,10 @@ export function ensureRequirementDrivenFiles(
       ensureFile("src/services/authService.ts");
       ensureFile("tests/auth.test.ts");
     } else {
-      // Architect 已规划:只确保 middleware/auth.ts 存在(auth 必需)
+      // Architect 已规划:仍需保留最小认证入口和测试，避免 authRequired 只剩中间件不可验收。
       ensureFile("src/middleware/auth.ts");
+      ensureFile("src/routes/auth.ts");
+      ensureFile("tests/auth.test.ts");
     }
   }
 
@@ -5771,7 +5773,7 @@ export function buildCoderExecutionContext(
     lines.push(`• 统一端口:${core?.port || protocol?.runtime?.listenPort}`);
   }
   lines.push(
-    `• 执行阶段:${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
+    `• 执行阶段：${state.validationCheckpointCompleted ? "阶段验证后补齐外围文件" : "首轮核心骨架"}`
   );
 
   const sprintContractContext = buildSprintContractContext(state);
@@ -5820,7 +5822,7 @@ export function buildCoderExecutionContext(
     lines.push(`• file:${fileTarget}`);
     lines.push(`• role:${fileContract?.role || "other"}`);
     if (dependencyLabels.length > 0) {
-      lines.push(`• directDependencies:${dependencyLabels.join(", ")}`);
+      lines.push(`• directDependencies：${dependencyLabels.join(", ")}`);
     }
     if (currentTask.contextRequirement) {
       lines.push(`• contextRequirement:${currentTask.contextRequirement}`);

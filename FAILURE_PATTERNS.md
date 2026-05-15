@@ -191,3 +191,14 @@
 - **预防**: `agent_pending` 必须是持久化暂停点，不应在图内部循环清空 `agentRecoveryPending`。
 - **首次发现**: 2026-05-15, managed harness focused suite
 - **标签**: `agent-pending`, `resume`, `graph`, `control-plane`
+
+---
+
+## FP-018: 小项目跳过契约校验导致 import 漂移
+
+- **症状**: 小型项目中 Coder 可以导入未导出的符号，或让 model 层依赖 controller 层，任务仍被标记为 completed。
+- **根因**: import/export 校验和 ExecutionProtocol 角色依赖校验在文件数 ≤15 时被跳过，导致最常见的 MVP 项目反而缺少契约保护。
+- **修复**: 移除小项目跳过逻辑，所有规模都执行导出契约与协议角色校验；同时 authRequired 场景保留最小 auth route/test，保证认证能力可验收。
+- **预防**: 性能优化不能关闭契约校验；如需降噪，应按明确的协议例外处理，而不是按文件数量跳过。
+- **首次发现**: 2026-05-15, `tests/core/coder-node.test.js`
+- **标签**: `coder`, `execution-protocol`, `import-contract`, `auth`, `small-project`

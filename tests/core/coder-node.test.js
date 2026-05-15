@@ -5788,6 +5788,97 @@ test("coder does not deadlock entry generation on deferred public page dependenc
   }
 });
 
+test("coder keeps files outside active sprint contract pending", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const attemptedTargets = [];
+  const events = [];
+  const state = createBaseState({
+    activeSprintId: "SP-1",
+    sprintContracts: [{
+      version: "v1",
+      sprintId: "SP-1",
+      builderPlan: {
+        intent: "只实现当前 sprint 的允许文件",
+        filesLikelyTouched: ["src/allowed.ts"],
+        implementationSteps: ["实现 allowed 文件"],
+        selfChecks: ["npm test"],
+        assumptions: [],
+      },
+      evaluatorPlan: {
+        checks: [{ id: "CHK-CMD-1", kind: "command", description: "运行测试", command: "npm test" }],
+        requiredEvidence: ["运行测试"],
+        passThreshold: "all",
+        concerns: [],
+      },
+      agreedScope: {
+        allowedFiles: ["src/allowed.ts"],
+        forbiddenFiles: ["node_modules/", "dist/", ".git/"],
+        maxNewFiles: 1,
+      },
+      status: "agreed",
+    }],
+    spec: {
+      language: "TypeScript",
+      framework: "Express",
+      filesToCreate: ["src/allowed.ts", "src/admin.ts"],
+    },
+    subTasks: [
+      {
+        id: "task-allowed",
+        description: "write allowed file",
+        fileTarget: "src/allowed.ts",
+        dependencies: [],
+        contextRequirement: "allowed",
+        status: "pending",
+      },
+      {
+        id: "task-admin",
+        description: "write admin file outside sprint",
+        fileTarget: "src/admin.ts",
+        dependencies: [],
+        contextRequirement: "admin",
+        status: "pending",
+      },
+    ],
+  });
+
+  try {
+    const result = await coderNode(
+      state,
+      {
+        coder: {
+          getPersona() {
+            return { name: "测试Coder" };
+          },
+          async chat(messages) {
+            const prompt = messages[0]?.content || "";
+            const target = prompt.match(/请实现\s+([^\n。]+)/)?.[1]?.trim() || "";
+            attemptedTargets.push(target);
+            return { content: "```typescript\nexport const allowed = true;\n```" };
+          },
+        },
+      },
+      workspace,
+      (type, sender, content, payload) => events.push({ type, sender, content, payload }),
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.deepEqual(attemptedTargets, ["src/allowed.ts"]);
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/allowed.ts").status, "completed");
+    assert.equal(result.subTasks.find((task) => task.fileTarget === "src/admin.ts").status, "pending");
+    assert.equal(result.blockedReason || "", "");
+    await assert.rejects(
+      () => fs.access(path.join(workspace, "src/admin.ts")),
+      /ENOENT/
+    );
+    assert.match(events.map((event) => event.content).join("\n"), /Sprint|src\/admin\.ts|允许范围/i);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("coder does not treat completed task-id dependencies as deadlock", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

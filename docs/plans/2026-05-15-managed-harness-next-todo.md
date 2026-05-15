@@ -532,6 +532,13 @@ git commit -m "docs: record managed harness smoke findings"
   - release gate：已参与；第 1 轮 `release_gate_completed` 阻塞，原因是“前端验收缺少 UI 证据”。
   - blocking failure：smoke 超过 40 分钟未收敛，最后快照为 `coder_task_task-07` / `retryCount=5`；过程中出现 Product 契约漂移，`src/app.ts` 访问未授权的 `stock/status` 字段，触发 `TS2339`，后续仲裁冻结字段为 `id/name/price`。
   - 手工核验：run 目录内最终代码 `npm run build` 与 `npm test` 在容器中通过，但图执行未进入最终 deploy/release/persistence；下一步优先修 release/evaluator evidence 与修复回路。
+- Task 3 执行：
+  - 新增回归：`coder keeps files outside active sprint contract pending`，验证 active SprintContract 只允许 `src/allowed.ts` 时，`src/admin.ts` 不会被尝试写入且保持 pending。
+  - 结果：新增测试首跑通过，说明 sprint scope 基础拦截已存在；无须改生产 scope 逻辑。
+  - 完整 `coder-node` 回归初跑暴露 5 个既有问题：小项目跳过 import/export 与协议角色校验、authRequired 未保留 auth route、执行 brief 冒号格式漂移。
+  - 已修复：所有规模都执行导出契约与协议角色校验；authRequired 至少保留 `src/routes/auth.ts` / `tests/auth.test.ts`；执行 brief 恢复 `执行阶段：` / `directDependencies：` 格式。
+  - 验证通过：`node --test tests/core/coder-node.test.js`
+  - 验证通过：`npx tsc --noEmit`
 
 ---
 

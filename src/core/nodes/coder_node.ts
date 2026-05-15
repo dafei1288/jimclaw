@@ -1125,8 +1125,6 @@ function validateImportContracts(
   content: string,
   filesContent: Record<string, string>
 ): string[] {
-  const totalFiles = Object.keys(filesContent).length;
-  const skipExportValidation = totalFiles <= 15;
   const errors: string[] = [];
   const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
   let match: RegExpExecArray | null;
@@ -1154,8 +1152,6 @@ function validateImportContracts(
       errors.push(`${targetBase} 不存在于项目中，无法导入`);
       continue;
     }
-
-    if (skipExportValidation) continue;
 
     const contract = extractExportContract(filesContent[targetFile]);
     const sanitized = specifier.replace(/\s+/g, " ").trim();
@@ -1192,9 +1188,6 @@ function validateProtocolDependencyRoles(
 ): string[] {
   const currentContract = getProtocolFileContract(protocol, fileTarget);
   if (!currentContract || !currentContract.allowedDependencyRoles?.length) return [];
-  // 小型项目（≤15 文件）跳过严格依赖角色校验——奥卡姆剃刀
-  const totalFiles = Object.keys(filesContent).length;
-  if (totalFiles <= 15) return [];
 
   const errors: string[] = [];
   const importPattern = /^\s*import\s+(.+?)\s+from\s+["']([^"']+)["'];?\s*$/gm;
