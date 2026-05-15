@@ -40,6 +40,15 @@ function extractGetUrls(text: string): string[] {
   return Array.from(new Set(urls));
 }
 
+function extractPathMentions(text: string): string[] {
+  const urls: string[] = [];
+  for (const match of String(text || "").matchAll(/\/[A-Za-z0-9_./?=&%-]+/g)) {
+    const url = normalizeEndpointUrl(match[0]);
+    if (url) urls.push(url);
+  }
+  return Array.from(new Set(urls));
+}
+
 function collectSprintValidationTexts(state: JimClawState, sprint: SprintPlan): string[] {
   const criteria = state.productSpec?.acceptanceCriteria || [];
   const sprintCriteria = criteria
@@ -50,9 +59,16 @@ function collectSprintValidationTexts(state: JimClawState, sprint: SprintPlan): 
 
 function textTargetsUrl(text: string, url: string): boolean {
   const extractedUrls = extractGetUrls(text);
-  if (extractedUrls.length === 0) return true;
   const normalizedUrl = normalizeEndpointUrl(url);
-  return extractedUrls.some((candidate) => normalizeEndpointUrl(candidate) === normalizedUrl);
+  if (extractedUrls.length > 0) {
+    return extractedUrls.some((candidate) => normalizeEndpointUrl(candidate) === normalizedUrl);
+  }
+  const pathMentions = extractPathMentions(text);
+  if (pathMentions.length > 0) {
+    const targetPath = endpointPathOnly(normalizedUrl);
+    return pathMentions.some((candidate) => endpointPathOnly(candidate) === targetPath);
+  }
+  return true;
 }
 
 function buildSemanticAssertionTemplates(url: string, text: string): Omit<EvaluationAssertion, "id">[] {
@@ -72,7 +88,8 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
     if (/\bid\b|编号|标识/i.test(normalizedText)) fields.add("id");
     if (/\bname\b|名称|商品名称/i.test(normalizedText)) fields.add("name");
     if (/\bstock\b|库存/i.test(normalizedText)) fields.add("stock");
-    if (/lowStock|低库存状态字段/i.test(normalizedText)) fields.add("lowStock");
+    if (/\bstatus\b|库存状态|状态文本/i.test(normalizedText)) fields.add("status");
+    if (/lowStock\s*(字段|field|布尔字段)|字段[^。；;]*lowStock/i.test(normalizedText)) fields.add("lowStock");
     for (const field of fields) {
       templates.push({ type: "jsonFieldExists", field, scope: "each" });
     }

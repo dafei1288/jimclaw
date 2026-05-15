@@ -195,6 +195,75 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonArray"), true);
     assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "stock"), true);
     assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "lt"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "lowStock"), false);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("sprint contract does not apply product semantic assertions to health checks", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await sprintContractNode(
+      createBaseState({
+        activeSprintId: "SP-2",
+        productSpec: {
+          version: "v1",
+          title: "库存看板",
+          userGoal: "查看商品库存",
+          userStories: [{ id: "US-1", story: "用户可以查看库存", priority: "must" }],
+          acceptanceCriteria: [
+            { id: "AC-1", description: "启动服务后，请求 GET /api/products 返回 200 状态码，响应体为 JSON 数组，数组元素至少包含 name、sku、stock、status 字段。", verificationKind: "api" },
+            { id: "AC-2", description: "项目包含可执行的自动化测试脚本，执行后能够验证 /api/products、/products 以及 lowStock=true 筛选行为并返回通过结果。", verificationKind: "unit" },
+          ],
+          nonGoals: [],
+        },
+        sprintPlans: [{
+          id: "SP-2",
+          title: "库存 API 闭环",
+          goal: "完成库存列表与低库存筛选",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-1", "AC-2"],
+          deliverables: ["库存 API", "低库存筛选"],
+          allowedScope: ["src/", "tests/", "public/"],
+          dependencies: ["SP-1"],
+          estimatedComplexity: "medium",
+          doneWhen: [
+            "启动服务后，请求 GET /api/products 返回 200 状态码，响应体为 JSON 数组，数组元素至少包含 name、sku、stock、status 字段。",
+            "项目包含可执行的自动化测试脚本，执行后能够验证 /api/products、/products 以及 lowStock=true 筛选行为并返回通过结果。",
+          ],
+        }],
+        apiContract: {
+          endpoints: [
+            { path: "/api/health", method: "GET", description: "健康检查" },
+            { path: "/api/products", method: "GET", description: "商品库存列表" },
+            { path: "/products", method: "GET", description: "商品库存页面" },
+          ],
+        },
+        spec: {
+          language: "TypeScript",
+          framework: "Express",
+          testCommand: "npm test",
+          filesToCreate: ["src/index.ts", "tests/products.test.ts", "public/index.html"],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const checks = result.sprintContracts[0].evaluatorPlan.checks;
+    const healthCheck = checks.find((check) => check.url === "/api/health");
+    const productsCheck = checks.find((check) => check.url === "/api/products");
+
+    assert.ok(healthCheck);
+    assert.equal(healthCheck.assertions, undefined);
+    assert.equal(productsCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "status"), true);
+    assert.equal(productsCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "lowStock"), false);
   } finally {
     await removeTempWorkspace(workspace);
   }
