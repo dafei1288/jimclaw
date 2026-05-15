@@ -63,6 +63,34 @@ test("buildExecutionProtocol emits normalized layout and file contracts", () => 
   assert.equal(protocol.runtime.healthCheckPath, "/");
 });
 
+test("buildExecutionProtocol treats Express app module as route-mounting entry", () => {
+  const requirementProtocol = buildRequirementProtocol({
+    title: "库存看板",
+    requirements: ["提供 /products 页面和 /api/products API"],
+    acceptanceCriteria: ["页面和 API 都可以访问"],
+  });
+  const protocol = buildExecutionProtocol(
+    {
+      language: "TypeScript",
+      framework: "Express.js ^4.18",
+      testCommand: "npm test",
+      runCommand: "npm start",
+      entryPoint: "src/index.ts",
+      filesToCreate: [
+        "src/index.ts",
+        "src/app.ts",
+        "src/routes/products.ts",
+      ],
+    },
+    { services: [{ name: "api", port: 4000 }] },
+    { endpoints: [{ method: "GET", path: "/api/products" }] },
+    requirementProtocol
+  );
+
+  assert.equal(protocol.contracts.files["src/app.ts"].role, "entry");
+  assert.equal(protocol.contracts.files["src/app.ts"].allowedDependencyRoles.includes("route"), true);
+});
+
 test("buildExecutionProtocol does not synthesize write endpoints for read-only book APIs", () => {
   const requirementProtocol = buildRequirementProtocol({
     title: "TypeScript Express 图书列表应用 MVP",

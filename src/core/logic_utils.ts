@@ -223,6 +223,10 @@ function inferProtocolFileRole(fileTarget: string): ProtocolFileRole {
     normalized.endsWith("/index.js") ||
     normalized === "src/index.ts" ||
     normalized === "src/index.js" ||
+    normalized === "src/app.ts" ||
+    normalized === "src/app.js" ||
+    normalized === "src/server.ts" ||
+    normalized === "src/server.js" ||
     normalized === "src/main.rs" ||
     /src\/main\/java\/.+\/(?:application|main)\.java$/.test(normalized) ||
     /src\/main\/kotlin\/.+\/(?:application|main)\.kt$/.test(normalized) ||

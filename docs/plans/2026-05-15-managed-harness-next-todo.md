@@ -557,6 +557,14 @@ git commit -m "docs: record managed harness smoke findings"
   - 已修复：`buildSystemContext()` 注入 `[修复契约]` 摘要，后续 Agent 能看到 failed check、复现步骤和允许修复文件，不再只依赖普通 issue title。
   - 验证通过：`node --test tests/core/fix-plan-node.test.js tests/core/workflow-replay.test.js tests/core/execution-protocol.test.js`
   - 验证通过：`npx tsc --noEmit`
+- Task 7 首轮 smoke：
+  - run：`run_1778811083795`
+  - route evidence：已出现 `sprint_planned`、`sprint_contract_agreed`，SP-1 可写范围被限定到 package/tsconfig/src/tests 文件。
+  - blocking failure：`src/app.ts` 被 `ExecutionProtocol` 标成 `other`，导致合法挂载 `src/routes/products.ts(route)` 被依赖角色校验拦截。
+  - 已修复：`buildExecutionProtocol` 将 Express/Node `src/app.ts`、`src/server.ts` 归类为 `entry`，允许其依赖 route/controller/service/middleware。
+  - 验证通过：`node --test tests/core/execution-protocol.test.js tests/core/coder-node.test.js`
+  - 验证通过：`node --test tests/core/managed-harness-types.test.js tests/core/sprint-planner.test.js tests/core/sprint-planner-node.test.js tests/core/sprint-contract-node.test.js tests/core/evaluator-node.test.js tests/core/release-gate-node.test.js tests/core/workflow-replay.test.js`
+  - 验证通过：`npx tsc --noEmit`
 
 ---
 
