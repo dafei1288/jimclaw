@@ -95,7 +95,37 @@ export interface EvaluationCheck {
   targetFile?: string;
   path?: string;
   exists?: boolean;
+  assertions?: EvaluationAssertion[];
 }
+
+export type EvaluationAssertionOperator = "eq" | "ne" | "lt" | "lte" | "gt" | "gte" | "includes";
+
+export interface EvaluationAssertion {
+  id: string;
+  type: "jsonArray" | "jsonFieldExists" | "jsonEvery" | "bodyContains" | "bodyNotContains";
+  field?: string;
+  scope?: "root" | "each";
+  operator?: EvaluationAssertionOperator;
+  value?: string | number | boolean | null;
+  text?: string;
+}
+
+export interface EvaluationAssertionEvidence {
+  id: string;
+  type: EvaluationAssertion["type"];
+  status: "pass" | "fail";
+  message: string;
+}
+
+export const EvaluationAssertionSchema = z.object({
+  id: z.string(),
+  type: z.enum(["jsonArray", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
+  field: z.string().optional(),
+  scope: z.enum(["root", "each"]).optional(),
+  operator: z.enum(["eq", "ne", "lt", "lte", "gt", "gte", "includes"]).optional(),
+  value: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+  text: z.string().optional(),
+});
 
 export const EvaluationCheckSchema = z.object({
   id: z.string(),
@@ -109,6 +139,7 @@ export const EvaluationCheckSchema = z.object({
   targetFile: z.string().optional(),
   path: z.string().optional(),
   exists: z.boolean().optional(),
+  assertions: z.array(EvaluationAssertionSchema).optional(),
 });
 
 export interface SprintContract {
@@ -177,6 +208,7 @@ export interface EvaluationResult {
       fileExists?: boolean;
       sizeBytes?: number;
       error?: string;
+      assertions?: EvaluationAssertionEvidence[];
     };
     reproSteps: string[];
     suspectedFiles: string[];
@@ -202,6 +234,12 @@ export const EvaluationResultSchema = z.object({
       fileExists: z.boolean().optional(),
       sizeBytes: z.number().optional(),
       error: z.string().optional(),
+      assertions: z.array(z.object({
+        id: z.string(),
+        type: z.enum(["jsonArray", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
+        status: z.enum(["pass", "fail"]),
+        message: z.string(),
+      })).optional(),
     }),
     reproSteps: z.array(z.string()),
     suspectedFiles: z.array(z.string()),

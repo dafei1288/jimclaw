@@ -7,6 +7,7 @@ const {
   ProductSpecSchema,
   SprintPlanSchema,
   SprintContractSchema,
+  EvaluationCheckSchema,
   EvaluationResultSchema,
 } = require("../../src/core/graph_types");
 
@@ -86,4 +87,46 @@ test("managed harness schemas accept the minimal sprint contract flow", () => {
   assert.equal(sprint.id, "SP-1");
   assert.equal(contract.status, "agreed");
   assert.equal(evaluation.status, "pass");
+});
+
+test("managed harness schemas accept semantic assertions and assertion evidence", () => {
+  const check = EvaluationCheckSchema.parse({
+    id: "CHK-LOW-STOCK",
+    kind: "http",
+    description: "低库存 API 只返回低库存商品",
+    url: "/api/products?lowStock=true",
+    method: "GET",
+    expectedStatus: [200],
+    assertions: [
+      { id: "A-json-array", type: "jsonArray" },
+      { id: "A-name", type: "jsonFieldExists", field: "name", scope: "each" },
+      { id: "A-stock", type: "jsonEvery", field: "stock", operator: "lt", value: 10 },
+      { id: "A-page-title", type: "bodyContains", text: "Product Inventory" },
+      { id: "A-no-normal-item", type: "bodyNotContains", text: "USB-C Hub" },
+    ],
+  });
+
+  const evaluation = EvaluationResultSchema.parse({
+    version: "v1",
+    sprintId: "SP-1",
+    status: "pass",
+    checks: [{
+      checkId: "CHK-LOW-STOCK",
+      status: "pass",
+      evidence: {
+        httpStatus: 200,
+        httpBodySnippet: "[]",
+        assertions: [
+          { id: "A-json-array", type: "jsonArray", status: "pass", message: "响应体是 JSON 数组" },
+          { id: "A-stock", type: "jsonEvery", status: "pass", message: "所有元素满足 stock lt 10" },
+        ],
+      },
+      reproSteps: ["GET /api/products?lowStock=true"],
+      suspectedFiles: [],
+    }],
+    summary: "低库存 API 已通过",
+  });
+
+  assert.equal(check.assertions.length, 5);
+  assert.equal(evaluation.checks[0].evidence.assertions[0].status, "pass");
 });
