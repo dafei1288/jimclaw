@@ -545,6 +545,12 @@ git commit -m "docs: record managed harness smoke findings"
   - missing artifact 会失败，并把 repair 方向指向 `package.json`、`tsconfig.json`、入口文件等 build 输入，而不是把缺失的 `dist/` 产物交给 Coder 手写。
   - 验证通过：`node --test tests/core/evaluator-node.test.js`
   - 验证通过：`npx tsc --noEmit`
+- Task 5 执行：
+  - 新增回归：只有 `/api/health` 有 passing evidence、业务 GET `/api/books` 未被 evaluator 访问时，release gate 必须 fail。
+  - 新增回归：`GET /products` 返回 HTML 的 HTTP evidence 可满足前端 UI 验收，不再强制必须 screenshot/trace。
+  - 已修复：release gate 会逐一检查 `apiContract.endpoints` 中所有公开 GET 是否有 passing HTTP evidence；`<!doctype>/<html>/<body>/text/html` 页面响应可作为 UI evidence。
+  - 验证通过：`node --test tests/core/release-gate-node.test.js`
+  - 验证通过：`npx tsc --noEmit`
 
 ---
 

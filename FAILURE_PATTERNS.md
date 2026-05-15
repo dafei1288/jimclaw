@@ -202,3 +202,14 @@
 - **预防**: 性能优化不能关闭契约校验；如需降噪，应按明确的协议例外处理，而不是按文件数量跳过。
 - **首次发现**: 2026-05-15, `tests/core/coder-node.test.js`
 - **标签**: `coder`, `execution-protocol`, `import-contract`, `auth`, `small-project`
+
+---
+
+## FP-019: ReleaseGate 不识别 HTML HTTP 证据
+
+- **症状**: Evaluator 已经通过 `GET /products` 并拿到 HTML 响应，但 ReleaseGate 仍报“前端验收缺少 UI 证据”；另一个风险是只有 `/api/health` 通过也可能被放行。
+- **根因**: UI evidence 只识别 screenshot/trace/playwright 关键词，没有把页面 GET 的 HTML 响应作为 UI 证据；同时 ReleaseGate 没有逐一检查 `apiContract` 中公开 GET 端点是否都有 passing HTTP evidence。
+- **修复**: 将非 `/api/*` 页面端点的 HTML 响应纳入 UI evidence；ReleaseGate 要求所有公开 GET 端点都有 evaluator passing evidence。
+- **预防**: release gate 的放行条件必须绑定具体端点 evidence，不能只看 sprint pass 或 health check。
+- **首次发现**: 2026-05-15, `run_1778807069282`
+- **标签**: `release-gate`, `evaluator`, `ui-evidence`, `health-only`, `endpoint-coverage`

@@ -23,7 +23,10 @@ function createProductSpec(criteria) {
   };
 }
 
-function createEvaluationResult(evidence = { httpStatus: 200, httpBodySnippet: "GET /api/books 返回 200" }) {
+function createEvaluationResult(
+  evidence = { httpStatus: 200, httpBodySnippet: "GET /api/books 返回 200" },
+  reproSteps = ["GET /api/books"]
+) {
   return {
     version: "v1",
     sprintId: "SP-1",
@@ -32,11 +35,19 @@ function createEvaluationResult(evidence = { httpStatus: 200, httpBodySnippet: "
       checkId: "CHK-1",
       status: "pass",
       evidence,
-      reproSteps: ["GET /api/books"],
+      reproSteps,
       suspectedFiles: [],
     }],
     summary: "SP-1 验收通过",
   };
+}
+
+function createHttpEvaluationResult(path, evidence = {}) {
+  return createEvaluationResult({
+    httpStatus: 200,
+    httpBodySnippet: "ok",
+    ...evidence,
+  }, [`GET ${path}`]);
 }
 
 test("release gate passes when all acceptance criteria have passing sprint evidence", async () => {
@@ -154,6 +165,100 @@ test("release gate fails when frontend acceptance lacks ui evidence", async () =
     assert.equal(result.isDone, false);
     assert.equal(result.validationReport.status, "fail");
     assert.match(result.lastFailureSummary, /UI 证据|前端/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("release gate fails when only health endpoint has passing evidence", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await releaseGateNode(
+      createBaseState({
+        productSpec: createProductSpec([
+          { id: "AC-API", description: "GET /api/books 返回 200", verificationKind: "api" },
+        ]),
+        apiContract: {
+          endpoints: [
+            { method: "GET", path: "/api/health" },
+            { method: "GET", path: "/api/books" },
+          ],
+        },
+        sprintPlans: [{
+          id: "SP-1",
+          title: "核心 API",
+          goal: "完成图书列表 API",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-API"],
+          deliverables: ["API"],
+          allowedScope: ["src/", "tests/"],
+          dependencies: [],
+          estimatedComplexity: "small",
+          doneWhen: ["GET /api/books 返回 200"],
+        }],
+        evaluationResults: [createEvaluationResult(
+          { httpStatus: 200, httpBodySnippet: "{\"status\":\"ok\"}" },
+          ["GET /api/health"]
+        )],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, false);
+    assert.equal(result.validationReport.status, "fail");
+    assert.match(result.lastFailureSummary, /\/api\/books|业务端点|GET/);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("release gate accepts html http evidence for frontend acceptance", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await releaseGateNode(
+      createBaseState({
+        productSpec: createProductSpec([
+          { id: "AC-UI", description: "用户可以通过页面查看图书列表", verificationKind: "ui" },
+        ]),
+        apiContract: {
+          endpoints: [
+            { method: "GET", path: "/products" },
+          ],
+        },
+        sprintPlans: [{
+          id: "SP-1",
+          title: "前端闭环",
+          goal: "完成图书页面",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-UI"],
+          deliverables: ["页面"],
+          allowedScope: ["frontend/", "public/"],
+          dependencies: [],
+          estimatedComplexity: "medium",
+          doneWhen: ["用户可以通过页面查看图书列表"],
+        }],
+        evaluationResults: [createEvaluationResult(
+          { httpStatus: 200, httpBodySnippet: "<!doctype html><html><body>图书列表</body></html>" },
+          ["GET /products"]
+        )],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    assert.equal(result.isDone, true);
+    assert.equal(result.validationReport.status, "pass");
   } finally {
     await removeTempWorkspace(workspace);
   }

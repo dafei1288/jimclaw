@@ -6,6 +6,70 @@ function evidenceText(value: unknown): string {
   return JSON.stringify(value || {});
 }
 
+function normalizeEndpointPath(value: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  let pathPart = raw;
+  try {
+    pathPart = /^https?:\/\//i.test(raw) ? new URL(raw).pathname : raw;
+  } catch {
+    pathPart = raw;
+  }
+  const withoutMethod = pathPart.replace(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i, "").trim();
+  const clean = withoutMethod.split("?")[0].replace(/\/+$/, "");
+  const normalized = clean.startsWith("/") ? clean : `/${clean}`;
+  return (normalized || "/")
+    .replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => /id$/i.test(name) ? "1" : "test")
+    .replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => /id$/i.test(name) ? "1" : "test");
+}
+
+function pathFromReproStep(step: string): string {
+  const text = String(step || "").trim();
+  if (!text) return "";
+  const parts = text.split(/\s+/);
+  const candidate = parts[parts.length - 1] || text;
+  return normalizeEndpointPath(candidate);
+}
+
+function isPassingHttpCheck(check: any): boolean {
+  const status = Number(check?.evidence?.httpStatus);
+  return check?.status === "pass" && Number.isFinite(status) && status >= 200 && status < 300;
+}
+
+function checkCoversEndpoint(check: any, endpointPath: string): boolean {
+  if (!isPassingHttpCheck(check)) return false;
+  const expected = normalizeEndpointPath(endpointPath);
+  return (check.reproSteps || []).some((step: string) => pathFromReproStep(step) === expected);
+}
+
+function hasEndpointEvidence(state: JimClawState, endpointPath: string): boolean {
+  return (state.evaluationResults || [])
+    .filter((result) => result.status === "pass")
+    .some((result) => result.checks.some((check) => checkCoversEndpoint(check, endpointPath)));
+}
+
+function getPublicGetEndpoints(state: JimClawState): string[] {
+  return Array.from(new Set(
+    (state.apiContract?.endpoints || [])
+      .filter((endpoint: any) => String(endpoint?.method || "").toUpperCase() === "GET")
+      .map((endpoint: any) => normalizeEndpointPath(String(endpoint?.path || "")))
+      .filter(Boolean)
+  ));
+}
+
+function isHtmlPageEvidence(check: any): boolean {
+  if (!isPassingHttpCheck(check)) return false;
+  const text = [
+    evidenceText(check.evidence),
+    ...(check.reproSteps || []),
+  ].join("\n");
+  const hasHtmlBody = /<!doctype|<html|<body|text\/html/i.test(text);
+  const pagePath = (check.reproSteps || [])
+    .map(pathFromReproStep)
+    .find((value: string) => value && !value.startsWith("/api/") && !/\/health$/i.test(value));
+  return Boolean(hasHtmlBody && pagePath);
+}
+
 function hasUiEvidence(state: JimClawState): boolean {
   return (state.evaluationResults || [])
     .filter((result) => result.status === "pass")
@@ -17,6 +81,7 @@ function hasUiEvidence(state: JimClawState): boolean {
       return Boolean(
         check.evidence?.screenshotPath ||
         check.evidence?.tracePath ||
+        isHtmlPageEvidence(check) ||
         /playwright|browser|浏览器|页面|点击|ui|screenshot|trace/i.test(text)
       );
     }));
@@ -127,6 +192,18 @@ export async function releaseGateNode(
       evidence: [criterion.description],
       blocking: true,
     });
+  }
+
+  for (const endpointPath of getPublicGetEndpoints(state)) {
+    if (!hasEndpointEvidence(state, endpointPath)) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `GET ${endpointPath} 缺少通过的 HTTP 验收证据`,
+        evidence: [`apiContract endpoint=${endpointPath}`, "release gate 要求所有公开 GET 端点都有 evaluator passing evidence"],
+        blocking: true,
+      });
+    }
   }
 
   const frontendCriteria = (productSpec?.acceptanceCriteria || [])
