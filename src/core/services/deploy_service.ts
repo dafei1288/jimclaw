@@ -1,11 +1,12 @@
 import * as fs from "fs/promises";
 import * as path from "path";
 import { JimClawState, SystemManifest, TechSpec } from "../graph_types";
-import { ShellExecuteSkill } from "../../skills/shell_exec";
 import { FindFreePortSkill } from "../../skills/find_free_port";
 import { GetServerIPSkill } from "../../skills/get_server_ip";
 import { execInContainer } from "../logic_utils";
 import { AuditLogger } from "../../utils/audit";
+import { host } from "../../infra";
+import { buildDockerRunCommand } from "../docker_cli";
 
 export interface DeployResult {
   containerId: string;
@@ -53,16 +54,23 @@ export class DeployService {
     let containerId = "";
     try {
       if (hasCompose) {
-        await ShellExecuteSkill.config.run({ command: `cd ${workspaceDir} && docker-compose down 2>/dev/null || true` });
-        await ShellExecuteSkill.config.run({ command: `cd ${workspaceDir} && docker-compose up -d` });
+        await host.exec(`docker-compose down`, { cwd: workspaceDir, timeout: 30000 }).catch(() => {});
+        await host.exec(`docker-compose up -d`, { cwd: workspaceDir, timeout: 60000 });
         containerId = containerName;
       } else {
-        await ShellExecuteSkill.config.run({ command: `docker rm -f ${containerName} 2>/dev/null || true` });
-        const startOut = await ShellExecuteSkill.config.run({
-          command: `docker run -d --name ${containerName} -p ${hostPort}:${targetInternalPort} -v "${workspaceDir}:/app" -w /app ${image} tail -f /dev/null`,
-          timeout: 60000,
-        });
-        containerId = startOut.replace(/Output:/g, "").trim().split('\n').pop() || "";
+        await host.exec(`docker rm -f ${containerName}`, { timeout: 10000 }).catch(() => {});
+        const startResult = await host.exec(
+          buildDockerRunCommand({
+            containerName,
+            hostPort,
+            containerPort: targetInternalPort,
+            workspace: workspaceDir,
+            language: lang,
+            image,
+          }),
+          { timeout: 60000 }
+        );
+        containerId = startResult.stdout.trim().split('\n').pop() || "";
       }
 
       // 4. 安装依赖
@@ -83,12 +91,9 @@ export class DeployService {
       let isAccessible = false;
       for (let i = 0; i < 10; i++) {
         try {
-          const curlOut = await ShellExecuteSkill.config.run({ 
-            command: `curl -s -o /dev/null -w "%{http_code}" --max-time 2 ${dynamicUrl}`,
-            timeout: 5000
-          });
-          const code = curlOut.replace(/Output:/g, "").trim();
-          if (code === "200" || code === "301" || code === "302") {
+          // 用 Node.js 原生 HTTP 替代 curl — spawn({shell:true}) 在 Windows 上用 cmd.exe 不认 /dev/null
+          const code = await host.httpStatusCode(dynamicUrl, 3000);
+          if (code === 200 || code === 301 || code === 302) {
             isAccessible = true;
             break;
           }
@@ -99,10 +104,10 @@ export class DeployService {
       if (isAccessible) {
         return { containerId, hostPort, url: dynamicUrl, status: "running" };
       } else {
-        const logs = await ShellExecuteSkill.config.run({ command: `docker logs ${containerName} --tail 100` });
-        return { 
-          containerId, hostPort, url: dynamicUrl, status: "failed", 
-          error: "Health check failed", logs: logs.replace(/Output:/g, "").trim() 
+        const logsResult = await host.exec(`docker logs ${containerName} --tail 100`, { timeout: 10000 });
+        return {
+          containerId, hostPort, url: dynamicUrl, status: "failed",
+          error: "Health check failed", logs: logsResult.stdout + logsResult.stderr
         };
       }
 

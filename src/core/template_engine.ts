@@ -164,7 +164,7 @@ if (process.env.NODE_ENV !== 'test') {
   app.use(morgan('combined'));
 }
 
-// TODO: 添加路由
+// 在此处注册路由（由 agent 在后续 subTask 中完成）
 
 if (process.env.NODE_ENV !== 'test') {
   app.listen(PORT, '0.0.0.0', () => {

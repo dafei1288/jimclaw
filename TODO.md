@@ -126,9 +126,12 @@
 > 阶段 4 后续默认按下面顺序推进，先补执行完整性和状态追踪，再做并行与前端扩展。
 
 ### P0 执行完整性与回归测试
-- [ ] 核心 graph / node 回归测试继续补齐，覆盖中断、重试、仲裁、持久化
-- [ ] 失败 run 产物标准化：最后失败节点、失败摘要、兜底纪要、关键快照
-- [ ] 关键生成结果增加编译/语法/契约三类保底校验
+- [~] 核心 graph / node 回归测试继续补齐，覆盖中断、重试、仲裁、持久化
+  - 已覆盖：中断恢复、阻塞即停、QA 误放行、deploy 失败归因、dashboard snapshot、artifact truth、token 统计、checkpoint replay、deploy 启动日志与健康检查路径
+- [x] 失败 run 产物标准化：最后失败节点、失败摘要、兜底纪要、关键快照
+- [~] 关键生成结果增加编译/语法/契约三类保底校验
+  - 已补：坏文件结构校验、契约漂移拦截、模板骨架收敛、package/start 路径校验、部署启动链日志化
+  - 待补：更多语言模板下的同类确定性骨架策略
 
 ### P1 状态追踪增强与回放基础
 - [~] 任务溯源图谱所需的状态快照索引、节点事件索引、文件变更索引
@@ -144,6 +147,20 @@
   - 已补 replay 产物一致性回归测试，能拦截 checkpoint trace drift
   - 已补 `lint_fix` 工具链失败分级：`prettier` 安装/网络失败降级为环境告警，解析错误仍阻塞
   - 已补 `coder` 依赖顺序约束：只执行依赖已完成的文件任务，避免跨文件契约漂移
+  - 已补 `coder` 阻塞即停：单文件阻塞失败后立即停止本轮生成并转 `qa`，不再继续写后续 pending 文件消耗 token
+  - 已补 `qa` 阻塞聚焦分支：`[Coder 阻塞失败]` 只围绕真实阻塞文件生成工单，不再把 untouched pending 文件扩散成缺陷
+  - 已补 Agent 模型 fallback：429 / 5xx / 网络类故障会自动切换到同 Agent 的其他 mode
+  - 已补 `fix_plan` 节点级降级：模型资源耗尽时改走规则化修复计划，避免修复链路整体中断
+  - 已补 Coding Plan 路由收敛：`coder_node`、`qa_node` 深度分析、`fix_plan` 协商统一走 `coding` mode，避免代码任务继续误走普通 `glm`
+  - 已补 token 记账：每次模型调用会落盘到 `token-usage.json`，并同步聚合到 `trace-index.json.tokenUsage`
+  - 已补部署链路收口：非 compose 路径自动 `npm run build`，compose 路径改为 `build + idle test container`，deploy 健康检查改为 `127.0.0.1 + API 契约 GET 路径`，后台启动附带 `server.pid/server.log`
+  - 已通过真实 run `workspace/run_1774415632972` 验证最小 TypeScript Express 健康检查服务可完整闭环部署
+- [~] ExecutionProtocol 协议化
+  - 已落地 `ExecutionProtocol v1` state/type
+  - 已接入 `architect -> orchestrator -> coder -> verifier`
+  - 已协议化：测试布局、文件角色、基础启动/健康检查摘要、依赖角色约束
+  - 已落地：`ProtocolPatch[]` 生成与自动应用、`trace-index.json` 协议视图、前端协议视图
+  - 待补：`qa` 全量围绕 `ProtocolFailure` 收口、更多节点继续消费协议对象
 
 ### P2 编排能力增强
 - [ ] 容器资源配额改为从 config 配置，而不是固定参数
@@ -154,3 +171,17 @@
 - [ ] 现代前端框架支持（Vue 3 / React / Svelte）
 - [ ] 前端组件级单元测试（Testing Library）
 - [ ] 前端 E2E 测试与后端集成（Playwright 跨服务）
+## 2026-03-24 Note
+
+- [x] 修复 `coder` 的瞬时工具假失败：`lint_fix` 早期失败不再在最终代码已有效、文件已成功写入时粘住整个任务状态
+- [x] 为上述场景补回归：`coder accepts valid final code after a transient pre-write lint failure`
+- [x] 修复中断写入后的半状态：新增 per-file recovery intent，并在启动/退出时自动回放到 `boulder.json` 与 `trace-index.json`
+- [x] 修复阻塞失败后的 token 浪费：`coder` 现在单文件阻塞即停，不再继续生成后续文件
+- [x] 修复 QA 误扩散：`qa` 在 `[Coder 阻塞失败]` 分支只聚焦真实阻塞文件，不再把 pending 文件全部打成缺陷
+- [x] 补 workflow replay harness：固定回放 `Verifier` 失败不得误放行、`deploy` 失败必须落证据与归因
+- [x] 补 artifact truth harness：校验 `boulder.json / trace-index.json / nodes/*.md / audit/*.md` 对同一次失败的结论一致
+- [x] 补结构化审计事件流：新增 `audit/events.jsonl`，把关键 agent 事件、状态更新、任务结束/失败收敛为可机读事实源
+- [x] 补失败 run 提炼工具：支持从 `workspace/run_xxx` 自动抽取 fixture，供 workflow replay / dashboard snapshot 复用
+- [x] 补 dashboard snapshot harness：固定 session 快照校验节点、文件、token、共识四条显示口径互不打架
+- [x] 修复模型单点故障：`BaseAgent` 增加 retryable fallback，遇到 429 / 5xx / 网络故障时自动切换候选模型
+- [x] 修复 `fix_plan` 配额单点故障：当 `coder` / `qa` 模型都不可用时，节点会输出规则化修复计划而不是直接崩溃

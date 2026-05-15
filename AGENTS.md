@@ -14,6 +14,10 @@ npx ts-node src/tui.ts "your task description"
 # Run standard CLI session
 npx ts-node src/index.ts "your task description"
 
+# Watch a run until terminal state (done / pending approval / recovery / failure)
+npx ts-node src/index.ts --watch "<workspace/run_xxx>"
+npx ts-node src/index.ts --watch-latest
+
 # Run web dashboard (served at http://localhost:3000)
 npx ts-node src/server.ts
 
@@ -256,3 +260,21 @@ const APP_PORT = state.manifest?.services?.[0]?.port || 8080;
 // ✅ 正确：从 spec 获取测试命令（在容器内执行）
 await execInContainer(state.containerId, `NODE_ENV=test ${state.spec.testCommand}`);
 ```
+
+## 经验系统
+
+### 外部 Assistant 必读
+- **`LESSONS.md`** — 操作经验教训。每次 session 开始时阅读，宣布成功前必须执行验证清单。
+- **`FAILURE_PATTERNS.md`** — 已知失败模式库。修复 bug 时同步更新。
+
+### JimClaw 内部经验
+- **`KNOWLEDGE.md`** — post_mortem 节点写入的自由文本经验（当前为空壳，待补全）
+- **`FAILURE_PATTERNS.md`** — 结构化失败模式，agent 可程序化消费（待实现 Pre-flight Checklist 注入）
+
+### 宣布 E2E 成功的强制验证清单
+1. 读 `audit/Infrastructure.md` — 搜索 `exit code`、`not found`、`Critical Error`
+2. 读 `audit/Terminal.md` — 确认测试结果无未解释的失败
+3. 对所有公开端点执行 curl（不只是 health check）
+4. 混合项目：`curl http://host:port/` 必须返回 HTML（不是 404/JSON）
+5. `docker exec` 确认 build 产物存在
+6. boulder.json 中 `testResults` 不含未解释的错误

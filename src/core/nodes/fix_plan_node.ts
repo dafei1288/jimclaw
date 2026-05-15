@@ -1,9 +1,238 @@
 import * as fs from "fs/promises";
 import * as path from "path";
-import { JimClawState, FixPlanItem } from "../graph_types";
-import { BaseAgent } from "../agent";
-import { buildSystemContext, writeMeetingNote } from "../logic_utils";
+import { JimClawState, FixPlanItem, ProtocolPatch, RepairContract } from "../graph_types";
+import { AgentResourceExhaustedError, AgentServiceUnavailableError, AgentTimeoutError, BaseAgent } from "../agent";
+import { applyProtocolPatches, buildProtocolPatchesForFixPlan, buildSystemContext, getActiveSprintContract, isFileAllowedBySprintContract, writeMeetingNote } from "../logic_utils";
 import { extractText, parseJsonFromResponse } from "../../utils/common";
+
+const FIX_PLAN_CODER_TIMEOUT_MS = 120000;
+const FIX_PLAN_QA_TIMEOUT_MS = 90000;
+
+function isRecoverableFixPlanError(error: any): boolean {
+  if (
+    error instanceof AgentTimeoutError ||
+    error instanceof AgentServiceUnavailableError ||
+    error instanceof AgentResourceExhaustedError
+  ) {
+    return true;
+  }
+  const status = error?.status || error?.response?.status;
+  if (status === 429) return true;
+  const message = (error?.message || "").toLowerCase();
+  return message.includes("429")
+    || message.includes("余额不足")
+    || message.includes("rate limit")
+    || message.includes("quota")
+    || message.includes("resource");
+}
+
+function buildDeterministicFixPlan(
+  failingFiles: string[],
+  openIssues: any[],
+  state: JimClawState,
+  coderPlan?: any
+): FixPlanItem[] {
+  const plan: FixPlanItem[] = [];
+
+  for (const item of (coderPlan?.items || [])) {
+    if (!item?.file) continue;
+    plan.push({
+      fileTarget: item.file,
+      diagnosis: item.my_understanding || "模型降级后沿用开发工程师已有诊断。",
+      proposedChange: item.proposed_change || `优先修复 ${item.file} 的当前阻塞错误，确保输出为纯代码且满足现有契约。`,
+      qaApproval: "approved",
+    });
+  }
+
+  for (const file of failingFiles) {
+    if (plan.some((p) => p.fileTarget === file)) continue;
+    const issue = openIssues.find((i: any) => i.relatedFiles?.includes(file));
+    const matchingError = (state.qaFailures?.testErrors || []).find((msg: string) => msg.includes(file));
+    plan.push({
+      fileTarget: file,
+      diagnosis: issue?.description || matchingError || `${file} 当前存在阻塞错误，需要先恢复最小正确实现。`,
+      proposedChange: `聚焦修复 ${file} 的阻塞问题，保持改动最小化，输出必须为纯代码，且不要扩散到仍处于 pending 的文件。`,
+      qaApproval: "approved",
+    });
+  }
+
+  return plan;
+}
+
+function buildSyntheticOpenIssuesFromProtocolFailures(state: JimClawState) {
+  return (state.protocolFailures || [])
+    .filter((failure) => failure?.blocking)
+    .map((failure, index) => ({
+      id: `BUG-PROTOCOL-${index + 1}`,
+      title: `${failure.file || failure.node} 协议未通过`,
+      description: failure.summary,
+      severity: "major" as const,
+      status: "open" as const,
+      relatedFiles: failure.file ? [failure.file] : [],
+      rawErrorSnippet: failure.evidence?.join(" | ") || failure.summary,
+      detectedRound: state.retryCount || 0,
+    }));
+}
+
+function buildSyntheticOpenIssuesFromEvaluationResults(state: JimClawState) {
+  return (state.evaluationResults || [])
+    .filter((result) => result.status === "fail")
+    .flatMap((result) =>
+      result.checks
+        .filter((check) => check.status !== "pass")
+        .map((check) => ({
+          id: `BUG-EVAL-${result.sprintId}-${check.checkId}`,
+          title: `${result.sprintId} ${check.checkId} 验收失败`,
+          description: [
+            result.summary,
+            `复现步骤：${(check.reproSteps || []).join("；") || "无"}`,
+            `证据：${JSON.stringify(check.evidence || {})}`,
+          ].join("\n"),
+          severity: "major" as const,
+          status: "open" as const,
+          relatedFiles: check.suspectedFiles || [],
+          rawErrorSnippet: JSON.stringify(check.evidence || {}).slice(0, 500),
+          detectedRound: state.retryCount || 0,
+        }))
+    );
+}
+
+function unique(values: string[]): string[] {
+  return Array.from(new Set(values.filter(Boolean)));
+}
+
+function normalizeFileTarget(file: string | undefined): string {
+  return String(file || "").trim().replace(/\\/g, "/");
+}
+
+function isEvidenceBackedRepairTarget(
+  file: string | undefined,
+  evidenceRepairTargets: Set<string>,
+  activeContract: ReturnType<typeof getActiveSprintContract>
+): boolean {
+  const normalized = normalizeFileTarget(file);
+  if (!normalized) return false;
+  if (!evidenceRepairTargets.has(normalized)) return false;
+  if (activeContract && !isFileAllowedBySprintContract(normalized, activeContract)) return false;
+  return true;
+}
+
+function buildRepairContractsFromEvaluation(
+  state: JimClawState,
+  fixPlan: FixPlanItem[],
+  failingFiles: string[]
+): RepairContract[] {
+  const failedResults = (state.evaluationResults || []).filter((result) =>
+    result.status === "fail" &&
+    (!state.activeSprintId || result.sprintId === state.activeSprintId)
+  );
+  if (!failedResults.length) return state.repairContracts || [];
+
+  const activeContract = getActiveSprintContract(state);
+  const nextContracts = failedResults.map((result) => {
+    const failedChecks = result.checks.filter((check) => check.status !== "pass");
+    const suspectedFiles = unique(failedChecks.flatMap((check) => check.suspectedFiles || []));
+    const rawRepairScope = unique([
+      ...failedChecks.flatMap((check) => check.suspectedFiles || []),
+      ...failingFiles,
+      ...fixPlan.map((item) => item.fileTarget),
+    ]);
+    const allowedRepairFiles = activeContract
+      ? rawRepairScope.filter((file) => isFileAllowedBySprintContract(file, activeContract))
+      : rawRepairScope;
+    const repairScope = allowedRepairFiles;
+    const instructions = fixPlan
+      .filter((item) => repairScope.includes(item.fileTarget))
+      .map((item) => `${item.fileTarget}: ${item.proposedChange}`);
+    const expectedEvidence = unique([
+      ...(activeContract?.evaluatorPlan.requiredEvidence || []),
+      ...failedChecks.flatMap((check) => check.reproSteps || []),
+    ]);
+    const reproSteps = unique(failedChecks.flatMap((check) => check.reproSteps || []));
+    const rerunChecks = failedChecks.map((check) => check.checkId);
+
+    return {
+      version: "v1" as const,
+      sprintId: result.sprintId,
+      sourceEvaluationResultId: `${result.sprintId}:${failedChecks.map((check) => check.checkId).join(",")}`,
+      failedChecks: rerunChecks,
+      reproSteps,
+      suspectedFiles,
+      allowedRepairFiles,
+      rerunChecks,
+      repairScope,
+      instructions,
+      expectedEvidence,
+      status: "open" as const,
+    };
+  });
+
+  const map = new Map((state.repairContracts || []).map((item) => [item.sprintId, item]));
+  for (const contract of nextContracts) map.set(contract.sprintId, contract);
+  return Array.from(map.values());
+}
+
+function summarizeBlock(text: string | undefined, limit = 1200): string {
+  const normalized = String(text || "").trim();
+  if (!normalized) return "（无）";
+  if (normalized.length <= limit) return normalized;
+  const head = normalized.slice(0, Math.floor(limit * 0.65));
+  const tail = normalized.slice(-Math.floor(limit * 0.25));
+  return `${head}\n...\n[已截断 ${normalized.length - head.length - tail.length} 字符]\n...\n${tail}`;
+}
+
+function summarizeIssues(openIssues: any[], limit = 6): string {
+  if (!openIssues.length) return "（无）";
+  return openIssues.slice(0, limit).map((i) =>
+    `- [${i.id}] ${i.title} (${i.severity})\n  描述：${summarizeBlock(i.description, 180)}\n  影响文件：${(i.relatedFiles || []).slice(0, 4).join(", ")}`
+  ).join("\n\n");
+}
+
+function summarizeFailingFiles(fileContents: Record<string, string>, limit = 4): string {
+  const entries = Object.entries(fileContents).slice(0, limit);
+  if (!entries.length) return "（无）";
+  return entries.map(([f, c]) =>
+    `### ${f}\n\`\`\`\n${summarizeBlock(c, 900)}\n\`\`\``
+  ).join("\n\n");
+}
+
+function summarizeCoderPlan(coderPlan: any): string {
+  const items = Array.isArray(coderPlan?.items) ? coderPlan.items.slice(0, 6) : [];
+  const compact = {
+    overall_diagnosis: summarizeBlock(coderPlan?.overall_diagnosis || "（无）", 240),
+    items: items.map((item: any) => ({
+      file: item?.file,
+      issue_id: item?.issue_id,
+      my_understanding: summarizeBlock(item?.my_understanding || "", 180),
+      proposed_change: summarizeBlock(item?.proposed_change || "", 220),
+      confidence: item?.confidence,
+    })),
+  };
+  return JSON.stringify(compact, null, 2);
+}
+
+function shouldBypassLlmCollaboration(
+  failingFiles: string[],
+  openIssues: any[],
+  state: JimClawState
+): { bypass: boolean; reason: string } {
+  if (failingFiles.length === 0) return { bypass: false, reason: "" };
+  const hasQaFailedFiles = (state.qaFailures?.failedFiles || []).length > 0;
+  if (!hasQaFailedFiles) return { bypass: false, reason: "" };
+
+  const staticIssueIdPattern = /^(BUG-COMPILE-|BUG-AUTO-|BUG-VERIFIER-|BUG-DEPLOY-|BUG-QA-FALLBACK-)/;
+  const staticIssueSignals = openIssues.filter((issue: any) =>
+    staticIssueIdPattern.test(String(issue?.id || "")) ||
+    /静态兜底|模型不可用|模型降级/.test(`${issue?.description || ""} ${issue?.title || ""}`)
+  );
+  const allStatic = openIssues.length > 0 && staticIssueSignals.length === openIssues.length;
+  if (!allStatic) return { bypass: false, reason: "" };
+
+  return {
+    bypass: true,
+    reason: "QA 侧已进入静态归因兜底，直接生成确定性 fixPlan，跳过模型协商超时风险。",
+  };
+}
 
 /**
  * FixPlan 节点：QA 与 Coder 在编写代码前进行协商
@@ -25,7 +254,12 @@ export async function fixPlanNode(
   startSpan("fix_plan");
 
   const round = state.retryCount || 0;
-  const openIssues = (state.issueTracker || []).filter(i => i.status === "open");
+  const issueOpenIssues = (state.issueTracker || []).filter(i => i.status === "open");
+  const protocolOpenIssues = buildSyntheticOpenIssuesFromProtocolFailures(state);
+  const evaluationOpenIssues = buildSyntheticOpenIssuesFromEvaluationResults(state);
+  const openIssues = protocolOpenIssues.length > 0
+    ? protocolOpenIssues
+    : (evaluationOpenIssues.length > 0 ? evaluationOpenIssues : issueOpenIssues);
   const failingFiles = Array.from(new Set([
     ...(state.qaFailures?.failedFiles || []),
     ...openIssues.flatMap(i => i.relatedFiles),
@@ -34,6 +268,19 @@ export async function fixPlanNode(
   // 若无失败工单，直接跳过
   if (openIssues.length === 0 && failingFiles.length === 0) {
     return {};
+  }
+
+  if (state.repairPlan?.repairType && state.repairPlan.repairType !== "implementation") {
+    const noteId = `note-fixplan-r${round}`;
+    const summary = `第${round}轮修复协商：跳过实现修复，转交 ${state.repairPlan.repairType}`;
+    const fullContent = `# 修复计划协商纪要 - 第${round}轮\n\n## 结论\n当前失败类型为 ${state.repairPlan.repairType}，不属于实现错误，fix_plan 不再生成代码修复计划。\n\n## RepairPlan\n\`\`\`json\n${JSON.stringify(state.repairPlan, null, 2)}\n\`\`\`\n`;
+    const meetingNote = await writeMeetingNote(WORKSPACE, noteId, "fix_plan", round, summary, fullContent);
+    const result = {
+      fixPlan: [],
+      meetingNotes: [meetingNote],
+    };
+    await saveBoulder({ ...state, ...result }, "fix_plan");
+    return result;
   }
 
   emit("phase-change", "System", "fix_planning");
@@ -49,20 +296,31 @@ export async function fixPlanNode(
   }
 
   // === Step 1：Coder 分析并提出修复计划 ===
+  const summarizedTestResults = summarizeBlock(state.testResults || "", 1800);
+  const summarizedIssues = summarizeIssues(openIssues, 6);
+  const summarizedFiles = summarizeFailingFiles(fileContents, 4);
+  const activeContract = getActiveSprintContract(state);
+  const evidenceRepairTargets = new Set(failingFiles.map(normalizeFileTarget));
+  const allowedRepairTargets = failingFiles
+    .map(normalizeFileTarget)
+    .filter((file) => isEvidenceBackedRepairTarget(file, evidenceRepairTargets, activeContract));
+
   const coderPrompt = `你是星河（全栈开发工程师）。在动手写代码之前，请先仔细分析失败原因，制定修复计划。
 
 [本轮测试失败输出]：
-${(state.testResults || "").slice(-2500)}
+${summarizedTestResults}
 
 [QA 提交的缺陷工单]：
-${openIssues.map(i =>
-  `- [${i.id}] ${i.title} (${i.severity})\n  描述：${i.description}\n  影响文件：${i.relatedFiles.join(", ")}`
-).join("\n\n")}
+${summarizedIssues}
 
 [失败文件的当前内容]：
-${Object.entries(fileContents).map(([f, c]) =>
-  `### ${f}\n\`\`\`\n${c.slice(0, 2000)}\n\`\`\``
-).join("\n\n")}
+${summarizedFiles}
+
+[本轮允许进入 fixPlan 的修复文件]：
+${allowedRepairTargets.length ? allowedRepairTargets.map((file) => `- ${file}`).join("\n") : "（无）"}
+
+⚠️ 重要约束：你**只允许读取上面列出的失败文件**。不要用 read_file 读取其他文件。你的输出必须是 JSON 格式的修复计划。
+⚠️ 修复计划里的 file 必须来自“本轮允许进入 fixPlan 的修复文件”，不要新增未被失败证据指向的重构、拆分或优化文件。
 
 请认真阅读以上内容，输出你的修复计划（JSON格式）：
 {
@@ -81,34 +339,70 @@ ${Object.entries(fileContents).map(([f, c]) =>
 注意：confidence=low 说明你自己也不确定，QA 会重点审查这些项。`;
 
   emit("thinking", agents.coder.getPersona().name, "正在分析失败原因，制定修复计划...", {});
-
-  const coderResponse = await agents.coder.chat(
-    [{ role: "user", content: coderPrompt }],
-    (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
-    { brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-  );
-
-  const coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
+  let coderPlan: any = {
     overall_diagnosis: "（解析失败）",
     items: [],
-  });
+  };
+  let degradedByFallback = false;
+  const bypassDecision = shouldBypassLlmCollaboration(failingFiles, openIssues, state);
+  if (bypassDecision.bypass) {
+    degradedByFallback = true;
+    coderPlan = {
+      overall_diagnosis: bypassDecision.reason,
+      items: [],
+    };
+    emit("thinking", "System", `fix_plan 进入静态快速通道：${bypassDecision.reason}`, {});
+  }
+
+  if (!degradedByFallback) {
+    try {
+      const coderResponse = await agents.coder.chat(
+        [{ role: "user", content: coderPrompt }],
+        (ev) => emit(ev.type, ev.sender, "制定修复计划中", ev),
+        {
+          mode: "coding",
+          brief: buildSystemContext(state),
+          workspaceDir: WORKSPACE,
+          timeoutMs: FIX_PLAN_CODER_TIMEOUT_MS,
+        }
+      );
+
+      coderPlan = parseJsonFromResponse(extractText(coderResponse.content), {
+        overall_diagnosis: "（解析失败）",
+        items: [],
+      });
+    } catch (error: any) {
+      if (!isRecoverableFixPlanError(error)) throw error;
+      degradedByFallback = true;
+      emit("thinking", "System", `fix_plan 模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
+      coderPlan = {
+        overall_diagnosis: `模型资源不足，使用规则化降级计划。原始错误：${error.message || error}`,
+        items: [],
+      };
+    }
+  }
 
   // === Step 2：QA 审查计划 ===
   const qaPrompt = `你是清扬（测试工程师）。请审查开发工程师的修复计划，判断他的理解是否正确。
 
 [原始测试失败输出]：
-${(state.testResults || "").slice(-2500)}
+${summarizedTestResults}
 
 [缺陷工单列表]：
-${openIssues.map(i => `- [${i.id}] ${i.title}: ${i.description}`).join("\n")}
+${summarizedIssues}
 
 [星河的修复计划]：
-${JSON.stringify(coderPlan, null, 2)}
+${summarizeCoderPlan(coderPlan)}
+
+[本轮允许进入 fixPlan 的修复文件]：
+${allowedRepairTargets.length ? allowedRepairTargets.map((file) => `- ${file}`).join("\n") : "（无）"}
 
 请逐项审查：
 1. 根因理解是否正确？（特别关注 confidence=low 的项）
 2. 提出的具体修改是否能解决问题？
 3. 是否有遗漏的修复点（测试还会继续失败的地方）？
+
+⚠️ additional_fixes 只能包含“本轮允许进入 fixPlan 的修复文件”。不要把没有失败证据的拆分、重构或优化文件加入 additional_fixes。
 
 输出审查结果（JSON格式）：
 {
@@ -129,65 +423,156 @@ ${JSON.stringify(coderPlan, null, 2)}
   ]
 }`;
 
-  emit("thinking", agents.qa.getPersona().name, "正在审查修复计划...", {});
-
-  const qaResponse = await agents.qa.chat(
-    [{ role: "user", content: qaPrompt }],
-    (ev) => emit(ev.type, ev.sender, "审查修复计划中", ev),
-    { brief: buildSystemContext(state), workspaceDir: WORKSPACE }
-  );
-
-  const qaReview = parseJsonFromResponse(extractText(qaResponse.content), {
-    overall_assessment: "（解析失败）",
+  let qaReview: any = {
+    overall_assessment: degradedByFallback ? "模型资源不足，已转规则化修复计划。" : "（解析失败）",
     items: [],
     additional_fixes: [],
-  });
+  };
+
+  if (!degradedByFallback) {
+    emit("thinking", agents.qa.getPersona().name, "正在审查修复计划...", {});
+    try {
+      const qaResponse = await agents.qa.chat(
+        [{ role: "user", content: qaPrompt }],
+        (ev) => emit(ev.type, ev.sender, "审查修复计划中", ev),
+        {
+          mode: "coding",
+          brief: buildSystemContext(state),
+          workspaceDir: WORKSPACE,
+          timeoutMs: FIX_PLAN_QA_TIMEOUT_MS,
+        }
+      );
+
+      qaReview = parseJsonFromResponse(extractText(qaResponse.content), {
+        overall_assessment: "（解析失败）",
+        items: [],
+        additional_fixes: [],
+      });
+    } catch (error: any) {
+      if (!isRecoverableFixPlanError(error)) throw error;
+      degradedByFallback = true;
+      emit("thinking", "System", `fix_plan QA 审查模型资源不可用，切换为规则化修复计划：${error.message || error}`, {});
+      qaReview = {
+        overall_assessment: `QA 模型资源不足，自动批准规则化修复计划。原始错误：${error.message || error}`,
+        items: [],
+        additional_fixes: [],
+      };
+    }
+  }
 
   // === Step 3：合并为批准后的修复计划 ===
-  const fixPlan: FixPlanItem[] = [];
+  const fixPlan: FixPlanItem[] = degradedByFallback
+    ? buildDeterministicFixPlan(failingFiles, openIssues, state, coderPlan)
+    : [];
+  const ignoredFixTargets: Array<{ file: string; reason: string }> = [];
+  let protocolPatches: ProtocolPatch[] = buildProtocolPatchesForFixPlan(
+    failingFiles,
+    state.executionProtocol,
+    state.apiContract
+  );
 
-  for (const item of (coderPlan.items || [])) {
-    const review = (qaReview.items || []).find((r: any) => r.file === item.file);
-    if (review && review.approved === false) {
-      fixPlan.push({
-        fileTarget: item.file,
-        diagnosis: review.feedback || item.my_understanding,
-        proposedChange: review.feedback || item.proposed_change,
-        qaApproval: "corrected",
-        qaFeedback: review.feedback,
-      });
-    } else {
-      fixPlan.push({
-        fileTarget: item.file,
-        diagnosis: item.my_understanding,
-        proposedChange: item.proposed_change,
-        qaApproval: "approved",
-      });
+  if (!degradedByFallback) {
+    for (const item of (coderPlan.items || [])) {
+      const targetFile = normalizeFileTarget(item.file);
+      if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+        ignoredFixTargets.push({
+          file: targetFile || String(item.file || ""),
+          reason: "Coder 修复项不在本轮失败证据文件集合或 Sprint 允许范围内。",
+        });
+        continue;
+      }
+      const review = (qaReview.items || []).find((r: any) => r.file === item.file);
+      if (review && review.approved === false) {
+        fixPlan.push({
+          fileTarget: targetFile,
+          diagnosis: review.feedback || item.my_understanding,
+          proposedChange: review.feedback || item.proposed_change,
+          qaApproval: "corrected",
+          qaFeedback: review.feedback,
+        });
+      } else {
+        fixPlan.push({
+          fileTarget: targetFile,
+          diagnosis: item.my_understanding,
+          proposedChange: item.proposed_change,
+          qaApproval: "approved",
+        });
+      }
     }
+
+    // 把 QA 发现的遗漏文件也加入计划
+    for (const extra of (qaReview.additional_fixes || [])) {
+      const targetFile = normalizeFileTarget(extra.file);
+      if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+        ignoredFixTargets.push({
+          file: targetFile || String(extra.file || ""),
+          reason: "QA additional_fixes 不在本轮失败证据文件集合或 Sprint 允许范围内。",
+        });
+        continue;
+      }
+      if (!fixPlan.some(p => p.fileTarget === targetFile)) {
+        fixPlan.push({
+          fileTarget: targetFile,
+          diagnosis: extra.diagnosis,
+          proposedChange: extra.proposed_change,
+          qaApproval: "approved",
+        });
+      }
+    }
+
+    protocolPatches = buildProtocolPatchesForFixPlan(
+      Array.from(new Set(fixPlan.map((item) => item.fileTarget))),
+      state.executionProtocol,
+      state.apiContract
+    );
   }
 
-  // 把 QA 发现的遗漏文件也加入计划
-  for (const extra of (qaReview.additional_fixes || [])) {
-    if (!fixPlan.some(p => p.fileTarget === extra.file)) {
-      fixPlan.push({
-        fileTarget: extra.file,
-        diagnosis: extra.diagnosis,
-        proposedChange: extra.proposed_change,
-        qaApproval: "approved",
+  for (const file of failingFiles) {
+    const targetFile = normalizeFileTarget(file);
+    if (!isEvidenceBackedRepairTarget(targetFile, evidenceRepairTargets, activeContract)) {
+      ignoredFixTargets.push({
+        file: targetFile,
+        reason: "失败文件不在 Sprint 允许范围内，未写入 fixPlan。",
       });
+      continue;
     }
+    if (fixPlan.some((item) => item.fileTarget === targetFile)) continue;
+    const issue = openIssues.find((item: any) => item.relatedFiles?.includes(file));
+    const matchingError = (state.qaFailures?.testErrors || []).find((msg: string) => msg.includes(file));
+    fixPlan.push({
+      fileTarget: targetFile,
+      diagnosis: issue?.description || matchingError || `${file} 已被 QA 标记为需重开修复，但协商输出遗漏了该文件。`,
+      proposedChange: issue?.description
+        ? `围绕以下问题做最小修复：${issue.description}`
+        : `优先修复 ${file} 当前暴露的问题，保持改动最小且不要扩散到无关文件。`,
+      qaApproval: "approved",
+      qaFeedback: "该文件已进入 QA 重开集合，不能因协商遗漏而跳过。",
+    });
   }
+
+  protocolPatches = buildProtocolPatchesForFixPlan(
+    Array.from(new Set(fixPlan.map((item) => item.fileTarget))),
+    state.executionProtocol,
+    state.apiContract
+  );
 
   // === 写入会议纪要 ===
   const approvedCount = fixPlan.filter(p => p.qaApproval === "approved").length;
   const correctedCount = fixPlan.filter(p => p.qaApproval === "corrected").length;
   const noteId = `note-fixplan-r${round}`;
-  const summary = `第${round}轮修复协商：${fixPlan.length}项，批准${approvedCount}项，纠正${correctedCount}项`;
+  const summary = degradedByFallback
+    ? `第${round}轮修复协商：模型降级，生成${fixPlan.length}项规则化修复计划`
+    : `第${round}轮修复协商：${fixPlan.length}项，批准${approvedCount}项，纠正${correctedCount}项`;
   const fullContent = [
     `# 修复计划协商纪要 - 第${round}轮\n`,
     `## 星河的整体诊断\n${coderPlan.overall_diagnosis}\n`,
     `## QA 的整体评估\n${qaReview.overall_assessment}\n`,
+    degradedByFallback ? `## 降级说明\n本轮因模型资源不足，改用规则化修复计划，避免修复链路整体中断。\n` : "",
     `## 批准后的修复计划\n\`\`\`json\n${JSON.stringify(fixPlan, null, 2)}\n\`\`\`\n`,
+    ignoredFixTargets.length > 0
+      ? `## 已忽略的无证据修复目标\n\`\`\`json\n${JSON.stringify(ignoredFixTargets, null, 2)}\n\`\`\`\n`
+      : "",
+    `## 协议补丁\n\`\`\`json\n${JSON.stringify(protocolPatches, null, 2)}\n\`\`\`\n`,
     correctedCount > 0
       ? `## QA 纠正的项目（${correctedCount}项）\n${fixPlan.filter(p => p.qaApproval === "corrected").map(p => `- **${p.fileTarget}**: ${p.qaFeedback}`).join("\n")}\n`
       : "",
@@ -202,11 +587,16 @@ ${JSON.stringify(coderPlan, null, 2)}
     }
     return t;
   });
+  const nextExecutionProtocol = applyProtocolPatches(state.executionProtocol, protocolPatches);
+  const repairContracts = buildRepairContractsFromEvaluation(state, fixPlan, failingFiles);
 
-  await saveBoulder({ ...state, fixPlan, subTasks: updatedSubTasks }, "fix_plan");
+  await saveBoulder({ ...state, fixPlan, repairContracts, protocolPatches, executionProtocol: nextExecutionProtocol, subTasks: updatedSubTasks }, "fix_plan");
 
   return {
     fixPlan,
+    repairContracts,
+    protocolPatches,
+    executionProtocol: nextExecutionProtocol,
     subTasks: updatedSubTasks,
     meetingNotes: [meetingNote],
   };

@@ -15,6 +15,9 @@ export function classifyPrettierFailure(message: string): "blocking" | "warning"
   ) {
     return "warning";
   }
+  if (/No files matching the pattern were found/i.test(text)) {
+    return "warning";
+  }
   return "blocking";
 }
 
@@ -69,10 +72,17 @@ export const LintFixSkill = new Skill({
           return `文件 ${file_path} (JS/TS) 已完成格式化和规范修复。`;
         }
 
-        case ".py":
+        case ".py": {
+          // ruff 可能未安装，静默跳过
+          try {
+            await execPromise(`ruff --version`);
+          } catch {
+            return `文件 ${file_path} (Python) 跳过 lint：ruff 未安装（非阻塞）`;
+          }
           await execPromise(`ruff format "${fullPath}"`);
           await execPromise(`ruff check --fix "${fullPath}"`);
           return `文件 ${file_path} (Python) 已使用 ruff 完成格式化和规范修复。`;
+        }
 
         case ".go":
           await execPromise(`gofmt -w "${fullPath}"`);

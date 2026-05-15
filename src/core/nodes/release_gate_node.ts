@@ -1,0 +1,360 @@
+import { EvaluationResult, Issue, JimClawState, ProtocolFailure } from "../graph_types";
+import { buildRepairPlan, buildValidationReport, writeMeetingNote } from "../logic_utils";
+import { appendSessionEvent } from "../../utils/session_events";
+
+function evidenceText(value: unknown): string {
+  return JSON.stringify(value || {});
+}
+
+function getLatestEvaluationResults(state: JimClawState): EvaluationResult[] {
+  const latestBySprint = new Map<string, EvaluationResult>();
+  for (const result of state.evaluationResults || []) {
+    if (!result?.sprintId) continue;
+    latestBySprint.set(result.sprintId, result);
+  }
+  return Array.from(latestBySprint.values());
+}
+
+function normalizeEndpointPath(value: string): string {
+  const raw = String(value || "").trim();
+  if (!raw) return "";
+  let pathPart = raw;
+  try {
+    pathPart = /^https?:\/\//i.test(raw) ? new URL(raw).pathname : raw;
+  } catch {
+    pathPart = raw;
+  }
+  const withoutMethod = pathPart.replace(/^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS)\s+/i, "").trim();
+  const clean = withoutMethod.split("?")[0].replace(/\/+$/, "");
+  const normalized = clean.startsWith("/") ? clean : `/${clean}`;
+  return (normalized || "/")
+    .replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (_match, name) => /id$/i.test(name) ? "1" : "test")
+    .replace(/\{([A-Za-z_][A-Za-z0-9_]*)\}/g, (_match, name) => /id$/i.test(name) ? "1" : "test");
+}
+
+function pathFromReproStep(step: string): string {
+  const text = String(step || "").trim();
+  if (!text) return "";
+  const parts = text.split(/\s+/);
+  const candidate = parts[parts.length - 1] || text;
+  return normalizeEndpointPath(candidate);
+}
+
+function isPassingHttpCheck(check: any): boolean {
+  const status = Number(check?.evidence?.httpStatus);
+  return check?.status === "pass" && Number.isFinite(status) && status >= 200 && status < 300;
+}
+
+function checkCoversEndpoint(check: any, endpointPath: string): boolean {
+  if (!isPassingHttpCheck(check)) return false;
+  const expected = normalizeEndpointPath(endpointPath);
+  return (check.reproSteps || []).some((step: string) => pathFromReproStep(step) === expected);
+}
+
+function hasEndpointEvidence(state: JimClawState, endpointPath: string): boolean {
+  return getLatestEvaluationResults(state)
+    .filter((result) => result.status === "pass")
+    .some((result) => result.checks.some((check) => checkCoversEndpoint(check, endpointPath)));
+}
+
+function getPublicGetEndpoints(state: JimClawState): string[] {
+  return Array.from(new Set(
+    (state.apiContract?.endpoints || [])
+      .filter((endpoint: any) => String(endpoint?.method || "").toUpperCase() === "GET")
+      .map((endpoint: any) => normalizeEndpointPath(String(endpoint?.path || "")))
+      .filter(Boolean)
+  ));
+}
+
+function isHtmlPageEvidence(check: any): boolean {
+  if (!isPassingHttpCheck(check)) return false;
+  const text = [
+    evidenceText(check.evidence),
+    ...(check.reproSteps || []),
+  ].join("\n");
+  const hasHtmlBody = /<!doctype|<html|<body|text\/html/i.test(text);
+  const pagePath = (check.reproSteps || [])
+    .map(pathFromReproStep)
+    .find((value: string) => value && !value.startsWith("/api/") && !/\/health$/i.test(value));
+  return Boolean(hasHtmlBody && pagePath);
+}
+
+function hasUiEvidence(state: JimClawState): boolean {
+  return getLatestEvaluationResults(state)
+    .filter((result) => result.status === "pass")
+    .some((result) => result.checks.some((check) => {
+      const text = [
+        evidenceText(check.evidence),
+        ...(check.reproSteps || []),
+      ].join("\n");
+      return Boolean(
+        check.evidence?.screenshotPath ||
+        check.evidence?.tracePath ||
+        isHtmlPageEvidence(check) ||
+        /playwright|browser|浏览器|页面|点击|ui|screenshot|trace/i.test(text)
+      );
+    }));
+}
+
+function requiresSemanticEvidence(text: string): boolean {
+  return /筛选|仅包含|字段|包含|不包含|lowStock|isLowStock/i.test(String(text || ""));
+}
+
+function hasPassingSemanticEvidence(state: JimClawState, sprintIds?: string[]): boolean {
+  const allowedSprintIds = sprintIds?.length ? new Set(sprintIds) : null;
+  return getLatestEvaluationResults(state)
+    .filter((result) => result.status === "pass")
+    .filter((result) => !allowedSprintIds || allowedSprintIds.has(result.sprintId))
+    .some((result) => result.checks.some((check) => {
+      if (check.status !== "pass") return false;
+      const assertions = check.evidence?.assertions || [];
+      return assertions.some((assertion) => assertion.status === "pass");
+    }));
+}
+
+function criterionHasEvidence(state: JimClawState, criterion: { id: string; description: string }): boolean {
+  const latestEvaluationResults = getLatestEvaluationResults(state);
+  const passedSprintIds = new Set(
+    latestEvaluationResults
+      .filter((result) => result.status === "pass")
+      .map((result) => result.sprintId)
+  );
+  const owningSprintIds = (state.sprintPlans || [])
+    .filter((plan) => (plan.acceptanceCriteriaIds || []).includes(criterion.id))
+    .map((plan) => plan.id);
+
+  if (owningSprintIds.length > 0) {
+    return owningSprintIds.some((id) => passedSprintIds.has(id));
+  }
+
+  return latestEvaluationResults
+    .filter((result) => result.status === "pass")
+    .some((result) => {
+      const text = [
+        result.summary,
+        ...result.checks.flatMap((check) => [
+          check.checkId,
+          evidenceText(check.evidence),
+          ...(check.reproSteps || []),
+        ]),
+      ].join("\n");
+      return text.includes(criterion.description);
+    });
+}
+
+function buildReleaseGateIssues(state: JimClawState, failures: ProtocolFailure[]): Issue[] {
+  const round = state.retryCount || 0;
+  return failures.map((failure, index) => ({
+    id: `RELEASE-GATE-${index + 1}`,
+    title: failure.summary,
+    description: failure.evidence.join("\n") || failure.summary,
+    severity: "major" as const,
+    status: "open" as const,
+    relatedFiles: failure.file ? [failure.file] : [],
+    rawErrorSnippet: failure.evidence.join(" | ").slice(0, 500),
+    detectedRound: round,
+  }));
+}
+
+export async function releaseGateNode(
+  state: JimClawState,
+  agents: any,
+  WORKSPACE: string,
+  emit: any,
+  startSpan: any,
+  saveBoulder: any
+) {
+  startSpan("release_gate");
+  emit("phase-change", "System", "release_gate");
+  const round = state.retryCount || 0;
+  const productSpec = state.productSpec;
+  const failures: ProtocolFailure[] = [];
+
+  if (!productSpec) {
+    failures.push({
+      type: "test_discovery_gap",
+      node: "release_gate",
+      summary: "缺少 ProductSpec，无法确认验收覆盖",
+      evidence: ["state.productSpec 为空"],
+      blocking: true,
+    });
+  }
+
+  const latestEvaluationResults = getLatestEvaluationResults(state);
+  const failedEvaluations = latestEvaluationResults.filter((result) => result.status !== "pass");
+  for (const result of failedEvaluations) {
+    failures.push({
+      type: "runtime_mismatch",
+      node: "release_gate",
+      summary: `${result.sprintId} 仍有 evaluator 验收失败`,
+      evidence: [result.summary, evidenceText(result.checks)],
+      blocking: true,
+    });
+  }
+
+  const passedSprintIds = new Set(
+    latestEvaluationResults
+      .filter((result) => result.status === "pass")
+      .map((result) => result.sprintId)
+  );
+  for (const plan of state.sprintPlans || []) {
+    if (!passedSprintIds.has(plan.id)) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `${plan.id} 缺少通过的 evaluator 验收结果`,
+        evidence: [`sprint=${plan.id}`, `goal=${plan.goal}`],
+        blocking: true,
+      });
+    }
+  }
+
+  const uncoveredCriteria = (productSpec?.acceptanceCriteria || [])
+    .filter((criterion) => !criterionHasEvidence(state, criterion));
+  for (const criterion of uncoveredCriteria) {
+    failures.push({
+      type: "test_discovery_gap",
+      node: "release_gate",
+      summary: `${criterion.id} 缺少验收证据`,
+      evidence: [criterion.description],
+      blocking: true,
+    });
+  }
+
+  for (const criterion of productSpec?.acceptanceCriteria || []) {
+    if (!requiresSemanticEvidence(criterion.description)) continue;
+    const owningSprintIds = (state.sprintPlans || [])
+      .filter((plan) => (plan.acceptanceCriteriaIds || []).includes(criterion.id))
+      .map((plan) => plan.id);
+    if (!hasPassingSemanticEvidence(state, owningSprintIds)) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `${criterion.id} 缺少 semantic assertion 语义证据`,
+        evidence: [
+          criterion.description,
+          "ReleaseGate 要求包含筛选、字段、包含/不包含等语义验收时，必须有 evaluator 产生的 passing assertion evidence",
+        ],
+        blocking: true,
+      });
+    }
+  }
+
+  for (const plan of state.sprintPlans || []) {
+    const semanticDoneWhen = (plan.doneWhen || []).filter(requiresSemanticEvidence);
+    if (semanticDoneWhen.length > 0 && !hasPassingSemanticEvidence(state, [plan.id])) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `${plan.id} 缺少 semantic assertion 语义证据`,
+        evidence: [
+          ...semanticDoneWhen,
+          "Sprint doneWhen 包含语义验收，必须由 evaluator assertion evidence 覆盖",
+        ],
+        blocking: true,
+      });
+    }
+  }
+
+  for (const endpointPath of getPublicGetEndpoints(state)) {
+    if (!hasEndpointEvidence(state, endpointPath)) {
+      failures.push({
+        type: "test_discovery_gap",
+        node: "release_gate",
+        summary: `GET ${endpointPath} 缺少通过的 HTTP 验收证据`,
+        evidence: [`apiContract endpoint=${endpointPath}`, "release gate 要求所有公开 GET 端点都有 evaluator passing evidence"],
+        blocking: true,
+      });
+    }
+  }
+
+  const frontendCriteria = (productSpec?.acceptanceCriteria || [])
+    .filter((criterion) => criterion.verificationKind === "ui");
+  if (frontendCriteria.length > 0 && !hasUiEvidence(state)) {
+    failures.push({
+      type: "test_discovery_gap",
+      node: "release_gate",
+      summary: "前端验收缺少 UI 证据",
+      evidence: frontendCriteria.map((criterion) => `${criterion.id}: ${criterion.description}`),
+      blocking: true,
+    });
+  }
+
+  const blocking = failures.length > 0;
+  const failureType = failures.some((failure) => failure.type === "runtime_mismatch")
+    ? "runtime_gap"
+    : "planning_gap";
+  const validationReport = blocking
+    ? buildValidationReport(
+        failures.map((failure) => ({
+          summary: failure.summary,
+          file: failure.file,
+          evidence: failure.evidence,
+        })),
+        { failureType, status: "fail", blocking: true }
+      )
+    : buildValidationReport([], { status: "pass", blocking: false });
+  const issues = blocking ? buildReleaseGateIssues(state, failures) : [];
+  const issueIds = new Set(issues.map((issue) => issue.id));
+  const issueTracker = [
+    ...(state.issueTracker || []).filter((issue) => !issueIds.has(issue.id)),
+    ...issues,
+  ];
+  const summary = blocking
+    ? `ReleaseGate 第${round}轮：阻塞，${failures.length} 项证据缺口`
+    : `ReleaseGate 第${round}轮：放行`;
+  const note = await writeMeetingNote(
+    WORKSPACE,
+    `note-release-gate-r${round}`,
+    "release_gate",
+    round,
+    summary,
+    `# Release Gate 第${round}轮
+
+## ValidationReport
+\`\`\`json
+${JSON.stringify(validationReport, null, 2)}
+\`\`\`
+
+## EvaluationResults
+\`\`\`json
+${JSON.stringify(latestEvaluationResults, null, 2)}
+\`\`\`
+`
+  );
+
+  emit("thinking", "System", `[ReleaseGate] ${summary}`, {});
+  await appendSessionEvent(WORKSPACE, {
+    type: "release_gate_completed",
+    node: "release_gate",
+    summary,
+    payload: { passed: !blocking, failures },
+  });
+
+  const result = {
+    isDone: !blocking,
+    validationReport,
+    repairPlan: blocking ? buildRepairPlan(validationReport) : null,
+    protocolFailures: blocking ? failures : [],
+    issueTracker,
+    qaFailures: blocking
+      ? {
+          failedFiles: failures.map((failure) => failure.file).filter(Boolean) as string[],
+          testErrors: failures.map((failure) => failure.summary),
+          failedTestNames: [],
+        }
+      : null,
+    consensusProgress: {
+      ...(state.consensusProgress || { completedFiles: [], pendingFiles: [], currentRound: round, openIssues: [] }),
+      currentRound: round,
+      openIssues: blocking ? failures.map((failure) => failure.summary) : [],
+    },
+    meetingNotes: [note],
+    testResults: blocking ? `[ReleaseGate 阻塞]\n${failures.map((failure) => failure.summary).join("\n")}` : state.testResults,
+    lastFailedNode: blocking ? "release_gate" : "",
+    lastFailureSummary: blocking ? failures.map((failure) => failure.summary).join("；") : "",
+    blockedReason: blocking ? "ReleaseGate 证据不足，禁止发布" : "",
+  };
+  await saveBoulder({ ...state, ...result }, "release_gate");
+  return result;
+}

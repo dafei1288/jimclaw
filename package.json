@@ -4,8 +4,10 @@
   "description": "JimClaw 是一个借鉴了 Claude Code, OpenClaw 和 OpenCode 设计理念的智能体系统。它旨在通过拟人化的角色设定、执着的循环迭代（Sisyphus 协议）以及基于复盘的自我进化，实现高度自主的代码开发与维护。",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "node --test tests/core/pure-functions.test.js",
     "test:core": "node --experimental-test-isolation=none --test tests/core/*.test.js",
+    "executor:sidecar": "powershell.exe -ExecutionPolicy Bypass -File scripts/executor-sidecar.ps1",
+    "executor:sidecar:node": "npx ts-node src/executor/sidecar.ts",
     "clean:workspace": "node -e \"const fs=require('fs');const dirs=fs.readdirSync('./workspace').filter(d=>d.startsWith('run_')).sort();dirs.slice(0,-10).forEach(d=>fs.rmSync('./workspace/'+d,{recursive:true,force:true}));console.log('保留最新10个run，已清理'+Math.max(0,dirs.length-10)+'个')\"",
     "clean:all": "node -e \"const fs=require('fs');const path=require('path');const dirs=fs.readdirSync('./workspace').filter(d=>d.startsWith('run_'));dirs.forEach(d=>fs.rmSync(path.join('./workspace',d),{recursive:true,force:true}));console.log('已清理'+dirs.length+'个run目录')\""
   },
@@ -30,6 +32,7 @@
     "playwright": "^1.58.2",
     "react": "^19.2.4",
     "socket.io": "^4.8.3",
+    "token-costs": "^3.5.0",
     "zod": "^4.3.6"
   },
   "devDependencies": {

@@ -1,11 +1,126 @@
 import * as fs from "fs/promises";
 import * as path from "path";
+import * as ts from "typescript";
 import { JimClawState } from "../graph_types";
-import { findContractRouteDrift } from "../logic_utils";
+import {
+  buildRepairPlan,
+  buildValidationReport,
+  findContractRouteDrift,
+  getProtocolBusinessTestFiles,
+  getProtocolTestRoots,
+  getProtocolFileContract,
+  isNodeJestProject,
+  normalizeNodeJestTestFilePath,
+  writeMeetingNote
+} from "../logic_utils";
+
+type VerifierFailureType = "planning_gap" | "implementation_bug" | "environment_gap" | "runtime_gap";
+
+function formatTsDiagnostics(fileTarget: string, content: string, diagnostics: readonly ts.Diagnostic[]): string {
+  return diagnostics
+    .map((diag) => {
+      const message = ts.flattenDiagnosticMessageText(diag.messageText, "\n");
+      if (typeof diag.start !== "number") {
+        return `语法错误: ${message}`;
+      }
+      const sourceFile = ts.createSourceFile(fileTarget, content, ts.ScriptTarget.ES2020, true);
+      const position = sourceFile.getLineAndCharacterOfPosition(diag.start);
+      return `语法错误(${fileTarget}:L${position.line + 1}:C${position.character + 1}): ${message}`;
+    })
+    .join("; ");
+}
+
+function getSyntaxValidationError(fileTarget: string, content: string): string | null {
+  if (!/\.(ts|tsx|js|jsx)$/i.test(fileTarget)) return null;
+  let diagnostics: any[] = [];
+  try {
+    diagnostics = ts.transpileModule(content, {
+      fileName: fileTarget,
+      reportDiagnostics: true,
+      compilerOptions: {
+        target: ts.ScriptTarget.ES2020,
+        module: ts.ModuleKind.CommonJS,
+      },
+    }).diagnostics || [];
+  } catch (transpileError: any) {
+    // TypeScript 5.9.3 transpileModule 内部断言错误，跳过诊断
+    console.warn(`[Verifier] transpileModule 警告 (${fileTarget}): ${transpileError.message?.slice(0, 100)}`);
+    return null;
+  }
+  if (diagnostics.length === 0) return null;
+  return formatTsDiagnostics(fileTarget, content, diagnostics);
+}
+
+function extractIssueFile(issue: string): string | undefined {
+  const explicitFileMatch = issue.match(/(?:文件|服务文件|测试文件|入口文件)\s+([^\s:，,]+)/);
+  if (explicitFileMatch?.[1]) {
+    return explicitFileMatch[1].replace(/\\/g, "/");
+  }
+  const pathMatch = issue.match(/([A-Za-z0-9_./\\-]+\.(?:ts|tsx|js|jsx|json|cjs|mjs|html|py|go|ya?ml)|Dockerfile)/);
+  return pathMatch?.[1] ? pathMatch[1].replace(/\\/g, "/") : undefined;
+}
+
+function classifyVerifierIssue(issue: string): {
+  failureType: VerifierFailureType;
+  protocolType: "layout_mismatch" | "contract_drift" | "runtime_mismatch" | "test_discovery_gap" | "tooling_unavailable";
+} {
+  if (/阶段验证拒绝|降级骨架/i.test(issue)) {
+    return { failureType: "implementation_bug", protocolType: "contract_drift" };
+  }
+  if (
+    /缺少 package\.json|缺少 jest\.config\.cjs|运行时框架 .*devDependencies|jest: not found|npm ERR|node_modules|module not found/i.test(issue)
+  ) {
+    return { failureType: "environment_gap", protocolType: "tooling_unavailable" };
+  }
+  if (/未找到监听声明|入口挂载缺失|健康检查/i.test(issue)) {
+    return { failureType: "runtime_gap", protocolType: "runtime_mismatch" };
+  }
+  if (/契约漂移|语法错误/i.test(issue)) {
+    return { failureType: "implementation_bug", protocolType: "contract_drift" };
+  }
+  if (/Jest roots|Jest testMatch|测试文件 .*覆盖范围/.test(issue)) {
+    return { failureType: "planning_gap", protocolType: "test_discovery_gap" };
+  }
+  return { failureType: "planning_gap", protocolType: "layout_mismatch" };
+}
+
+function isInfrastructureFailureOutput(text: string): boolean {
+  return /(基础设施|docker-compose|docker run|spawn EPERM|spawn ENOENT|EACCES|OCI runtime|容器未成功启动|容器 ID 为空)/i.test(String(text || ""));
+}
+
+function isPlanningFallbackActive(state: JimClawState): boolean {
+  return (
+    state.designSource === "deterministic-fallback" ||
+    state.orchestrationSource === "deterministic-fallback"
+  );
+}
+
+function isCompactAuthFallbackRuntimeScaffoldFile(state: JimClawState, fileTarget: string): boolean {
+  if (!isPlanningFallbackActive(state)) return false;
+  if (state.spec?.authScaffoldMode !== "compact") return false;
+  const normalized = normalizeNodeJestTestFilePath(fileTarget).toLowerCase();
+  return normalized === "src/services/authservice.ts";
+}
+
+function isCoreBusinessFile(state: JimClawState, fileTarget: string): boolean {
+  const role = getProtocolFileContract(state.executionProtocol, fileTarget)?.role || "other";
+  return ["entry", "route", "controller", "service", "repository", "model", "middleware"].includes(role);
+}
+
+function getLatestGenerationSource(state: JimClawState, fileTarget: string): string | undefined {
+  const normalized = normalizeNodeJestTestFilePath(fileTarget);
+  for (let index = (state.codeLog || []).length - 1; index >= 0; index -= 1) {
+    const entry = state.codeLog?.[index];
+    if (entry && normalizeNodeJestTestFilePath(entry.file) === normalized) {
+      return entry.generationSource;
+    }
+  }
+  return undefined;
+}
 
 /**
  * Verifier 节点：纯静态预检，无 LLM 调用，运行极快。
- * 检查项：文件存在、服务监听、测试断言、契约漂移、依赖分类、Dockerfile 头部。
+ * 检查项：文件存在、入口挂载/覆盖、测试断言、契约漂移、依赖分类、Dockerfile 头部。
  */
 export async function verifierNode(
   state: JimClawState,
@@ -16,11 +131,82 @@ export async function verifierNode(
   saveBoulder: any
 ) {
   startSpan("verifier");
+  const round = state.retryCount || 0;
   const issues: string[] = [];
-  const filesToCreate = state.spec?.filesToCreate || [];
+  const filesToCreate = (state.spec?.filesToCreate || []).map((file: string) => normalizeNodeJestTestFilePath(file));
+  const stagedValidationMode = Boolean(state.validationCheckpointRequested);
+  const completedTaskFiles = new Set(
+    (state.subTasks || [])
+      .filter((task) => task.status === "completed")
+      .map((task) => normalizeNodeJestTestFilePath(task.fileTarget))
+  );
+  const activeFiles = stagedValidationMode && completedTaskFiles.size > 0
+    ? filesToCreate.filter((file) => completedTaskFiles.has(file))
+    : filesToCreate;
+  const plannedFiles = filesToCreate;
+  const requirementProtocol = state.requirementProtocol || state.executionProtocol?.requirements || null;
   const language = (state.spec?.language || "").toLowerCase();
+  if (stagedValidationMode && isPlanningFallbackActive(state)) {
+    const downgradedCoreFiles = activeFiles.filter(
+      (file) =>
+        isCoreBusinessFile(state, file) &&
+        getLatestGenerationSource(state, file) === "deterministic_scaffold" &&
+        !isCompactAuthFallbackRuntimeScaffoldFile(state, file)
+    );
+    for (const file of downgradedCoreFiles) {
+      issues.push(`阶段验证拒绝：核心业务文件 ${file} 仍是降级骨架产物，必须由模型重新生成后才能进入环境验证`);
+    }
+  }
+  if (!state.containerId && isInfrastructureFailureOutput(`${state.testResults || ""}\n${state.lastFailureSummary || ""}\n${state.blockedReason || ""}`)) {
+    const issue = state.testResults || state.lastFailureSummary || "[Verifier] 基础设施未就绪，跳过静态预检";
+    const validationReport = buildValidationReport(
+      [{ summary: issue, evidence: [issue] }],
+      { failureType: "environment_gap", blocking: true }
+    );
+    const repairPlan = buildRepairPlan(validationReport);
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-verifier-r${round}`,
+      "verifier",
+      round,
+      `Verifier 第${round}轮：基础设施未就绪，回退环境修复`,
+      `# Verifier 第${round}轮\n\n## 预检结论\n- 状态：跳过\n- 原因：检测到基础设施层失败，避免把环境问题误判为规划/实现问题\n\n## 原始信息\n\`\`\`text\n${issue}\n\`\`\`\n`
+    );
+    return {
+      testResults: `[Verifier 预检失败]\n${issue}`,
+      validationReport,
+      repairPlan,
+      protocolFailures: validationReport.findings.map((finding) => ({
+        type: "tooling_unavailable" as const,
+        node: "verifier",
+        file: finding.file,
+        summary: finding.summary,
+        evidence: finding.evidence || [],
+        blocking: true,
+      })),
+      meetingNotes: [note],
+      lastFailedNode: "verifier",
+      lastFailureSummary: issue.slice(0, 120),
+    };
+  }
 
-  for (const file of filesToCreate) {
+  const globToRegExp = (pattern: string) => {
+    const escaped = pattern
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      .replace(/\*\*/g, "§§DOUBLESTAR§§")
+      .replace(/\*/g, "[^/]*")
+      .replace(/§§DOUBLESTAR§§/g, ".*")
+      .replace(/\?/g, ".");
+    return new RegExp(`^${escaped}$`);
+  };
+
+  // Jest config dedup: coder 会自动删除 jest.config.js/.ts/.mjs (保留 .cjs)，verifier 应跳过这些文件
+  const JEST_ALT_CONFIGS = /^(jest\.config\.(js|ts|mjs))$/i;
+  const hasJestCjs = activeFiles.some(f => /^jest\.config\.cjs$/i.test(f));
+
+  for (const file of activeFiles) {
+    // 跳过被 dedup 移除的 jest 配置文件变体
+    if (hasJestCjs && JEST_ALT_CONFIGS.test(file)) continue;
     try {
       await fs.access(path.join(WORKSPACE, file));
     } catch {
@@ -28,33 +214,63 @@ export async function verifierNode(
     }
   }
 
-  const serverFilePatterns = /server|app|main|index/i;
-  const listenPatterns: Record<string, RegExp> = {
-    typescript: /app\.listen\(|server\.listen\(/,
-    javascript: /app\.listen\(|server\.listen\(/,
-    python: /uvicorn\.run\(|app\.run\(|serve\(/,
-    go: /http\.ListenAndServe\(|ListenAndServe\(/,
-  };
-  const listenPattern =
-    Object.entries(listenPatterns).find(([lang]) => language.includes(lang))?.[1] ||
-    /app\.listen\(|server\.listen\(|uvicorn\.run\(|ListenAndServe\(/;
+  const entryFile = state.executionProtocol?.project?.workspaceLayout?.entryFiles?.[0] || state.spec?.entryPoint;
+  let entryContent = "";
+  if (entryFile) {
+    try {
+      entryContent = await fs.readFile(path.join(WORKSPACE, entryFile), "utf-8");
+    } catch {}
+  }
 
-  for (const file of filesToCreate) {
-    if (serverFilePatterns.test(path.basename(file)) && !file.includes("test") && !file.includes("spec")) {
-      try {
-        const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
-        if (!listenPattern.test(content)) {
-          issues.push(`服务文件 ${file} 未找到监听声明（如 app.listen()）`);
+  // 前端检查：仅在 architect 实际规划了前端文件但缺失时报错
+  // 不再依赖 PM 的 frontendRequired（PM 经常对简单 API 产生幻觉）
+  if (requirementProtocol?.capabilities?.frontendRequired) {
+    const frontendFiles = plannedFiles.filter((file) => /^public\/.+/i.test(file) || /\.html$/i.test(file));
+    // 只有 architect 规划了前端但文件不存在时才报错
+    if (frontendFiles.length === 0 && plannedFiles.some(f => /^public|^static|^frontend|^client|^src\/pages/i.test(f))) {
+      issues.push("需求覆盖失败：规划中包含前端文件但未生成");
+    }
+  }
+
+  if (requirementProtocol?.capabilities?.backendRequired) {
+    const routeFiles = plannedFiles.filter((file) => getProtocolFileContract(state.executionProtocol, file)?.role === "route");
+    // 如果任何已完成的文件包含路由定义（Express app.get / Gin r.GET / FastAPI @app.get 等），则不需要独立 route 文件
+    let anyFileHasRoutes = entryContent && /((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\(|@(Get|Post|Put|Delete|Patch)Mapping\s*\(|#\[route\()/im.test(entryContent);
+    if (!anyFileHasRoutes) {
+      for (const file of plannedFiles) {
+        try {
+          const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
+          if (/((app|r|router)\.(get|post|put|delete|patch|use|GET|POST|PUT|DELETE|PATCH)\s*\(|@(app|router)\.(get|post|put|delete)|\.Route\s*\(|@(Get|Post|Put|Delete|Patch)Mapping\s*\(|#\[route\()/im.test(content)) {
+            anyFileHasRoutes = true;
+            break;
+          }
+        } catch {}
+      }
+    }
+    if (routeFiles.length === 0 && !anyFileHasRoutes) {
+      issues.push("需求覆盖失败：用户要求后端 API，但未规划任何 route 文件");
+    }
+    if (entryContent) {
+      for (const routeFile of routeFiles) {
+        if (/routes\/health\./i.test(routeFile)) continue;
+        // 跳过 __init__.py 文件（Python 包初始化文件，不是路由模块）
+        if (/__init__\.py$/i.test(routeFile)) continue;
+        const stem = path.basename(routeFile, path.extname(routeFile)).replace(/routes?$/i, "");
+        if (stem && !new RegExp(stem, "i").test(entryContent)) {
+          issues.push(`入口挂载缺失：${entryFile} 未挂载路由文件 ${routeFile}`);
         }
-      } catch {
-        // 文件缺失已由前置检查覆盖
       }
     }
   }
 
   const testFilePatterns = /test|spec/i;
-  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(/;
-  for (const file of filesToCreate) {
+  // conftest.py 和 pytest.ini 是 pytest 配置/fixture 文件，不是测试文件
+  // vitest.config/vite.config/jest.config 等是构建/测试配置，也不是测试文件
+  const nonTestFiles = /^(conftest\.py|pytest\.ini|pytest\.cfg|setup\.cfg|tox\.ini|pyproject\.toml|vitest\.config\.(ts|js|mjs)|vite\.config\.(ts|js|mjs)|jest\.config\.(cjs|js|ts))$/i;
+  // 支持 Jest (expect/toBe/toEqual)、pytest (assert 语句)、Go (t.Error/t.Fatal/assert) 风格
+  const assertionPattern = /expect\(|assert\.|\.toBe\(|\.toEqual\(|\.assert\(|test\(|it\(|^\s*assert\s|t\.Errorf?\(|t\.Fatalf?\(|assertThat\(|assertEquals\(|assertTrue\(|assert_eq!|assert_ne!|andExpect\(|\.value\(/m;
+  for (const file of activeFiles) {
+    if (nonTestFiles.test(path.basename(file))) continue;
     if (testFilePatterns.test(path.basename(file))) {
       try {
         const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
@@ -67,15 +283,30 @@ export async function verifierNode(
     }
   }
 
-  for (const file of filesToCreate) {
+  for (const file of activeFiles) {
     if (/routes?[\\/].+\.[tj]s$/i.test(file) || /Routes?\.[tj]s$/i.test(path.basename(file))) {
       try {
         const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
-        const routeDrift = findContractRouteDrift(content, state.apiContract);
+        const routeDrift = findContractRouteDrift(content, state.apiContract, {
+          ownedEndpoints: getProtocolFileContract(state.executionProtocol, file)?.ownedEndpoints || [],
+        });
         issues.push(...routeDrift.map((item) => `契约漂移 ${file}: ${item}`));
       } catch {
         // 文件缺失已由前置检查覆盖
       }
+    }
+  }
+
+  for (const file of activeFiles) {
+    if (!/\.(ts|tsx|js|jsx)$/i.test(file)) continue;
+    try {
+      const content = await fs.readFile(path.join(WORKSPACE, file), "utf-8");
+      const syntaxError = getSyntaxValidationError(file, content);
+      if (syntaxError) {
+        issues.push(syntaxError);
+      }
+    } catch {
+      // 文件缺失已由前置检查覆盖
     }
   }
 
@@ -110,6 +341,115 @@ export async function verifierNode(
     // Dockerfile 缺失已由前置检查覆盖
   }
 
-  if (issues.length === 0) return {};
-  return { isDone: false, testResults: `[Verifier 预检失败]\n${issues.join("\n")}` };
+  if (isNodeJestProject(state.spec)) {
+    const jestConfigPath = path.join(WORKSPACE, "jest.config.cjs");
+    try {
+      const jestConfigContent = await fs.readFile(jestConfigPath, "utf-8");
+      const rootsMatch = jestConfigContent.match(/roots\s*:\s*\[([\s\S]*?)\]/m);
+      const testMatchBlock = jestConfigContent.match(/testMatch\s*:\s*\[([\s\S]*?)\]/m);
+      const configuredRoots = rootsMatch
+        ? Array.from(rootsMatch[1].matchAll(/["'`](.+?)["'`]/g)).map((match) =>
+            match[1].replace(/^<rootDir>\//, "").replace(/\\/g, "/")
+          )
+        : [];
+      const configuredTestMatch = testMatchBlock
+        ? Array.from(testMatchBlock[1].matchAll(/["'`](.+?)["'`]/g)).map((match) =>
+            match[1].replace(/^<rootDir>\//, "").replace(/\\/g, "/")
+          )
+        : [];
+      const expectedRoots = getProtocolTestRoots(state.executionProtocol, state.spec);
+      const declaredBusinessTests = getProtocolBusinessTestFiles(state.executionProtocol, state.spec)
+        .filter((file) => !stagedValidationMode || completedTaskFiles.has(file));
+
+      for (const expectedRoot of expectedRoots) {
+        if (!configuredRoots.includes(expectedRoot)) {
+          issues.push(`Jest roots 未覆盖声明的测试目录 ${expectedRoot}`);
+        }
+      }
+
+      for (const testFile of declaredBusinessTests) {
+        const isCovered = configuredRoots.some((root) => testFile === root || testFile.startsWith(`${root}/`));
+        if (!isCovered) {
+          issues.push(`测试文件 ${testFile} 不在 Jest roots 覆盖范围内`);
+        }
+        const matchesPattern =
+          configuredTestMatch.length === 0 ||
+          configuredTestMatch.some((pattern) => globToRegExp(pattern).test(testFile));
+        if (!matchesPattern) {
+          issues.push(`测试文件 ${testFile} 不在 Jest testMatch 覆盖范围内`);
+        }
+      }
+    } catch {
+      issues.push("缺少 jest.config.cjs：Jest 项目必须显式声明测试发现范围");
+    }
+  }
+
+  if (issues.length === 0) {
+    const note = await writeMeetingNote(
+      WORKSPACE,
+      `note-verifier-r${round}`,
+      "verifier",
+      round,
+      `Verifier 第${round}轮：静态预检通过`,
+        `# Verifier 第${round}轮\n\n## 预检结论\n- 状态：通过\n- 模式：${stagedValidationMode ? "阶段验证" : "完整验证"}\n- 检查文件数：${activeFiles.length}\n`
+    );
+    return {
+      meetingNotes: [note],
+      validationReport: buildValidationReport([], { status: "pass", blocking: false }),
+      repairPlan: null,
+      protocolFailures: [],
+      lastFailedNode: "",
+      lastFailureSummary: "",
+    };
+  }
+
+  const output = `[Verifier 预检失败]\n${issues.join("\n")}`;
+  const classifiedIssues = issues.map((issue) => {
+    const category = classifyVerifierIssue(issue);
+    return {
+      issue,
+      file: extractIssueFile(issue),
+      ...category,
+    };
+  });
+  const failureType = classifiedIssues.some((item) => item.failureType === "environment_gap")
+    ? "environment_gap"
+    : classifiedIssues.some((item) => item.failureType === "runtime_gap")
+      ? "runtime_gap"
+      : classifiedIssues.some((item) => item.failureType === "implementation_bug")
+        ? "implementation_bug"
+        : "planning_gap";
+  const validationReport = buildValidationReport(
+    classifiedIssues.map((item) => ({
+      summary: item.issue,
+      file: item.file,
+      evidence: [item.issue],
+    })),
+    { failureType, blocking: true }
+  );
+  const note = await writeMeetingNote(
+    WORKSPACE,
+    `note-verifier-r${round}`,
+    "verifier",
+    round,
+    `Verifier 第${round}轮：发现 ${issues.length} 个预检问题`,
+    `# Verifier 第${round}轮\n\n## 预检结论\n- 状态：失败\n- 问题数：${issues.length}\n\n## 问题列表\n\`\`\`text\n${issues.join("\n")}\n\`\`\`\n`
+  );
+  return {
+    isDone: false,
+    testResults: output,
+    validationReport,
+    repairPlan: buildRepairPlan(validationReport),
+    protocolFailures: classifiedIssues.map((item) => ({
+      type: item.protocolType,
+      node: "verifier",
+      file: item.file,
+      summary: item.issue,
+      evidence: [item.issue],
+      blocking: true,
+    })),
+    meetingNotes: [note],
+    lastFailedNode: "verifier",
+    lastFailureSummary: issues[0] || "Verifier 预检失败",
+  };
 }

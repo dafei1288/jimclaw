@@ -28,8 +28,24 @@
 12. workspace 产物一致性校验器与 replay 一致性回归测试
 13. `lint_fix` 中 `prettier` 工具失败分级，环境失败不再误伤 coder
 14. `coder` 遵守 `orchestrator` 子任务依赖顺序
+15. `coder` 阻塞即停，单文件失败后不再继续消耗 token 写后续文件
+16. `qa` 对 `coder` 阻塞失败走聚焦分支，不再扩散到 untouched pending 文件
+17. `BaseAgent` 增加 retryable 模型 fallback，降低单模型/单额度故障导致的节点崩溃
+18. `fix_plan` 增加规则化降级路径，额度不足时仍能继续生成修复计划
+19. Coding Plan 路由显式落地到 `coder` / `qa` / `fix_plan` 的代码相关调用，避免继续误走普通推理模型
+20. 模型调用 token 用量落盘并汇总到 trace 索引，便于后续分析成本与异常消耗
+21. QA 放行规则改为“失败证据优先”，`Verifier 预检失败` / 测试失败 / 编译失败 / 部署失败 / `Coder 阻塞失败` 均不会被空 issue 误放行
+22. `infra_setup` / `terminal` / `verifier` / `deploy` 结构化纪要补齐，失败 run 的证据链不再只剩零散 audit
+23. `audit/events.jsonl` 结构化事件流落盘，补齐可机读的 run 级事实源
+24. 新增失败 run 提炼工具，可从 `workspace/run_xxx` 生成测试 fixture
+25. 新增 dashboard snapshot harness，固定验证节点、文件、token、共识四条 UI 口径分离
+26. 模板骨架接管 Express TypeScript 关键基础文件，减少首轮生成漂移
+27. 非 compose 基础设施路径自动补 `npm run build`，修复“测试能过但 start 找不到 dist”问题
+28. compose 基础设施路径改为 `docker-compose build + idle test container`，避免业务容器自启动干扰测试
+29. deploy 健康检查改为“localhost + API 契约 GET 路径”，并补齐后台启动 PID / 日志采集
+30. 真实最小任务 `workspace/run_1774415632972` 已完成端到端闭环，部署成功
 
-其中 `trace-index.json` 当前包含最后节点、失败摘要、会议纪要索引、文件变更索引、按文件聚合状态和基础时间线；`checkpoints/` 当前为 `orchestrator` / `coder_final` / `verifier` / `qa` / `deploy` 留存成功节点快照；服务端已提供 checkpoint 列表和 replay 预览入口，CLI 与 Web 都已支持从 checkpoint 续跑，并且会复用原 workspace 与 trace 上下文；同时新增了 workspace 产物一致性校验器，用于校验 `boulder.json / trace-index.json / checkpoints` 是否仍属于同一条恢复链，并补充了 `subTasks` 与 `trace-index.files` 的联动一致性检查；另外，`lint_fix` 已区分工具环境失败与真实格式错误，避免 `prettier` 安装/网络抖动直接打断 coder，`coder` 也开始遵守 `orchestrator` 提供的文件依赖顺序，作为后续“任务溯源图谱 / 分支回溯”的底座。
+其中 `trace-index.json` 当前包含最后节点、失败摘要、会议纪要索引、文件变更索引、按文件聚合状态和基础时间线；`checkpoints/` 当前为 `orchestrator` / `coder_final` / `verifier` / `qa` / `deploy` 留存成功节点快照；服务端已提供 checkpoint 列表和 replay 预览入口，CLI 与 Web 都已支持从 checkpoint 续跑，并且会复用原 workspace 与 trace 上下文；同时新增了 workspace 产物一致性校验器，用于校验 `boulder.json / trace-index.json / checkpoints` 是否仍属于同一条恢复链，并补充了 `subTasks` 与 `trace-index.files` 的联动一致性检查；另外，`lint_fix` 已区分工具环境失败与真实格式错误，避免 `prettier` 安装/网络抖动直接打断 coder，`coder` 也开始遵守 `orchestrator` 提供的文件依赖顺序，作为后续“任务溯源图谱 / 分支回溯”的底座。部署侧现在额外补齐了 `package.json` 启动路径与编译产物对齐、非 compose 路径自动 build、compose 路径的空闲测试容器语义，以及 `deploy` 的结构化启动日志与契约化健康检查，从而把最小 TypeScript Express 健康检查服务真正跑通到了 deploy success。
 
 ---
 
@@ -611,3 +627,16 @@ git commit -m "docs: reorder roadmap around execution integrity"
 4. TypeScript + Jest 项目能自动生成最小可运行测试基线
 5. 中途中断的 run 也能留下结构化失败纪要
 6. `TODO.md` 的优先级顺序与执行依赖一致
+## 2026-03-24 Addendum
+
+- Fixed a false-negative coder path exposed by `workspace/run_1774313543413`.
+- Root cause: an early `lint_fix` / `prettier` failure was kept as a sticky task failure even after `write_file` produced valid final code.
+- Current rule: if the final extracted or persisted code is structurally valid and the file was successfully written, coder no longer fails the task only because of that earlier transient tool error.
+- Regression coverage: `coder accepts valid final code after a transient pre-write lint failure`.
+- Added interrupted-write recovery: coder now records a per-file recovery intent before snapshot persistence, and graph startup / `SIGINT` / `SIGTERM` replays those intents back into `boulder.json` and `trace-index.json`.
+- Added fail-fast coder routing: once a file hits a blocking failure, coder stops the round immediately and hands off to QA instead of continuing to generate later files.
+- Added focused QA handling for `[Coder 阻塞失败]`: QA now creates issues only for the actual blocked file(s) and skips speculative expansion to still-pending files.
+- Added retryable model fallback in `BaseAgent`: when the current mode hits 429 / 5xx / network failures, the agent will automatically switch to another available mode before giving up.
+- Added deterministic fallback in `fix_plan`: if quota/resource failures block both coder and QA model calls, the node now emits a minimal rule-based repair plan instead of crashing the run.
+- Explicitly routed code-heavy calls to `coding` mode: `coder_node` generation, `qa_node` deep audit, and both LLM calls inside `fix_plan` now use the Coding Plan model chain.
+- Added token accounting: each model call now persists usage into `token-usage.json`, and `trace-index.json` carries an aggregated `tokenUsage` summary by agent.
