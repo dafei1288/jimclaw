@@ -61,7 +61,11 @@ function textTargetsUrl(text: string, url: string): boolean {
   const extractedUrls = extractGetUrls(text);
   const normalizedUrl = normalizeEndpointUrl(url);
   if (extractedUrls.length > 0) {
-    return extractedUrls.some((candidate) => normalizeEndpointUrl(candidate) === normalizedUrl);
+    return extractedUrls.some((candidate) => {
+      const normalizedCandidate = normalizeEndpointUrl(candidate);
+      return normalizedCandidate === normalizedUrl ||
+        (normalizedUrl.includes("?") && endpointPathOnly(normalizedCandidate) === endpointPathOnly(normalizedUrl));
+    });
   }
   const pathMentions = extractPathMentions(text);
   if (pathMentions.length > 0) {
@@ -69,6 +73,18 @@ function textTargetsUrl(text: string, url: string): boolean {
     return pathMentions.some((candidate) => endpointPathOnly(candidate) === targetPath);
   }
   return true;
+}
+
+function shouldSynthesizeLowStockQueryCheck(url: string, texts: string[]): boolean {
+  const normalizedUrl = normalizeEndpointUrl(url);
+  if (normalizedUrl.includes("?")) return false;
+  const pathOnly = endpointPathOnly(normalizedUrl);
+  if (!pathOnly.startsWith("/api/") || /\/health$/i.test(pathOnly)) return false;
+  return texts.some((text) =>
+    textTargetsUrl(text, normalizedUrl) &&
+    /低库存|lowStock/i.test(text) &&
+    /筛选|过滤|仅包含|只包含|仅返回|只返回|lowStock/i.test(text)
+  );
 }
 
 function buildSemanticAssertionTemplates(url: string, text: string): Omit<EvaluationAssertion, "id">[] {
@@ -176,6 +192,10 @@ function buildDefaultEvaluationChecks(state: JimClawState, sprint: SprintPlan): 
     const method = String(endpoint.method || "").toUpperCase();
     if (method !== "GET") continue;
     const url = normalizeEndpointUrl(endpoint.path);
+    const endpointTexts = [
+      String((endpoint as any).description || ""),
+      ...validationTexts,
+    ];
     getEndpointPaths.add(endpointPathOnly(url));
     const check: EvaluationCheck = {
       id: `CHK-HTTP-${checks.length + 1}`,
@@ -185,12 +205,26 @@ function buildDefaultEvaluationChecks(state: JimClawState, sprint: SprintPlan): 
       url,
       expectedStatus: [200, 201, 204],
     };
-    const assertions = buildSemanticAssertionsForCheck(check.id, url, [
-      String((endpoint as any).description || ""),
-      ...validationTexts,
-    ]);
+    const assertions = buildSemanticAssertionsForCheck(check.id, url, endpointTexts);
     if (assertions.length > 0) check.assertions = assertions;
     checks.push(check);
+
+    if (shouldSynthesizeLowStockQueryCheck(url, endpointTexts)) {
+      const lowStockUrl = `${endpointPathOnly(url)}?lowStock=true`;
+      if (!checks.some((item) => normalizeEndpointUrl(item.url || "") === lowStockUrl)) {
+        const lowStockCheck: EvaluationCheck = {
+          id: `CHK-HTTP-${checks.length + 1}`,
+          kind: "http",
+          description: `验证 GET ${lowStockUrl}：低库存筛选`,
+          method: "GET",
+          url: lowStockUrl,
+          expectedStatus: [200, 201, 204],
+        };
+        const lowStockAssertions = buildSemanticAssertionsForCheck(lowStockCheck.id, lowStockUrl, endpointTexts);
+        if (lowStockAssertions.length > 0) lowStockCheck.assertions = lowStockAssertions;
+        checks.push(lowStockCheck);
+      }
+    }
   }
 
   for (const text of validationTexts) {

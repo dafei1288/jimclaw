@@ -203,6 +203,66 @@ test("sprint contract derives semantic assertions for low stock filter checks", 
   }
 });
 
+test("sprint contract creates lowStock query check from Chinese filter wording without explicit query string", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await sprintContractNode(
+      createBaseState({
+        activeSprintId: "SP-2",
+        productSpec: {
+          version: "v1",
+          title: "库存看板",
+          userGoal: "查看商品库存",
+          userStories: [{ id: "US-1", story: "用户可以查看库存", priority: "must" }],
+          acceptanceCriteria: [
+            { id: "AC-1", description: "访问 GET /api/products 时返回 HTTP 200，响应体为 JSON，且顶层结构为商品数组。", verificationKind: "api" },
+            { id: "AC-2", description: "当以低库存筛选方式请求 GET /api/products 时返回 HTTP 200，响应结果仅包含低库存商品。", verificationKind: "api" },
+          ],
+          nonGoals: [],
+        },
+        sprintPlans: [{
+          id: "SP-2",
+          title: "库存 API 闭环",
+          goal: "完成库存列表与低库存筛选",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-1", "AC-2"],
+          deliverables: ["库存 API", "低库存筛选"],
+          allowedScope: ["src/", "tests/"],
+          dependencies: ["SP-1"],
+          estimatedComplexity: "medium",
+          doneWhen: [
+            "访问 GET /api/products 时返回 HTTP 200，响应体为 JSON，且顶层结构为商品数组。",
+            "当以低库存筛选方式请求 GET /api/products 时返回 HTTP 200，响应结果仅包含低库存商品。",
+          ],
+        }],
+        apiContract: { endpoints: [{ path: "/api/products", method: "GET", description: "商品库存列表，支持低库存筛选" }] },
+        spec: {
+          language: "TypeScript",
+          framework: "Express",
+          testCommand: "npm test",
+          filesToCreate: ["src/index.ts", "tests/products.test.ts"],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const checks = result.sprintContracts[0].evaluatorPlan.checks;
+    const lowStockCheck = checks.find((check) => check.url === "/api/products?lowStock=true");
+
+    assert.ok(lowStockCheck);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonNonEmpty"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock" && item.operator === "lt"), true);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("sprint contract does not apply product semantic assertions to health checks", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
