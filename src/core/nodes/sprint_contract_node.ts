@@ -85,9 +85,12 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
 
   if (isApi) {
     const fields = new Set<string>();
+    const hasExplicitQuantity = /\bquantity\b/i.test(normalizedText);
+    const hasExplicitStock = /\bstock\b/i.test(normalizedText);
     if (/\bid\b|编号/i.test(normalizedText)) fields.add("id");
     if (/\bname\b|名称|商品名称/i.test(normalizedText)) fields.add("name");
-    if (/\bstock\b|库存/i.test(normalizedText)) fields.add("stock");
+    if (hasExplicitQuantity) fields.add("quantity");
+    if (hasExplicitStock || (!hasExplicitQuantity && /库存/i.test(normalizedText))) fields.add("stock");
     if (/\bstatus\b|库存状态|状态文本/i.test(normalizedText)) fields.add("status");
     if (/lowStock\s*(字段|field|布尔字段)|字段[^。；;]*lowStock/i.test(normalizedText)) fields.add("lowStock");
     for (const field of fields) {
@@ -96,7 +99,9 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
   }
 
   if (isApi && isLowStockUrl && isLowStockText) {
-    templates.push({ type: "jsonEvery", field: "stock", operator: "lt", value: 10 });
+    const quantityField = /\bquantity\b/i.test(normalizedText) ? "quantity" : "stock";
+    templates.push({ type: "jsonNonEmpty" });
+    templates.push({ type: "jsonEvery", field: quantityField, operator: "lt", value: 10 });
   }
 
   if (!isApi && /页面|html|展示|显示/i.test(normalizedText)) {
@@ -109,14 +114,22 @@ function buildSemanticAssertionTemplates(url: string, text: string): Omit<Evalua
 
 function buildSemanticAssertionsForCheck(checkId: string, url: string, texts: string[]): EvaluationAssertion[] {
   const deduped = new Map<string, Omit<EvaluationAssertion, "id">>();
+  const targetedTexts: string[] = [];
   for (const text of texts) {
     if (!textTargetsUrl(text, url)) continue;
+    targetedTexts.push(text);
     for (const assertion of buildSemanticAssertionTemplates(url, text)) {
       const key = JSON.stringify(assertion);
       if (!deduped.has(key)) deduped.set(key, assertion);
     }
   }
-  return Array.from(deduped.values()).map((assertion, index) => ({
+  const hasExplicitQuantity = targetedTexts.some((text) => /\bquantity\b/i.test(text));
+  const hasExplicitStock = targetedTexts.some((text) => /\bstock\b/i.test(text));
+  const assertions = Array.from(deduped.values()).filter((assertion) => {
+    if (!hasExplicitQuantity || hasExplicitStock) return true;
+    return assertion.field !== "stock";
+  });
+  return assertions.map((assertion, index) => ({
     id: `${checkId}-A${index + 1}`,
     ...assertion,
   }));

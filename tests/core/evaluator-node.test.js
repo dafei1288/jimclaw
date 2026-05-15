@@ -348,6 +348,52 @@ test("evaluator records passing semantic assertion evidence", async () => {
   }
 });
 
+test("evaluator fails jsonNonEmpty semantic assertion for an empty array", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const originalHttpGet = host.httpGet;
+  host.httpGet = async () => ({
+    statusCode: 200,
+    body: JSON.stringify([]),
+  });
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-LOW-STOCK",
+          kind: "http",
+          description: "验证 GET /api/products?lowStock=true 返回非空低库存商品数组",
+          method: "GET",
+          url: "/api/products?lowStock=true",
+          expectedStatus: [200],
+          assertions: [
+            { id: "A-array", type: "jsonArray" },
+            { id: "A-non-empty", type: "jsonNonEmpty" },
+            { id: "A-stock-low", type: "jsonEvery", field: "stock", operator: "lt", value: 10 },
+          ],
+        }])],
+        deploymentStatus: { status: "running", url: "http://127.0.0.1:4100" },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(result.evaluationResults[0].status, "fail");
+    assert.equal(check.status, "fail");
+    assert.equal(check.evidence.assertions.some((item) => item.id === "A-non-empty" && item.status === "fail"), true);
+    assert.match(check.evidence.assertions.find((item) => item.id === "A-non-empty").message, /非空|为空/);
+  } finally {
+    host.httpGet = originalHttpGet;
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("evaluator fails an http check when html body semantic assertion fails", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();

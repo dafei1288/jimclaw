@@ -102,7 +102,7 @@ export type EvaluationAssertionOperator = "eq" | "ne" | "lt" | "lte" | "gt" | "g
 
 export interface EvaluationAssertion {
   id: string;
-  type: "jsonArray" | "jsonFieldExists" | "jsonEvery" | "bodyContains" | "bodyNotContains";
+  type: "jsonArray" | "jsonNonEmpty" | "jsonFieldExists" | "jsonEvery" | "bodyContains" | "bodyNotContains";
   field?: string;
   scope?: "root" | "each";
   operator?: EvaluationAssertionOperator;
@@ -119,7 +119,7 @@ export interface EvaluationAssertionEvidence {
 
 export const EvaluationAssertionSchema = z.object({
   id: z.string(),
-  type: z.enum(["jsonArray", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
+  type: z.enum(["jsonArray", "jsonNonEmpty", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
   field: z.string().optional(),
   scope: z.enum(["root", "each"]).optional(),
   operator: z.enum(["eq", "ne", "lt", "lte", "gt", "gte", "includes"]).optional(),
@@ -236,7 +236,7 @@ export const EvaluationResultSchema = z.object({
       error: z.string().optional(),
       assertions: z.array(z.object({
         id: z.string(),
-        type: z.enum(["jsonArray", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
+        type: z.enum(["jsonArray", "jsonNonEmpty", "jsonFieldExists", "jsonEvery", "bodyContains", "bodyNotContains"]),
         status: z.enum(["pass", "fail"]),
         message: z.string(),
       })).optional(),

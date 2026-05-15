@@ -99,6 +99,7 @@ test("managed harness schemas accept semantic assertions and assertion evidence"
     expectedStatus: [200],
     assertions: [
       { id: "A-json-array", type: "jsonArray" },
+      { id: "A-json-non-empty", type: "jsonNonEmpty" },
       { id: "A-name", type: "jsonFieldExists", field: "name", scope: "each" },
       { id: "A-stock", type: "jsonEvery", field: "stock", operator: "lt", value: 10 },
       { id: "A-page-title", type: "bodyContains", text: "Product Inventory" },
@@ -118,6 +119,7 @@ test("managed harness schemas accept semantic assertions and assertion evidence"
         httpBodySnippet: "[]",
         assertions: [
           { id: "A-json-array", type: "jsonArray", status: "pass", message: "响应体是 JSON 数组" },
+          { id: "A-json-non-empty", type: "jsonNonEmpty", status: "pass", message: "响应体 JSON 数组非空" },
           { id: "A-stock", type: "jsonEvery", status: "pass", message: "所有元素满足 stock lt 10" },
         ],
       },
@@ -127,6 +129,6 @@ test("managed harness schemas accept semantic assertions and assertion evidence"
     summary: "低库存 API 已通过",
   });
 
-  assert.equal(check.assertions.length, 5);
+  assert.equal(check.assertions.length, 6);
   assert.equal(evaluation.checks[0].evidence.assertions[0].status, "pass");
 });

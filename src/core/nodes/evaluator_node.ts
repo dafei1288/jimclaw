@@ -388,6 +388,15 @@ function runSemanticAssertions(check: EvaluationCheck, body: string): Evaluation
         message: ok ? "响应体是 JSON 数组" : "响应体不是 JSON 数组",
       };
     }
+    if (assertion.type === "jsonNonEmpty") {
+      const ok = Array.isArray(json.value) && json.value.length > 0;
+      return {
+        id: assertion.id,
+        type: assertion.type,
+        status: ok ? "pass" : "fail",
+        message: ok ? "响应体 JSON 数组非空" : "响应体 JSON 数组为空或不是数组",
+      };
+    }
     if (assertion.type === "jsonFieldExists") {
       return evaluateJsonFieldExists(assertion, json.value);
     }

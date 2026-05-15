@@ -271,6 +271,71 @@ test("sprint contract does not apply product semantic assertions to health check
   }
 });
 
+test("sprint contract respects explicit quantity field and requires non-empty low stock results", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await sprintContractNode(
+      createBaseState({
+        activeSprintId: "SP-2",
+        productSpec: {
+          version: "v1",
+          title: "库存看板",
+          userGoal: "查看商品库存",
+          userStories: [{ id: "US-1", story: "用户可以查看库存", priority: "must" }],
+          acceptanceCriteria: [
+            { id: "AC-1", description: "GET /api/products 返回 JSON 数组，每个商品对象均包含 name、quantity、status 字段。", verificationKind: "api" },
+            { id: "AC-2", description: "GET /api/products?lowStock=true 只包含低库存商品，每个商品 quantity 均满足预设低库存判断条件。", verificationKind: "api" },
+          ],
+          nonGoals: [],
+        },
+        sprintPlans: [{
+          id: "SP-2",
+          title: "库存 API 闭环",
+          goal: "完成库存列表与低库存筛选",
+          userStoryIds: ["US-1"],
+          acceptanceCriteriaIds: ["AC-1", "AC-2"],
+          deliverables: ["库存 API", "低库存筛选"],
+          allowedScope: ["src/", "tests/"],
+          dependencies: ["SP-1"],
+          estimatedComplexity: "medium",
+          doneWhen: [
+            "GET /api/products 返回 JSON 数组，每个商品对象均包含 name、quantity、status 字段。",
+            "GET /api/products?lowStock=true 只包含低库存商品，每个商品 quantity 均满足预设低库存判断条件。",
+          ],
+        }],
+        apiContract: { endpoints: [{ path: "/api/products", method: "GET", description: "商品库存列表" }] },
+        spec: {
+          language: "TypeScript",
+          framework: "Express",
+          testCommand: "npm test",
+          filesToCreate: ["src/index.ts", "tests/products.test.ts"],
+        },
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const checks = result.sprintContracts[0].evaluatorPlan.checks;
+    const baseCheck = checks.find((check) => check.url === "/api/products");
+    const lowStockCheck = checks.find((check) => check.url === "/api/products?lowStock=true");
+
+    assert.ok(baseCheck);
+    assert.ok(lowStockCheck);
+    assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "quantity"), true);
+    assert.equal(baseCheck.assertions.some((item) => item.type === "jsonFieldExists" && item.field === "stock"), false);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonNonEmpty"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "quantity"), true);
+    assert.equal(lowStockCheck.assertions.some((item) => item.type === "jsonEvery" && item.field === "stock"), false);
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
 test("sprint contract node advances to the next runnable sprint after current sprint passes", async () => {
   const workspace = await createTempWorkspace();
   const recorder = createSnapshotRecorder();
