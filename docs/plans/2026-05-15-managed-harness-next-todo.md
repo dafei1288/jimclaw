@@ -539,6 +539,12 @@ git commit -m "docs: record managed harness smoke findings"
   - 已修复：所有规模都执行导出契约与协议角色校验；authRequired 至少保留 `src/routes/auth.ts` / `tests/auth.test.ts`；执行 brief 恢复 `执行阶段：` / `directDependencies：` 格式。
   - 验证通过：`node --test tests/core/coder-node.test.js`
   - 验证通过：`npx tsc --noEmit`
+- Task 4 执行：
+  - 新增 `EvaluationCheck.kind="file"` 支持，字段为 `path` / `targetFile` 与 `exists`。
+  - passing evidence 现在包含 `path`、`fileExists`、`sizeBytes`，可证明 `dist/src/index.js` 等 build artifact 真实存在。
+  - missing artifact 会失败，并把 repair 方向指向 `package.json`、`tsconfig.json`、入口文件等 build 输入，而不是把缺失的 `dist/` 产物交给 Coder 手写。
+  - 验证通过：`node --test tests/core/evaluator-node.test.js`
+  - 验证通过：`npx tsc --noEmit`
 
 ---
 

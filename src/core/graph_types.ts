@@ -93,6 +93,8 @@ export interface EvaluationCheck {
   expectedStatus?: number[];
   expectedText?: string;
   targetFile?: string;
+  path?: string;
+  exists?: boolean;
 }
 
 export const EvaluationCheckSchema = z.object({
@@ -105,6 +107,8 @@ export const EvaluationCheckSchema = z.object({
   expectedStatus: z.array(z.number()).optional(),
   expectedText: z.string().optional(),
   targetFile: z.string().optional(),
+  path: z.string().optional(),
+  exists: z.boolean().optional(),
 });
 
 export interface SprintContract {
@@ -169,6 +173,9 @@ export interface EvaluationResult {
       screenshotPath?: string;
       tracePath?: string;
       fileSnippet?: string;
+      path?: string;
+      fileExists?: boolean;
+      sizeBytes?: number;
       error?: string;
     };
     reproSteps: string[];
@@ -191,6 +198,9 @@ export const EvaluationResultSchema = z.object({
       screenshotPath: z.string().optional(),
       tracePath: z.string().optional(),
       fileSnippet: z.string().optional(),
+      path: z.string().optional(),
+      fileExists: z.boolean().optional(),
+      sizeBytes: z.number().optional(),
       error: z.string().optional(),
     }),
     reproSteps: z.array(z.string()),

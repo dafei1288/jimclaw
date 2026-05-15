@@ -1,4 +1,5 @@
 import { EvaluationCheck, EvaluationResult, Issue, JimClawState, SprintContract } from "../graph_types";
+import * as fs from "fs/promises";
 import * as path from "path";
 import {
   buildRepairPlan,
@@ -294,15 +295,98 @@ function runCommandCheck(state: JimClawState, check: EvaluationCheck, contract: 
   };
 }
 
-async function runEvaluationCheck(
+function resolveEvaluationFilePath(
+  workspace: string,
+  check: EvaluationCheck
+): { relativePath: string; absolutePath: string; error?: string } {
+  const rawPath = normalizePath(check.path || check.targetFile || "");
+  if (!rawPath.trim()) {
+    return { relativePath: "", absolutePath: "", error: "文件检查缺少 path/targetFile" };
+  }
+  const absolutePath = path.resolve(workspace, rawPath);
+  const relativePath = path.relative(workspace, absolutePath).replace(/\\/g, "/");
+  if (!relativePath || relativePath.startsWith("..") || path.isAbsolute(relativePath)) {
+    return { relativePath: rawPath, absolutePath, error: `文件检查路径越界：${rawPath}` };
+  }
+  return { relativePath, absolutePath };
+}
+
+function inferSuspectedFilesFromFileCheck(
   state: JimClawState,
   check: EvaluationCheck,
   contract: SprintContract
+): string[] {
+  const target = normalizePath(check.path || check.targetFile || "");
+  const buildInputs = unique([
+    "package.json",
+    "tsconfig.json",
+    state.spec?.entryPoint ? normalizePath(state.spec.entryPoint) : "",
+    ...((state.executionProtocol?.project?.workspaceLayout?.entryFiles || []) as string[]).map(normalizePath),
+  ]);
+  if (/^(dist|build|out)\//i.test(target)) {
+    return buildInputs.slice(0, 6);
+  }
+  return unique([
+    target,
+    ...buildInputs,
+    ...(contract.builderPlan.filesLikelyTouched || []).map(normalizePath),
+  ]).slice(0, 6);
+}
+
+async function runFileCheck(
+  state: JimClawState,
+  check: EvaluationCheck,
+  contract: SprintContract,
+  workspace: string
+): Promise<CheckResult> {
+  const resolved = resolveEvaluationFilePath(workspace, check);
+  const expectedExists = check.exists !== false;
+  if (resolved.error) {
+    return {
+      checkId: check.id,
+      status: "fail",
+      evidence: {
+        path: resolved.relativePath,
+        fileExists: false,
+        error: resolved.error,
+      },
+      reproSteps: [`file ${resolved.relativePath}`],
+      suspectedFiles: inferSuspectedFilesFromFileCheck(state, check, contract),
+    };
+  }
+
+  const stat = await fs.stat(resolved.absolutePath).catch(() => null);
+  const actualExists = Boolean(stat);
+  const ok = expectedExists ? actualExists : !actualExists;
+  return {
+    checkId: check.id,
+    status: ok ? "pass" : "fail",
+    evidence: {
+      path: resolved.relativePath,
+      fileExists: actualExists,
+      sizeBytes: stat?.isFile() ? stat.size : undefined,
+      error: ok
+        ? undefined
+        : expectedExists
+          ? `文件不存在或缺失：${resolved.relativePath}`
+          : `文件不应存在但实际存在：${resolved.relativePath}`,
+    },
+    reproSteps: [`file ${resolved.relativePath}`],
+    suspectedFiles: ok ? [] : inferSuspectedFilesFromFileCheck(state, check, contract),
+  };
+}
+
+async function runEvaluationCheck(
+  state: JimClawState,
+  check: EvaluationCheck,
+  contract: SprintContract,
+  workspace: string
 ): Promise<CheckResult> {
   if (check.kind === "http") return runHttpCheck(state, check, contract);
   if (check.kind === "command" || check.kind === "unit") {
     return runCommandCheck(state, check, contract);
   }
+  if (check.kind === "file") return runFileCheck(state, check, contract, workspace);
   return {
     checkId: check.id,
     status: "fail",
@@ -379,7 +463,7 @@ export async function evaluatorNode(
   try {
     const evaluationState = { ...state, ...runtime.statePatch };
     for (const check of plannedChecks) {
-      checks.push(await runEvaluationCheck(evaluationState, check, contract));
+      checks.push(await runEvaluationCheck(evaluationState, check, contract, WORKSPACE));
     }
   } finally {
     await runtime.cleanup?.();

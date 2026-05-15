@@ -1,5 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("fs/promises");
+const path = require("path");
 const {
   createTempWorkspace,
   removeTempWorkspace,
@@ -324,6 +326,84 @@ test("evaluator does not pass command checks without evidence", async () => {
     assert.equal(result.evaluationResults[0].status, "fail");
     assert.match(result.evaluationResults[0].checks[0].evidence.error, /缺少命令验收证据/);
     assert.equal(result.validationReport.status, "fail");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("evaluator passes a file check with concrete build artifact evidence", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+  const artifactPath = path.join(workspace, "dist/src/index.js");
+  await fs.mkdir(path.dirname(artifactPath), { recursive: true });
+  await fs.writeFile(artifactPath, "console.log('ok');\n", "utf-8");
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        sprintContracts: [createSprintContract([{
+          id: "CHK-build-output",
+          kind: "file",
+          description: "确认 TypeScript build 产物存在",
+          path: "dist/src/index.js",
+          exists: true,
+        }])],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(check.status, "pass");
+    assert.equal(check.evidence.fileExists, true);
+    assert.equal(check.evidence.path, "dist/src/index.js");
+    assert.equal(check.evidence.sizeBytes, "console.log('ok');\n".length);
+    assert.equal(result.validationReport.status, "pass");
+  } finally {
+    await removeTempWorkspace(workspace);
+  }
+});
+
+test("evaluator file check failure points repair toward build inputs", async () => {
+  const workspace = await createTempWorkspace();
+  const recorder = createSnapshotRecorder();
+
+  try {
+    const result = await evaluatorNode(
+      createBaseState({
+        activeSprintId: "SP-1",
+        spec: {
+          entryPoint: "src/index.ts",
+          filesToCreate: ["package.json", "tsconfig.json", "src/index.ts"],
+        },
+        sprintContracts: [createSprintContract([{
+          id: "CHK-build-output",
+          kind: "file",
+          description: "确认 TypeScript build 产物存在",
+          path: "dist/src/index.js",
+          exists: true,
+        }])],
+      }),
+      {},
+      workspace,
+      createNoopEmit,
+      createNoopStartSpan,
+      recorder.save
+    );
+
+    const check = result.evaluationResults[0].checks[0];
+    assert.equal(check.status, "fail");
+    assert.equal(check.evidence.fileExists, false);
+    assert.match(check.evidence.error || "", /文件不存在|缺失/);
+    assert.equal(
+      check.suspectedFiles.some((file) => ["package.json", "tsconfig.json", "src/index.ts"].includes(file)),
+      true
+    );
+    assert.equal(result.validationReport.failureType, "runtime_gap");
   } finally {
     await removeTempWorkspace(workspace);
   }
